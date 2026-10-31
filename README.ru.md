@@ -166,9 +166,9 @@ dq8 DQ8.code DQ8.romfs [--load-state ПУТЬ] [--state ПУТЬ]
 | Переменная | Значение |
 |---|---|
 | `DQ8_GL=1` | включить OpenGL-рендерер (выкл = программный растеризатор) |
-| `DQ8_GL_FBFETCH=on/off` | путь framebuffer-fetch (`imageLoad`) — по умолчанию включён |
+| `DQ8_GL_FBFETCH=on/off` | framebuffer-fetch (`imageLoad` живого render target, с texture barriers). **По умолчанию включён на проверенных драйверах**: llvmpipe, softpipe, swrast и radeonsi (AMD/Mesa); на непроверенных драйверах остаётся путь с копированием на каждый драв, пока не задан `=1`, а `=0` принудительно включает копирование везде |
 | `DQ8_GL_BATCH=...` | управление батчингом дравов |
-| `DQ8_GL_BLENDS=...` | выбор обработки blend-режимов |
+| `DQ8_GL_BLENDS=on/off` | факторы/уравнения блендинга PICA на GPU (fixed-function GL). **По умолчанию включён**; `DQ8_GL_BLENDS=0` возвращает шейдерный (программный) путь блендинга |
 | `DQ8_GL_CTX_HOLD=...` | держать GL-контекст привязанным (без лишних MakeCurrent) |
 | `DQ8_GL_ZCLEAR=...` | политика очистки depth |
 | `DQ8_GL_DSTALWAYS=...` | переопределение обработки dst-альфы |

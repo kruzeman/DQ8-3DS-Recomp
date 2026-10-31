@@ -164,9 +164,9 @@ All runtime behaviour is controlled by `DQ8_*` environment variables. Everything
 | Variable | Meaning |
 |---|---|
 | `DQ8_GL=1` | enable the OpenGL renderer (off = software rasterizer) |
-| `DQ8_GL_FBFETCH=on/off` | framebuffer-fetch (`imageLoad`) path — default on |
+| `DQ8_GL_FBFETCH=on/off` | framebuffer-fetch (`imageLoad` of the live render target, with texture barriers). **Default on for verified drivers**: llvmpipe, softpipe, swrast and radeonsi (AMD/Mesa); untested drivers keep the per-draw copy path unless `=1`, and `=0` forces the copies everywhere |
 | `DQ8_GL_BATCH=...` | draw batching control |
-| `DQ8_GL_BLENDS=...` | blend-mode handling selection |
+| `DQ8_GL_BLENDS=on/off` | PICA blend factors/equations on the GPU (fixed-function GL). **Default on**; `DQ8_GL_BLENDS=0` restores the shader (software) blend path |
 | `DQ8_GL_CTX_HOLD=...` | keep the GL context bound (avoids MakeCurrent churn) |
 | `DQ8_GL_ZCLEAR=...` | depth-clear policy |
 | `DQ8_GL_DSTALWAYS=...` | dst-alpha handling override |
