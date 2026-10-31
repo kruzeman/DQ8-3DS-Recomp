@@ -15,6 +15,14 @@ with an OpenGL backend — and runs the game as an ordinary desktop application.
 
 ---
 
+## Screenshots
+
+![Title screen](docs/screenshots/title-screen.png)
+*Title screen*
+
+![3D world — an encounter in the forest](docs/screenshots/encounter-ogre.png)
+*3D world — an encounter in the forest*
+
 ## Contents
 
 - [What you need](#what-you-need)
