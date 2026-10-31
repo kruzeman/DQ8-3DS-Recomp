@@ -1,0 +1,105 @@
+run=split-movie commit=009690bc92c9 bin_sha=15d761843710
+exit=max-wall reached samples=2054 ptrace_pause_s=0.529 windows=[[6, 20], [135, 205]]
+window 0-215 (215 s): guest_Minstr/s=3.50 (main 0.00 + worker 3.50) vblanks/s=46.9 draws/s=124.2 movie_d=82 y2r_d=353 fb_flips/s=0.87 distinct_top_hashes=121 cpu: main=94.0% other=18.1% total=112.1% wait_spins=14 parks=38705 host_sleeps=3646 main_sleeps=35347 dsp_ticks=10789 dsp_resyncs=1897 snapshots=0
+window 6-20 (14 s): guest_Minstr/s=0.30 (main 0.00 + worker 0.30) vblanks/s=54.9 draws/s=143.3 movie_d=0 y2r_d=0 fb_flips/s=1.29 distinct_top_hashes=10 cpu: main=89.6% other=18.2% total=107.8% wait_spins=0 parks=2141 host_sleeps=472 main_sleeps=0 dsp_ticks=553 dsp_resyncs=149 snapshots=0
+window last10 10-20 (10 s): guest_Minstr/s=0.30 (main 0.00 + worker 0.30) vblanks/s=54.0 draws/s=177.5 movie_d=0 y2r_d=0 fb_flips/s=1.20 distinct_top_hashes=9 cpu: main=89.4% other=21.1% total=110.5% wait_spins=0 parks=1545 host_sleeps=343 main_sleeps=0 dsp_ticks=402 dsp_resyncs=111 snapshots=0
+window 135-205 (70 s): guest_Minstr/s=7.78 (main 0.00 + worker 7.78) vblanks/s=41.4 draws/s=9.2 movie_d=65 y2r_d=280 fb_flips/s=0.69 distinct_top_hashes=70 cpu: main=99.2% other=16.4% total=115.6% wait_spins=4 parks=16810 host_sleeps=156 main_sleeps=26448 dsp_ticks=4893 dsp_resyncs=407 snapshots=0
+window last10 195-205 (10 s): guest_Minstr/s=0.07 (main 0.00 + worker 0.07) vblanks/s=18.1 draws/s=15.8 movie_d=0 y2r_d=0 fb_flips/s=1.20 distinct_top_hashes=10 cpu: main=98.2% other=14.0% total=112.2% wait_spins=0 parks=294 host_sleeps=42 main_sleeps=0 dsp_ticks=85 dsp_resyncs=51 snapshots=0
+--- stacks 6-20 (338 samples)
+  leaf  30.8% 104 pica_tev
+  leaf  24.3% 82 libc.so.6+0xc4bdf
+  leaf  10.4% 35 pica_write_fragment
+  leaf   9.2% 31 pica_raster_triangle
+  leaf   5.0% 17 pica_get_pixel
+  leaf   2.4% 8 pica_put_pixel
+  leaf   2.4% 8 pica_sample_tex0
+  leaf   2.1% 7 gsp_display_transfer
+  leaf   1.5% 5 pica_write_register
+  leaf   1.2% 4 libc.so.6+0x169ac7
+  leaf   1.2% 4 pica_rect_log
+  leaf   1.2% 4 libm.so.6+0x68230
+  leaf   0.9% 3 libm.so.6+0x6823a
+  leaf   0.9% 3 dq8_part_010 [guest pc 0x140000-0x15ffff]
+  leaf   0.9% 3 dq8_part_029 [guest pc 0x3a0000-0x3bffff]
+  leaf   0.6% 2 gsp_memory_fill
+  leaf   0.6% 2 libc.so.6+0x207f8
+  leaf   0.6% 2 pica_px_log_write
+  leaf   0.3% 1 dsp_job_free
+  leaf   0.3% 1 arm_shift_imm_carry
+  top chains:
+  chain  104 pica_tev
+  chain   35 pica_write_fragment
+  chain   34 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- split_present_main
+  chain   31 pica_raster_triangle
+  chain   22 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- guest_wait_until_deadline
+  chain   17 pica_get_pixel
+  chain   13 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- dsp_music_worker_main
+  chain   11 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- dsp_sfx_worker_main
+  chain    8 pica_put_pixel
+  chain    8 pica_sample_tex0
+  chain    7 gsp_display_transfer
+  chain    5 pica_write_register
+  per-tid:
+    tid 1869198 (dq8-split-rende) 277 samples
+       104 pica_tev
+        35 pica_write_fragment
+        31 pica_raster_triangle
+        22 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- guest_wait_until_deadline
+    tid 1869200 (dq8-split-rende) 35 samples
+        34 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- split_present_main
+         1 host_display_convert_span
+    tid 1869203 (dq8-split-rende) 13 samples
+        13 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- dsp_music_worker_main
+    tid 1869204 (dq8-split-rende) 11 samples
+        11 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- dsp_sfx_worker_main
+    tid 1869202 (SDLAudioP2) 2 samples
+         2 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- libSDL2-2.0.so.0.3000.0+0x12235f <- libSDL2-2.0.so.0.3000.0+0xe2b4 <- libSDL2-2.0.so.0.3000.0+0x116366 <- libc.so.6+0x
+--- stacks 135-205 (1716 samples)
+  leaf  37.2% 638 pica_tev
+  leaf  14.4% 247 libc.so.6+0xc4bdf
+  leaf  12.5% 215 dq8_part_013 [guest pc 0x1a0000-0x1bffff]
+  leaf   6.6% 114 pica_raster_triangle
+  leaf   4.4% 75 pica_write_fragment
+  leaf   3.8% 66 pica_sample_tex0
+  leaf   2.6% 45 dq8_part_012 [guest pc 0x180000-0x19ffff]
+  leaf   1.8% 31 par_op
+  leaf   1.6% 27 dq8_pc_needs_boundary
+  leaf   1.2% 21 pica_get_pixel
+  leaf   1.1% 19 gsp_display_transfer
+  leaf   1.1% 19 dq8_mem_identity_span
+  leaf   1.0% 18 dq8_mem32_fast
+  leaf   0.9% 15 pica_put_pixel
+  leaf   0.8% 13 y2r_start_conversion
+  leaf   0.7% 12 libc.so.6+0x207f8
+  leaf   0.6% 11 libc.so.6+0x169ac7
+  leaf   0.6% 10 dq8_put32_fast
+  leaf   0.4% 7 pica_px_log_write
+  leaf   0.4% 7 dq8_part_010 [guest pc 0x140000-0x15ffff]
+  top chains:
+  chain  638 pica_tev
+  chain  214 dq8_part_013 [guest pc 0x1a0000-0x1bffff] <- translated_from
+  chain  114 pica_raster_triangle
+  chain  110 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- split_present_main
+  chain   75 pica_write_fragment
+  chain   66 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- dsp_sfx_worker_main
+  chain   66 pica_sample_tex0
+  chain   65 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- dsp_music_worker_main
+  chain   45 dq8_part_012 [guest pc 0x180000-0x19ffff] <- translated_from
+  chain   27 dq8_pc_needs_boundary <- translated_from
+  chain   25 par_op
+  chain   21 pica_get_pixel
+  per-tid:
+    tid 1869198 (dq8-split-rende) 1463 samples
+       638 pica_tev
+       214 dq8_part_013 [guest pc 0x1a0000-0x1bffff] <- translated_from
+       114 pica_raster_triangle
+        75 pica_write_fragment
+    tid 1869200 (dq8-split-rende) 122 samples
+       110 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- split_present_main
+         1 libc.so.6+0x1691c5
+         1 libSDL2-2.0.so.0.3000.0+0x9f457 <- libSDL2-2.0.so.0.3000.0+0x7da6f <- libSDL2-2.0.so.0.3000.0+0xb7154 <- host_display_present_impl
+         1 libSDL2-2.0.so.0.3000.0+0x9f5bd <- libSDL2-2.0.so.0.3000.0+0x7da6f <- libSDL2-2.0.so.0.3000.0+0xb7154 <- host_display_present_impl
+    tid 1869204 (dq8-split-rende) 66 samples
+        66 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- dsp_sfx_worker_main
+    tid 1869203 (dq8-split-rende) 65 samples
+        65 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- dsp_music_worker_main

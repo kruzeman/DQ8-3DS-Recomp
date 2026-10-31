@@ -1,0 +1,4 @@
+# Saved-context continuation restore: loads SP/LR from the context pointed to
+# by r0 and branches through restored LR, rather than returning to its caller.
+# The bytes after the call site are an inline exception message, not code.
+0x0017B780

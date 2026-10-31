@@ -1,0 +1,75 @@
+# Personal game dumps and extracted game data
+*.3ds
+*.cia
+*.cxi
+*.nds
+*.code
+*.decomp.c
+*.pseudo.c
+*.decomp.indirect.md
+DQ8.trace.gdb
+DQ8.runtime-gdb.log
+aes_keys.txt
+aeskeydb.bin
+seeddb.bin
+boot9.bin
+otp.bin
+movable.sed
+secret_sector.bin
+slot0x*key*.bin
+*.xorpad
+ncchinfo.bin
+romfs/
+exefs/
+extracted/
+
+# Recompiler output and compiled artifacts
+target/
+build/
+out/
+generated/
+*.so
+*.dll
+*.dylib
+*.a
+*.o
+DQ8.code
+
+# RomFS images and filesystem extracts
+*.romfs
+romfs.bin
+code.bin
+exefs.bin
+
+# Saves / savestates / userdata
+userdata/
+saves/
+*.sav
+honeySave*.bin
+
+# Keys / credentials / env
+.env
+auth.json
+*.pem
+*.key
+id_ed25519*
+id_rsa*
+
+# Evidence / captures / dumps / logs
+evidence/
+identity/
+frames/
+*.ppm
+*.log
+*.dump
+__pycache__/
+*.pyc
+
+# Internal diagnostics reports
+reports/
+
+# Editor noise
+.vscode/
+.idea/
+*.swp
+.DS_Store

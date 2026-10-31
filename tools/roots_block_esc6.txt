@@ -1,0 +1,80 @@
+# Sixth escape-hunting (t_99ce6946): escaped PC 0x001BEBB0 in the post-save-
+# creation flow (operator: after CONFIRM a save-file window appears, then
+# `translated PC escaped to 001BEBB0 after 001BEBB0 lr=004D5788`). Root cause:
+# BLX r3 at 0x004D5784 (r3 = *(vptr+0x58) = 0x00472404) -> the setter thunk
+# 0x00472404 (strb r1,[this,#0x30]; tail-calls *(vptr+0x28)) -> 0x001BEBB0,
+# which exists ONLY in that vtable slot (single xref 0x0058DF38) and was never
+# a translation seed, so the indirect tail-call escaped (self-pattern: the
+# tail-call keeps lr=0x004D5788 and r3=0x00472404). 0x001BEBB0 disasm: ldr r2,
+# [pc,#0x50] (table 0x005FA624, 19-word scan loop); stmdb sp!,{r4,lr}; bl
+# 0x002600AC on *(this+0x14); tail-b 0x0025F56C (state machine on this+0x40/
+# +0x80) - a save-flow callback/completion step, not data.
+#
+# BATCH (protocol: root the whole family, not one per round): every unrooted
+# .text pointer word in the callback/vtable cluster window 0x0058DB00..0x0058E800
+# (the same cluster that produced the 0x00472804, 0x001C09B0/980, 0x001BFA64/7C
+# escapes in rounds 4-5, incl. the vtable run 0x0058DED8..0x0058DFB4 that holds
+# 0x0058DF38). 57 entries, ALL disasm-verified with tools/verify_batch_entries.py
+# (first instruction decodes to a plausible entry: stmdb/mov/bx-lr leaf/ldr-
+# literal prologues). Two words whose 2nd/1st insn dq8tool marks unsupported
+# are VFP, cross-checked as real code: 0x0047F8A8 sits in 10+ vtable slots
+# (siblings 0x0047F854/8B4/8D4 in the same run), 0x00480670 is a vldr+bx-lr
+# sibling of the rooted 0x00480648/650/660/668 stub family (same pattern as
+# already-rooted VFP leaf 0x003A6690). Scan: tools/scan_table_roots.py.
+0x001B37B4
+0x001B5ED0
+0x001B6674
+0x001BAD50
+0x001BAF28
+0x001BAFB4
+0x001BAFC4
+0x001BB014
+0x001BBF08
+0x001BEBB0
+0x001C86D0
+0x001C8B1C
+0x001C8E80
+0x001C9CF4
+0x001CEC54
+0x001CEC58
+0x001CEC5C
+0x001CEC60
+0x001CEC64
+0x001CEC68
+0x001CEC6C
+0x001CEE1C
+0x001CEE20
+0x001CF080
+0x001CF088
+0x001CF0FC
+0x001CF9E8
+0x001D5FB8
+0x001D6294
+0x001D640C
+0x001D6414
+0x001D641C
+0x001D6578
+0x0021F358
+0x0021F370
+0x00231198
+0x002396B4
+0x0047CDEC
+0x0047F750
+0x0047F780
+0x0047F854
+0x0047F8A8
+0x0047F8B4
+0x0047F8D4
+0x0047F8F4
+0x00480648
+0x00480650
+0x00480658
+0x00480660
+0x00480668
+0x00480670
+0x0048067C
+0x004806D4
+0x00480728
+0x00481220
+0x00481268
+0x004BAB04

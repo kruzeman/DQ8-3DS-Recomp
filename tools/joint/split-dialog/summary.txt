@@ -1,0 +1,107 @@
+run=split-dialog commit=009690bc92c9 bin_sha=15d761843710
+exit=max-wall reached samples=1546 ptrace_pause_s=0.440 windows=[[6, 20], [100, 150]]
+window 0-165 (165 s): guest_Minstr/s=0.25 (main 0.00 + worker 0.25) vblanks/s=49.6 draws/s=202.8 movie_d=0 y2r_d=0 fb_flips/s=1.03 distinct_top_hashes=27 cpu: main=90.4% other=20.0% total=110.3% wait_spins=0 parks=21188 host_sleeps=4524 main_sleeps=0 dsp_ticks=5551 dsp_resyncs=1759 snapshots=0
+window 6-20 (14 s): guest_Minstr/s=0.30 (main 0.00 + worker 0.30) vblanks/s=57.0 draws/s=131.4 movie_d=0 y2r_d=0 fb_flips/s=1.14 distinct_top_hashes=10 cpu: main=90.4% other=17.7% total=108.1% wait_spins=0 parks=2133 host_sleeps=443 main_sleeps=0 dsp_ticks=543 dsp_resyncs=152 snapshots=0
+window last10 10-20 (10 s): guest_Minstr/s=0.30 (main 0.00 + worker 0.30) vblanks/s=56.8 draws/s=161.3 movie_d=0 y2r_d=0 fb_flips/s=1.20 distinct_top_hashes=10 cpu: main=90.6% other=20.2% total=110.8% wait_spins=0 parks=1531 host_sleeps=311 main_sleeps=0 dsp_ticks=390 dsp_resyncs=111 snapshots=0
+window 100-150 (50 s): guest_Minstr/s=0.25 (main 0.00 + worker 0.25) vblanks/s=49.9 draws/s=223.6 movie_d=0 y2r_d=0 fb_flips/s=1.08 distinct_top_hashes=15 cpu: main=91.1% other=20.8% total=111.9% wait_spins=0 parks=6211 host_sleeps=1291 main_sleeps=0 dsp_ticks=1594 dsp_resyncs=558 snapshots=0
+window last10 140-150 (10 s): guest_Minstr/s=0.25 (main 0.00 + worker 0.25) vblanks/s=51.3 draws/s=232.5 movie_d=0 y2r_d=0 fb_flips/s=1.00 distinct_top_hashes=8 cpu: main=90.7% other=20.6% total=111.3% wait_spins=0 parks=1269 host_sleeps=270 main_sleeps=0 dsp_ticks=322 dsp_resyncs=117 snapshots=0
+--- stacks 6-20 (339 samples)
+  leaf  31.0% 105 pica_tev
+  leaf  22.4% 76 libc.so.6+0xc4bdf
+  leaf  12.4% 42 pica_write_fragment
+  leaf   9.4% 32 pica_raster_triangle
+  leaf   5.3% 18 pica_get_pixel
+  leaf   2.9% 10 pica_put_pixel
+  leaf   2.9% 10 gsp_display_transfer
+  leaf   1.8% 6 pica_sample_tex0
+  leaf   1.5% 5 libc.so.6+0x169ac7
+  leaf   0.6% 2 dq8_part_011 [guest pc 0x160000-0x17ffff]
+  leaf   0.6% 2 libc.so.6+0x207f8
+  leaf   0.6% 2 dq8_pc_needs_boundary
+  leaf   0.6% 2 pica_rect_log
+  leaf   0.6% 2 pica_px_init
+  leaf   0.6% 2 pica_vs_source
+  leaf   0.3% 1 dq8_mem_identity_span
+  leaf   0.3% 1 libm.so.6+0x6823a
+  leaf   0.3% 1 libm.so.6+0x68230
+  leaf   0.3% 1 libc.so.6+0x16d6cb
+  leaf   0.3% 1 dq8_part_012 [guest pc 0x180000-0x19ffff]
+  top chains:
+  chain  105 pica_tev
+  chain   42 pica_write_fragment
+  chain   32 pica_raster_triangle
+  chain   25 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- guest_wait_until_deadline
+  chain   24 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- split_present_main
+  chain   18 pica_get_pixel
+  chain   13 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- dsp_music_worker_main
+  chain   13 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- dsp_sfx_worker_main
+  chain   10 pica_put_pixel
+  chain   10 gsp_display_transfer
+  chain    6 pica_sample_tex0
+  chain    5 libc.so.6+0x169ac7
+  per-tid:
+    tid 1860115 (dq8-split-rende) 282 samples
+       105 pica_tev
+        42 pica_write_fragment
+        32 pica_raster_triangle
+        25 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- guest_wait_until_deadline
+    tid 1860117 (dq8-split-rende) 30 samples
+        24 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- split_present_main
+         1 libc.so.6+0x101b2b <- libxcb.so.1.1.0+0x1acb <- libxcb.so.1.1.0+0x1c4f <- libxcb.so.1.1.0+0x2d7f <- libX11.so.6.4.0+0x280b9 <- libX11.so.6.4.0+0x2bae9 <- libX11
+         1 libSDL2-2.0.so.0.3000.0+0x9f491 <- libSDL2-2.0.so.0.3000.0+0x7da6f <- libSDL2-2.0.so.0.3000.0+0xb7154 <- host_display_present_impl
+         1 libSDL2-2.0.so.0.3000.0+0x9f47b <- libSDL2-2.0.so.0.3000.0+0x7da6f <- libSDL2-2.0.so.0.3000.0+0xb7154 <- host_display_present_impl
+    tid 1860120 (dq8-split-rende) 13 samples
+        13 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- dsp_music_worker_main
+    tid 1860121 (dq8-split-rende) 13 samples
+        13 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- dsp_sfx_worker_main
+    tid 1860119 (SDLAudioP2) 1 samples
+         1 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- libSDL2-2.0.so.0.3000.0+0x12235f <- libSDL2-2.0.so.0.3000.0+0xe2b4 <- libSDL2-2.0.so.0.3000.0+0x116366 <- libc.so.6+0x
+--- stacks 100-150 (1207 samples)
+  leaf  44.8% 541 pica_tev
+  leaf  22.1% 267 libc.so.6+0xc4bdf
+  leaf   6.8% 82 pica_raster_triangle
+  leaf   5.3% 64 pica_write_fragment
+  leaf   4.1% 49 pica_sample_tex0
+  leaf   3.0% 36 pica_get_pixel
+  leaf   2.8% 34 gsp_display_transfer
+  leaf   0.9% 11 libc.so.6+0x169ac7
+  leaf   0.8% 10 pica_write_register
+  leaf   0.7% 8 dq8_part_029 [guest pc 0x3a0000-0x3bffff]
+  leaf   0.6% 7 gsp_enqueue_interrupt
+  leaf   0.5% 6 libc.so.6+0x207f8
+  leaf   0.5% 6 dq8_part_010 [guest pc 0x140000-0x15ffff]
+  leaf   0.5% 6 pica_px_log_write
+  leaf   0.4% 5 dq8_mem_identity_span
+  leaf   0.4% 5 dq8_part_012 [guest pc 0x180000-0x19ffff]
+  leaf   0.4% 5 dq8_mem32_fast
+  leaf   0.4% 5 dq8_part_009 [guest pc 0x120000-0x13ffff]
+  leaf   0.3% 4 gsp_memory_fill
+  leaf   0.3% 4 pica_put_pixel
+  top chains:
+  chain  541 pica_tev
+  chain  110 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- split_present_main
+  chain   82 pica_raster_triangle
+  chain   81 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- guest_wait_until_deadline
+  chain   64 pica_write_fragment
+  chain   49 pica_sample_tex0
+  chain   38 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- dsp_music_worker_main
+  chain   38 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- dsp_sfx_worker_main
+  chain   36 pica_get_pixel
+  chain   34 gsp_display_transfer
+  chain   11 libc.so.6+0x169ac7
+  chain   10 pica_write_register
+  per-tid:
+    tid 1860115 (dq8-split-rende) 1005 samples
+       541 pica_tev
+        82 pica_raster_triangle
+        81 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- guest_wait_until_deadline
+        64 pica_write_fragment
+    tid 1860117 (dq8-split-rende) 126 samples
+       110 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- split_present_main
+         3 libSDL2-2.0.so.0.3000.0+0x9f478 <- libSDL2-2.0.so.0.3000.0+0x7da6f <- libSDL2-2.0.so.0.3000.0+0xb7154 <- host_display_present_impl
+         2 libSDL2-2.0.so.0.3000.0+0x9f5db <- libSDL2-2.0.so.0.3000.0+0x7da6f <- libSDL2-2.0.so.0.3000.0+0xb7154 <- host_display_present_impl
+         2 libSDL2-2.0.so.0.3000.0+0x9f5e7 <- libSDL2-2.0.so.0.3000.0+0x7da6f <- libSDL2-2.0.so.0.3000.0+0xb7154 <- host_display_present_impl
+    tid 1860120 (dq8-split-rende) 38 samples
+        38 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- dsp_music_worker_main
+    tid 1860121 (dq8-split-rende) 38 samples
+        38 libc.so.6+0xc4bdf <- libc.so.6+0xd1b27 <- dsp_sfx_worker_main

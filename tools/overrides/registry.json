@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "overrides": [
+    {
+      "name": "packed_field_unpack_loop",
+      "start": "0x001A93A8",
+      "end": "0x001A940C",
+      "body_file": "packed_field_unpack.inc"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# t_07e30915: build the output-mapping fix binary (dq8-rfix5). Same recipe as
+# dq8-rfix4 (15 S1 regions + overrides registry + GL), runtime TU only changes
+# (src/pica_vs.c semantic mapping) so the guest split cache reuses.
+set -euo pipefail
+# Worktree-relative (t_d50c9503): the recipe must build the worktree that owns
+# this script, not a hardcoded one, so feature branches can reuse it verbatim.
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+export DQ8_CODE=/home/hermes/DQ8/DQ8.code
+export DQ8_OVERRIDES=tools/overrides/registry.json
+export DQ8_GL=1
+export DQ8_S1_CFG=0x001A93A8,0x001A9428,0x001A96C8,0x001A9904,0x001A99A8,0x00194D64,0x00195D44,0x001A982C,0x001A9A88,0x00193A78,0x001A7438,0x001A7468,0x001A747C,0x001AA9B8,0x001A9E20
+export DQ8_S1_CFG_END=0x001A9410,0x001A9608,0x001A97B8,0x001A9990,0x001A9A64,0x001956B8,0x00196A40,0x001A98DC,0x001A9AD0,0x0019405C,0x001A7468,0x001A747C,0x001A74B4,0x001AA9D0,0x001A9E38
+bash tools/build_split.sh target/dq8-rfix5

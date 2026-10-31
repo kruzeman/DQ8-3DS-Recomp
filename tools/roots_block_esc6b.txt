@@ -1,0 +1,22 @@
+# Sixth escape-hunting round 2 (t_99ce6946): after rooting the 0x001BEBB0
+# batch the scenario ran t=250..268 and escaped to 0x001B7CD0 (t=274, exit=3):
+# `escaped to 001B7CD0 after 001B7CD0 r0=085DD060 r4=r5=001B7CD0 lr=004D6514
+# sp=085DD060` (sp in heap = normal worker-thread stack). Root cause: BLX r4 at
+# 0x004D6510 inside wrapper 0x004D64FC (pool [0x004D6474,0x004D6578,0x004D64FC]
+# at 0x004D6468, all already rooted) - the wrapper pops a queued message and
+# invokes the callback it carries. The callback pointer is posted by the
+# F-cluster (0x001B6B00..0x001B8400): `ldr r1,[pc,#imm]` -> r3=obj+0x10,
+# r0=obj+0x8 -> BL 0x004D63FC (message builder) -> BL 0x0015EF20 (queue post).
+#
+# FAMILY BATCH: all 8 BL sites to the 0x004D63FC builder resolved with
+# tools/resolve_cb_family.py; 2 callbacks already rooted (0x001B7770,
+# 0x001B8478), the 6 below were not. All 6 disasm-verified genuine sibling
+# methods (stmdb {r4-r7...} prologues; 0x001B690C = stmdb {r4-r6,lr}; loads
+# *(r0)). Single-xref literals: 0x001B72F0/0x001B7524/0x001B7528/0x001B776C/
+# 0x001B7A70/0x001B8474.
+0x001B7CD0
+0x001B7DB0
+0x001B7A74
+0x001B690C
+0x001B6BA8
+0x001B752C

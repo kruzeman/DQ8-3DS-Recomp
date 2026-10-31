@@ -1,0 +1,8 @@
+[package]
+name = "dq8tool"
+default-run = "dq8tool"
+version = "0.1.0"
+edition = "2024"
+description = "3DS container inspector and ARM pseudocode disassembler for DQ8 analysis"
+
+[dependencies]
