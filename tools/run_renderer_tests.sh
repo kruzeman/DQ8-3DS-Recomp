@@ -25,5 +25,16 @@ echo "== build test_pica_gl_diff (SW/GL pixel differential) =="
 cc "${cflags[@]}" tools/test_pica_gl_diff.c -o target/test_pica_gl_diff "${ldflags[@]}" -lm
 echo "== run test_pica_gl_diff =="
 ./target/test_pica_gl_diff
+echo "== build test_gl_depth_order (per-fragment depth ordering) =="
+cc "${cflags[@]}" -D_DEFAULT_SOURCE tools/test_gl_depth_order.c \
+   -o target/test_gl_depth_order "${ldflags[@]}" -lm
+echo "== run test_gl_depth_order (live imageLoad, then per-draw copy) =="
+./target/test_gl_depth_order
+DQ8_GL_FBFETCH=0 ./target/test_gl_depth_order
+echo "== run test_gl_depth_order (IN-SHADER fallback path, DQ8_GL_DEPTH_ATTACH=0) =="
+DQ8_GL_DEPTH_ATTACH=0 ./target/test_gl_depth_order
+echo "== reference only: IN-SHADER + per-draw copies reproduces the pre-fix"
+echo "   defect (expects 'RESULT: N FAILED' with model case 143/143) =="
+DQ8_GL_DEPTH_ATTACH=0 DQ8_GL_FBFETCH=0 ./target/test_gl_depth_order || true
 echo "== build + run gl_backend_test =="
 exec tools/run_gl_test.sh "$@"

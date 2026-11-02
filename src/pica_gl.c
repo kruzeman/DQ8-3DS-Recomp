@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <math.h>
 #include <time.h> /* pica_pqt_now_ns: CLOCK_MONOTONIC (was template-provided) */
@@ -206,6 +207,10 @@ typedef unsigned char PGubyte;
 #define PGGL_CLAMP_TO_EDGE        0x812Fu
 #define PGGL_REPEAT               0x2901u
 #define PGGL_MIRRORED_REPEAT      0x8370u
+/* t_6b81015d: glMemoryBarrier bits (GL 4.2/ARB_shader_image_load_store). */
+#define PGGL_TEXTURE_FETCH_BARRIER_BIT        0x00000008u
+#define PGGL_SHADER_IMAGE_ACCESS_BARRIER_BIT  0x00000020u
+#define PGGL_FRAMEBUFFER_BARRIER_BIT          0x00000400u
 #define PGGL_ARRAY_BUFFER         0x8892u
 #define PGGL_DYNAMIC_DRAW         0x88E8u
 #define PGGL_VERTEX_SHADER        0x8B31u
@@ -215,6 +220,24 @@ typedef unsigned char PGubyte;
 #define PGGL_FRAMEBUFFER          0x8D40u
 #define PGGL_COLOR_ATTACHMENT0    0x8CE0u
 #define PGGL_COLOR_ATTACHMENT1    0x8CE1u
+/* t_a22413f1: real depth attachment.  The emulated PICA depth still lives in
+   ATT1 (R32F, raw integer z) because that is what the guest write-back reads,
+   but the depth TEST/WRITE itself is done by the rasterizer against this
+   attachment, so fragments of one draw depth-test each other in raster order
+   (the software path's semantics) instead of against a pre-draw snapshot. */
+#define PGGL_DEPTH_ATTACHMENT     0x8D00u
+#define PGGL_DEPTH_COMPONENT      0x1902u
+#define PGGL_DEPTH_COMPONENT32F   0x8CACu
+#define PGGL_DEPTH                0x1801u
+#define PGGL_DEPTH_TEST           0x0B71u
+#define PGGL_NEVER                0x0200u
+#define PGGL_LESS                 0x0201u
+#define PGGL_EQUAL                0x0202u
+#define PGGL_LEQUAL               0x0203u
+#define PGGL_GREATER              0x0204u
+#define PGGL_NOTEQUAL             0x0205u
+#define PGGL_GEQUAL               0x0206u
+#define PGGL_ALWAYS               0x0207u
 #define PGGL_FRAMEBUFFER_COMPLETE 0x8CD5u
 #define PGGL_NONE                 0u
 #define PGGL_RED                  0x1903u
@@ -240,6 +263,7 @@ typedef unsigned char PGubyte;
 #define PGGL_ONE_MINUS_SRC_COLOR       0x0301u
 #define PGGL_SRC_ALPHA                 0x0302u
 #define PGGL_ONE_MINUS_SRC_ALPHA       0x0303u
+#define PGGL_SRC_ALPHA_SATURATE        0x0308u /* t_d559a510: PICA factor 14 */
 #define PGGL_DST_ALPHA                 0x0304u
 #define PGGL_ONE_MINUS_DST_ALPHA       0x0305u
 #define PGGL_DST_COLOR                 0x0306u
@@ -326,11 +350,37 @@ typedef PGboolean (*PFN_glIsBuffer)(PGuint);
 typedef void (*PFN_glBindImageTexture)(PGuint, PGuint, PGint, PGboolean, PGint,
                                        PGenum, PGenum);
 typedef const PGubyte *(*PFN_glGetStringi)(PGenum, PGuint);
+/* t_6b81015d: texture/framebuffer barriers for the framebuffer-fetch path. */
+typedef void (*PFN_glTextureBarrier)(void);
+typedef void (*PFN_glMemoryBarrier)(PGuint);
+/* t_d559a510: per-draw-buffer blend state (GL 4.0 glBlendFunci/glBlendEquationi).
+   Required by the fixed-function blend path because the depth buffer is an
+   EMULATED depth buffer living in COLOR_ATTACHMENT1: GL_BLEND applies the
+   same fixed-function blend to EVERY enabled draw buffer, so a blend draw
+   would blend frag_z against the old depth instead of replacing it. */
+typedef void (*PFN_glBlendFunci)(PGuint, PGenum, PGenum);
+typedef void (*PFN_glBlendEquationi)(PGuint, PGenum);
+/* t_993e6fb6: per-draw-buffer colour mask (GL 3.0 core, soft-loaded).  The
+   PICA colour mask must gate ONLY the colour attachment: the emulated depth
+   buffer lives in COLOR_ATTACHMENT1 and the software path writes depth even
+   for colour-masked (depth-only) draws. */
+typedef void (*PFN_glColorMaski)(PGuint, PGboolean, PGboolean, PGboolean,
+                                 PGboolean);
+/* t_a22413f1: hardware depth test/write state (core GL, must exist). */
+typedef void (*PFN_glDepthFunc)(PGenum);
+typedef void (*PFN_glDepthMask)(PGboolean);
 
 #define PGL_FN(name) static PFN_##name pgl_##name
 PGL_FN(glGetString);
 PGL_FN(glGetStringi);      /* t_8c05fac8: extension query (soft-loaded) */
 PGL_FN(glBindImageTexture); /* t_8c05fac8: framebuffer fetch (soft-loaded) */
+PGL_FN(glTextureBarrier);  /* t_6b81015d: soft-loaded */
+PGL_FN(glMemoryBarrier);   /* t_6b81015d: soft-loaded */
+PGL_FN(glBlendFunci);      /* t_d559a510: soft-loaded (depth attachment) */
+PGL_FN(glBlendEquationi);  /* t_d559a510: soft-loaded (depth attachment) */
+PGL_FN(glColorMaski);      /* t_993e6fb6: soft-loaded (depth attachment) */
+PGL_FN(glDepthFunc);       /* t_a22413f1: soft-loaded (real depth attachment) */
+PGL_FN(glDepthMask);       /* t_a22413f1: soft-loaded (real depth attachment) */
 PGL_FN(glCreateShader);
 PGL_FN(glShaderSource);
 PGL_FN(glCompileShader);
@@ -424,7 +474,13 @@ static int pgl_external_ctx;
 static EGLDisplay pgl_dpy = EGL_NO_DISPLAY;
 static EGLContext pgl_ctx = EGL_NO_CONTEXT;
 static PGuint pgl_program, pgl_vao, pgl_vbo, pgl_fbo, pgl_rt_tex,
-             pgl_dst_tex, pgl_z_tex, pgl_zdst_tex;
+             pgl_dst_tex, pgl_z_tex, pgl_zdst_tex, pgl_dtex;
+static int pgl_depth_ok = 1;     /* t_a22413f1: glDepthFunc/glDepthMask loaded */
+static int pgl_dt_w, pgl_dt_h;   /* attached depth texture size */
+/* Applied hardware depth state (avoid redundant GL calls per draw). */
+static int pgl_depth_test_applied = -1;   /* -1 unknown, 0 off, 1 on */
+static unsigned pgl_depth_func_applied;   /* GL enum, valid when 1 */
+static int pgl_depth_mask_applied = -1;
 static int pgl_rt_w, pgl_rt_h;
 static PGint pgl_u_rt, pgl_u_mode, pgl_u_tex, pgl_u_alpha_test,
              pgl_u_alpha_func, pgl_u_alpha_ref, pgl_u_tex_en, pgl_u_dst,
@@ -433,12 +489,26 @@ static PGint pgl_u_rt, pgl_u_mode, pgl_u_tex, pgl_u_alpha_test,
 static PGint pgl_u_src_c, pgl_u_mod_c, pgl_u_src_a, pgl_u_mod_a, pgl_u_cop,
              pgl_u_aop, pgl_u_scale_c, pgl_u_scale_a, pgl_u_const_c,
              pgl_u_buf_init, pgl_u_buf_upd_c, pgl_u_buf_upd_a;
+/* t_1ae971f3: per-ELEMENT locations of u_const_c[].  A specialised shader
+   declares the array [6] but references only the TEV const indices its own
+   combiner uses, so the driver reports just those elements as active and
+   glUniform4f(base + k) for an inactive element is GL_INVALID_OPERATION
+   (observed on radeonsi: const_c=2, elements 1..5 invalid → one error per
+   draw).  Looking the elements up individually is the only portable way to
+   learn which ones may be written. */
+static PGint pgl_u_const_c_e[6];
 static PGint pgl_u_blend_en, pgl_u_eq_rgb, pgl_u_eq_a, pgl_u_f_src_rgb,
              pgl_u_f_dst_rgb, pgl_u_f_src_a, pgl_u_f_dst_a, pgl_u_blend_const;
-static PGint pgl_u_depth_on, pgl_u_depth_test, pgl_u_depth_write,
+static PGint pgl_u_depth_on, pgl_u_depth_hw, pgl_u_depth_test, pgl_u_depth_write,
              pgl_u_depth_func, pgl_u_depth_zbuf, pgl_u_depth_scale,
              pgl_u_depth_offset, pgl_u_depth_zmax;
 static unsigned long long pgl_draws;
+/* t_993e6fb6: colour-only clear accounting (see pgl_clear_color_only). */
+static unsigned long long pgl_clear_pins, pgl_clear_would_clobber;
+/* t_993e6fb6: depth draws whose PICA colour mask was not 0xF: the SW path
+   still writes depth for them, so they used to lose their depth-mirror write
+   under the global glColorMask. */
+static unsigned long long pgl_draws_cmask_depth;
 static unsigned long long pgl_rebuilds;   /* vanished-object repairs */
 static unsigned long long pgl_displaces;  /* foreign context was current */
 static unsigned pgl_obj_used; /* 1=program 2=vao 4=vbo 8=fbo 16=rt_tex 32=stage_tex
@@ -528,15 +598,331 @@ static int pgl_zdst_w, pgl_zdst_h;
 /* depth-region shadow (raw guest bytes), same sync design as the color
    region but coarser: memcmp fast path, uniform-z clear fast path, full
    re-upload otherwise (fills dominate depth-region writes). */
-static unsigned char *pgl_zshadow;
+static unsigned char *pgl_zshadow;      /* guest-thread owned under the split */
+/* t_a22413f1 run3: DEPTH PATH SELECTION (the operator's Radeon rendered
+   almost entirely black with the hardware depth attachment, so it must be
+   opt-in and self-validating, never the default):
+     pgl_depth_hw = 0  in-shader emulation against the emulated ATT1 mirror
+                       (the pre-fix behaviour: playable, may show holes on
+                       drivers that return pre-draw contents for a read of an
+                       attachment the same draw writes)
+     pgl_depth_hw = 1  real DEPTH_COMPONENT32F attachment + gl_FragDepth
+   DQ8_GL_DEPTH_ATTACH=1 asks for the hardware path; it is only kept when the
+   driver passes the startup self-test (small offscreen FBO with a known
+   gl_FragDepth sequence) and the main FBO comes back COMPLETE. */
+static int pgl_depth_hw_env = 0;   /* DQ8_GL_DEPTH_ATTACH as parsed */
+static int pgl_depth_hw = 0;       /* ACTIVE mode (0 in-shader, 1 hardware) */
+static int pgl_depth_hw_applied = -1; /* mode the shader/GL state reflects */
+static int pgl_depth_selftest;     /* 0 not run, 1 pass, -1 fail */
+static const char *pgl_depth_off_why = "default (DQ8_GL_DEPTH_ATTACH=0)";
+static unsigned pgl_depth_fallback_count;
+/* t_f8f2c1da: how many times the depth path changed at run time (0 for a
+   normal run: the mode is decided once, in pgl_setup, before any program). */
+static unsigned pgl_depth_mode_changes;
+static int pgl_black_frames;       /* consecutive near-black full frames */
+static int pgl_hw_bright_frames;    /* a lit full frame seen in HARDWARE mode */
+static int pgl_depth_autofallback;  /* DQ8_GL_DEPTH_AUTOFALLBACK (default ON) */
+/* ---- t_599a43f7: FAIL-SAFE FRAME GUARD ----------------------------------
+   The operator's Radeon 780M (RDNA3) presented an almost entirely black 3D
+   frame with the D32F depth attachment while our RX 580 (Polaris) renders it
+   correctly, and the previous defence could be disarmed: it counted a frame
+   "lit" when >0.5% of the sampled pixels were non-black, and the operator's
+   frame has a small green patch in a corner — so the guard latched "the run is
+   live", stopped watching, and the black screen stayed on screen for the whole
+   run.  Two changes make a lasting black screen impossible:
+     1. LIT means a PLAUSIBLE SCENE (default >5% of the sampled pixels), not
+        "one patch"; DQ8_GL_FRAME_GUARD_LIT adjusts the threshold.
+     2. A dark frame is only accepted as the game's own fade when the DEPTH
+        SURFACE shows structure, i.e. some fragment actually wrote depth during
+        that frame.  A flat depth surface (all-far after a far clear, or all-
+        near if the clear left 0.0 and every fragment failed GL_LESS) combined
+        with a dark colour attachment and depth-tested draws is the hardware
+        depth path not working on this driver -> fall back to the in-shader
+        path instead of presenting black.  That discriminator does not depend
+        on brightness thresholds or on guessing driver behaviour. */
+static unsigned pgl_frame_depth_draws; /* depth-tested draws since last flush */
+static unsigned pgl_frame_no;          /* full-frame flushes evaluated */
+static unsigned pgl_dark_frames;       /* dark frames with a FLAT depth surface */
+static unsigned pgl_dark_draws;        /* depth-tested draws over those frames */
+static int      pgl_frame_guard_lit = -1; /* parsed threshold, percent */
+static unsigned pgl_frame_guard_probes;   /* depth readbacks spent */
+static int      pgl_frame_guard_last;     /* last verdict (diag) */
+static unsigned pgl_lit_best_pmille;      /* brightest sampled frame, 0..1000 */
+static int      pgl_guard_sample_flat = -1; /* 1 flat far, -1 flat near, 0 struct */
+static int      pgl_frame_guard_off = -1;   /* DQ8_GL_FRAME_GUARD=0 (A/B only) */
+/* DQ8_GL_DEPTH_INJECT=near  clear the D32F attachment to 0.0 after every
+   depth clear, i.e. exactly the state in which every fragment fails GL_LESS
+   and the 3D scene comes out black while the UI/green patch survives.  It is
+   a fault injector for the frame guard (it makes the operator's symptom
+   reproducible on any GPU, including llvmpipe) and nothing else. */
+static int pgl_zinject = -1;
+static int pgl_zinject_near(void) {
+    if (pgl_zinject < 0) {
+        const char *e = getenv("DQ8_GL_DEPTH_INJECT");
+        pgl_zinject = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return pgl_zinject;
+}
+static unsigned pgl_errs_logged;   /* always-on GL error lines emitted */
+static unsigned pgl_depth_fbo_builds;
+/* t_8510204b: candidate fixes for the battle-scene corruption.  Both are
+   DEFAULT OFF until a deterministic A/B can prove them (see the status report
+   tools/../t_8510204b_STATUS.md): DQ8_GL_ZFIX=1 enables
+     (a) clearing a new depth attachment to PICA's 24-bit FAR (0xFFFFFF/2^24)
+         instead of GL 1.0 — 1.0 leaves one ulp of headroom so a far plane
+         polygon that PICA's integer compare rejects can pass GL_LESS;
+     (b) invalidating the depth-shadow fast path whenever a write-back skipped
+         pixels (the shadow then no longer describes the attachment). */
+static int pgl_zfix = -1;
+static int pgl_zfix_on(void) {
+    if (pgl_zfix < 0) {
+        const char *e = getenv("DQ8_GL_ZFIX");
+        pgl_zfix = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return pgl_zfix;
+}
+/* t_d8e5ab8c (RX 580): the D32F attachment is cleared with
+   glClearBufferfv(GL_DEPTH, ...), which the spec makes conditional on the
+   DEPTH WRITE MASK — unlike glClear(GL_DEPTH_BUFFER_BIT) on the default
+   framebuffer, and unlike the colour attachment's mask which the code already
+   forces to 1.  The previous draw of a frame routinely leaves
+   glDepthMask(0) behind (PICA depth-write-off draws and the in-shader mode's
+   unconditional glDepthMask(0)), so the frame's depth clear silently cleared
+   NOTHING: the attachment kept the previous frame's (or the allocator's)
+   contents, every fragment failed the depth test and the frame came out
+   black — the exact radeonsi symptom.  Force the mask on around the clear;
+   DQ8_GL_DEPTH_CLEARMASK=0 restores the old behaviour for A/B. */
+static int pgl_depth_clearmask_fix = 1;   /* DQ8_GL_DEPTH_CLEARMASK=0 -> off */
+/* t_8510204b causality knobs (diagnosis only, default = shipped behaviour):
+   DQ8_GL_ZWB=0      skip the depth write-back from ATT1 into guest memory
+                     (isolates "guest-visible depth memory content" as a cause)
+   DQ8_GL_HW_ATT1ALL=1  in HARDWARE mode write ATT1 for every depth draw even
+                     when PICA's depth write is off (isolates the ATT1 masking) */
+static int pgl_zwb_on = -1;   /* t_8df70ad4: -1 unresolved, 1 = write depth
+                                 back, 0 = DQ8_GL_ZWB=0 skips it */
+static int pgl_zwb(void) {
+    if (pgl_zwb_on < 0) {
+        const char *e = getenv("DQ8_GL_ZWB");
+        pgl_zwb_on = !(e && e[0] == '0');   /* only "0" disables */
+    }
+    return pgl_zwb_on;
+}
+static int pgl_hw_att1all = 0;
+static unsigned pgl_depth_probe_left;     /* DQ8_GL_DEPTH_PROBE=<n flushes> */
+static unsigned pgl_depth_probe_n;
+static int pgl_diag_gate = -1;            /* DQ8_GL_DIAG (t_275eb521: cached) */
+static unsigned pgl_depth_syncs;   /* times the D32F attachment was cleared/uploaded */
 static unsigned pgl_zshadow_len;
 static unsigned pgl_zshadow_w, pgl_zshadow_h, pgl_zshadow_bpp;
 static int pgl_zforce_full;
 static int pgl_zdirty; /* depth draws since the last write-back */
+/* t_7d18d1b6: a DEPTH-WRITING draw happened since the last write-back.  When
+   only depth TESTING ran, the depth attachment still equals what guest memory
+   already holds (the refresh uploaded it), so the depth resolve can be skipped
+   entirely — it would write the identical bytes.  pgl_zwrote is set by
+   depth-writing draws (both the synchronous and the split draw path) and by
+   every depth attachment clear, which are the only operations that can move a
+   depth pixel away from guest memory. */
+static int pgl_zwrote;
+/* DQ8_WB_ZSKIP=0 restores "resolve depth at every flush that ran a depth
+   test" (the pre-t_7d18d1b6 behaviour), for A/B of the skip rule. */
+static int pgl_zskip_env = -1;
+static int pgl_zskip_on(void) {
+    if (pgl_zskip_env < 0) {
+        const char *e = getenv("DQ8_WB_ZSKIP");
+        pgl_zskip_env = (e && e[0] == '0') ? 0 : 1;
+    }
+    return pgl_zskip_env;
+}
 static unsigned long long pgl_zrefills, pgl_zflushes;
 static int pgl_drawn_x0, pgl_drawn_y0, pgl_drawn_x1, pgl_drawn_y1; /* GL y */
 static int pgl_rect_trace; /* DQ8_GL_RECT_TRACE=1 */
+
+/* t_599a43f7: forward decls for the fail-safe (the helper below is the only
+   depth clear in the backend and verifies itself). */
+static void pgl_depth_fallback(const char *why);
+static unsigned pgl_drain_errors(const char *where, PGenum *first);
+static unsigned pgl_dclear_checks, pgl_dclear_bad;
+static int pgl_selftest_active;   /* inside a depth self-test: no injection, no
+                                     verification (the test sets its own state) */
+
+/* t_599a43f7: THE one and only way this backend clears the D32F depth
+   attachment.  glClearBufferfv on a depth attachment is gated by the depth
+   WRITE MASK (t_d8e5ab8c); a draw with PICA depth-write-off leaves
+   glDepthMask(0) behind, and then the frame's depth clear silently clears
+   NOTHING — the attachment keeps stale contents, every fragment fails GL_LESS
+   and the 3D frame comes out black.  The synchronous path was fixed for that;
+   the DQ8_SPLIT_GL worker's depth clear (pgl_split_apply_refresh) was not, which
+   IS the operator's black screen: DQ8_SPLIT_GL=1 + DQ8_GL_DEPTH_ATTACH=1 gave a
+   98.9% dark frame while DQ8_SPLIT_GL=0 rendered the same scene correctly.
+   Every clear now goes through this helper so the two threads cannot drift.
+   DQ8_GL_DEPTH_CLEARMASK=0 restores the pre-fix behaviour for A/B.
+   The helper also VERIFIES the clear on the real context (one-pixel depth
+   read-back at the screen centre: the first 8 clears of a run, then every
+   120th).  A stale value there means the clear did not take effect, which is
+   the single failure that made the operator's frame black — so it falls back
+   to the in-shader path immediately instead of presenting black. */
+static void pgl_depth_attachment_clear(float v) {
+    PGfloat d[4];
+    if (!pgl_depth_hw) return;
+    if (pgl_depth_clearmask_fix) {
+        pgl_glDepthMask(1);
+        pgl_depth_mask_applied = -1;   /* next draw re-applies PICA's mask */
+    }
+    if (!pgl_selftest_active && pgl_zinject_near()) v = 0.0f;  /* DQ8_GL_DEPTH_INJECT=near */
+    d[0] = d[1] = d[2] = d[3] = (PGfloat)v;
+    pgl_glClearBufferfv(PGGL_DEPTH, 0, d);
+    pgl_zwrote = 1;   /* t_7d18d1b6: the attachment no longer matches guest RAM */
+    /* ---- verify (cheap, rare) ---- */
+    if (pgl_selftest_active == 0 && pgl_depth_clearmask_fix && pgl_rt_w >= 4 && pgl_rt_h >= 4 &&
+        (pgl_dclear_checks < 8u || (pgl_dclear_checks % 120u) == 0u) &&
+        pgl_glCheckFramebufferStatus(PGGL_FRAMEBUFFER) == PGGL_FRAMEBUFFER_COMPLETE) {
+        float got = -1.0f;
+        ++pgl_dclear_checks;
+        pgl_glReadPixels(pgl_rt_w / 2, pgl_rt_h / 2, 1, 1, PGGL_DEPTH_COMPONENT,
+                         PGGL_FLOAT, &got);
+        if (pgl_drain_errors("dc-clear-check", NULL) == 0 &&
+            (got < v - 1e-3f || got > v + 1e-3f)) {
+            ++pgl_dclear_bad;
+            fprintf(stderr, "GL backend: DEPTH CLEAR did not take effect at "
+                            "(%d,%d): cleared to %.8f, reads %.8f (check #%u) — "
+                            "the depth attachment is stale, every fragment will "
+                            "fail the depth test\n",
+                    pgl_rt_w / 2, pgl_rt_h / 2, (double)v, (double)got,
+                    pgl_dclear_checks);
+            pgl_depth_fallback("the depth attachment clear did not take effect");
+        }
+    }
+}
+/* ---- t_8510204b: per-frame depth timeline (DQ8_GL_DEPTHLOG=1) ------------
+   The battle scene rendered wrong with the hardware D32F depth path while the
+   in-shader ATT1 mirror was clean.  This trace answers, for the frame that is
+   on screen: which draws were issued, with which PICA depth state, against
+   which depth surface, and every place the real depth attachment was cleared
+   or re-uploaded mid-frame (a clear/upload between draws of one frame
+   destroys the depth written by earlier draws, so later geometry passes the
+   test and paints over the scene = the operator's wedges/bands).  Bounded
+   ring; dumped at every flush so the last DFRAME block describes the last
+   frame.  Diagnostic only, off by default. */
+#define PGL_DLOG_MAX 400
+typedef struct {
+    unsigned long long draw;
+    unsigned rt_w, rt_h;
+    unsigned depth_addr, bpp;
+    int test, write, func, zbuf, on;
+    float scale, off, zmax;
+    int box[4];
+    int syncs_since;      /* depth attachment rebuilds/clears since prev draw */
+} PglDLogEntry;
+static PglDLogEntry pgl_dlog[PGL_DLOG_MAX];
+static unsigned pgl_dlog_n;       /* entries since the last flush */
+static int pgl_dlog_on = -1;      /* DQ8_GL_DEPTHLOG parsed on first use */
+static unsigned pgl_dlog_syncs;   /* depth attachment clears/uploads this frame */
+static unsigned long long pgl_dlog_draws; /* draws since the last flush */
+/* ---- t_d559a510: per-draw A/B instrumentation for blend semantics -------
+   DQ8_GL_DRAWHASH=1 reads the draw's box back from COLOR_ATTACHMENT0 before
+   and after the draw and logs the full pipeline state plus an FNV-1a hash of
+   both reads.  Two runs that differ ONLY in where the blend is evaluated (GL
+   fixed-function blending vs the shader's software blend) then produce the
+   same draw sequence: equal `pre` with different `post` on the first
+   diverging draw means the blend evaluation itself differs, and the state on
+   that line names the PICA blend configuration responsible.  Diagnostic only:
+   forces two readbacks per draw (slow), off by default. */
+static int pgl_drawhash_on = -1;
+static long long pgl_dh_dump_idx = -2;   /* DQ8_GL_DRAWHASH_DUMP=<draw> */
+static unsigned char *pgl_dh_buf, *pgl_dh_pre_saved;
+static size_t pgl_dh_cap, pgl_dh_pre_len;
+static unsigned long long pgl_dh_asum, pgl_dh_pre_asum;
+static void pgl_dh_write_ppm(const char *suffix, const unsigned char *rgba,
+                             unsigned w, unsigned h) {
+    char path[256];
+    const char *dir = getenv("DQ8_GL_DRAWHASH_DIR");
+    const char *tag = getenv("DQ8_GL_DRAWHASH_TAG");
+    FILE *f;
+    unsigned i;
+    if (!dir || !*dir) dir = "/tmp";
+    if (!tag) tag = "arm";
+    snprintf(path, sizeof path, "%s/dh_%s_%s.ppm", dir, tag, suffix);
+    f = fopen(path, "wb");
+    if (!f) return;
+    fprintf(f, "P6\n%u %u\n255\n", w, h);
+    for (i = 0; i < w * h; ++i) fwrite(rgba + i * 4u, 1, 3, f);
+    fclose(f);
+    fprintf(stderr, "GLHASHDUMP %s %ux%u\n", path, w, h);
+}
+static unsigned long long pgl_dh_hash(const unsigned char *p, size_t n) {
+    unsigned long long h = 1469598103934665603ull;
+    size_t i;
+    for (i = 0; i < n; ++i) {
+        h ^= (unsigned long long)p[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+static int pgl_dh_box(const int box[4], unsigned long long *out,
+                      unsigned long long *sum) {
+    unsigned w = (unsigned)(box[2] - box[0] + 1), h = (unsigned)(box[3] - box[1] + 1);
+    size_t need = (size_t)w * h * 4u;
+    if (!pgl_dh_buf || pgl_dh_cap < need) {
+        unsigned char *grown = (unsigned char *)realloc(pgl_dh_buf, need);
+        if (!grown) { pgl_dh_cap = 0; return 0; }
+        pgl_dh_buf = grown;
+        pgl_dh_cap = need;
+    }
+    pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_fbo);
+    pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
+    pgl_glReadPixels(box[0], box[1], (PGsizei)w, (PGsizei)h, PGGL_RGBA,
+                     PGGL_UNSIGNED_BYTE, pgl_dh_buf);
+    *out = pgl_dh_hash(pgl_dh_buf, need);
+    if (sum) {
+        unsigned long long s = 0;
+        size_t i;
+        for (i = 0; i < need; ++i) s += pgl_dh_buf[i];
+        *sum = s;
+    }
+    {
+        /* t_d559a510: the RGBA box hash covers alpha too; this splits it out so
+           a divergence can be attributed to colour vs alpha (the PPM dumps only
+           carry RGB). */
+        unsigned long long a = 0;
+        size_t i;
+        for (i = 0; i < (size_t)w * h; ++i) a += pgl_dh_buf[i * 4u + 3u];
+        pgl_dh_asum = a;
+    }
+    return 1;
+}
 static int pgl_zclear_on = 1; /* DQ8_GL_ZCLEAR=0: legacy no-op clear (reference) */
+/* t_d559a510: depth-attachment readback for the per-draw A/B.  The emulated
+   depth buffer is COLOR_ATTACHMENT1 (R32F, integer z values); the GL-blend
+   path must leave it bit-identical to the shader-blend path. */
+static unsigned char *pgl_dh_zbuf;
+static size_t pgl_dh_zcap;
+static int pgl_dh_zbox(const int box[4], unsigned long long *out,
+                       unsigned long long *sum) {
+    unsigned w = (unsigned)(box[2] - box[0] + 1);
+    unsigned h = (unsigned)(box[3] - box[1] + 1);
+    size_t need = (size_t)w * h * 4u;
+    if (!pgl_dh_zbuf || pgl_dh_zcap < need) {
+        unsigned char *grown = (unsigned char *)realloc(pgl_dh_zbuf, need);
+        if (!grown) { pgl_dh_zcap = 0; return 0; }
+        pgl_dh_zbuf = grown;
+        pgl_dh_zcap = need;
+    }
+    pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_fbo);
+    pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT1);
+    pgl_glReadPixels(box[0], box[1], (PGsizei)w, (PGsizei)h, PGGL_RED,
+                     PGGL_FLOAT, pgl_dh_zbuf);
+    pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
+    *out = pgl_dh_hash(pgl_dh_zbuf, need);
+    if (sum) {
+        const float *fp = (const float *)pgl_dh_zbuf;
+        double s = 0.0;
+        size_t i, n = (size_t)w * h;
+        for (i = 0; i < n; ++i) s += (double)fp[i];
+        *sum = (unsigned long long)(s + 0.5);
+    }
+    return 1;
+}
 /* ---- DQ8_GL_SKIP diagnostic knobs (t_77ac52ce profiling) ----
    Comma/space separated list of stages to SKIP, used only to attribute the
    per-draw wall time to a stage (visual output is wrong on purpose):
@@ -551,6 +937,44 @@ static int pgl_skip_mask;
 /* Phase clock: per-draw time split into refresh/state, dst copies, raster. */
 static unsigned long long pgl_ph_n, pgl_ph_setup_ns, pgl_ph_copy_ns,
                           pgl_ph_draw_ns;
+/* t_2d934e23: split of pgl_ph_setup_ns (the per-draw CPU cost before the
+   bounding box is even known): ens = drain_errors + object/FBO checks,
+   ref = pgl_refresh/pgl_refresh_depth (guest-memory diff against the FBO
+   shadow).  Also splits the deferred read-back: read = glReadPixels (+ error
+   drain), wb = pgl_wb_color pixel write-back into guest RAM. */
+static unsigned long long pgl_ph_ens_ns, pgl_ph_ref_ns, pgl_ph_ref_from;
+/* t_2d934e23: refresh fast-path hit counts (per report window). */
+static unsigned long long pgl_ph_ref_eq, pgl_ph_zref_eq, pgl_ph_ref_all;
+static unsigned long long pgl_ph_ref_uniform, pgl_ph_ref_blocks, pgl_ph_box_px;
+static unsigned long long pgl_fl_n, pgl_fl_read_ns, pgl_fl_wb_ns, pgl_fl_px;
+/* t_8df70ad4: depth half of the same window — number of flushes that had a
+   pending depth write-back (pgl_fl_zn), the ones skipped by DQ8_GL_ZWB=0
+   (pgl_fl_zskip) and the ATT1 read-back / guest-store times. */
+static unsigned long long pgl_fl_zn, pgl_fl_zskip, pgl_fl_zrb_ns, pgl_fl_zwb_ns;
+/* t_7d18d1b6: colour vs depth split of the deferred write-back, plus the
+   per-flush counters (pgl_fl_nc = flushes, pgl_fl_nz = flushes that needed a
+   depth resolve). */
+static unsigned long long pgl_fl_nz, pgl_fl_nc, pgl_fl_crb_ns, pgl_fl_cwb_ns;
+/* t_7d18d1b6 diagnostics: who closed the deferred episode (DQ8_WB_TRACE=1). */
+static int pgl_fl_reason;
+static int pgl_wb_trace(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("DQ8_WB_TRACE");
+        on = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return on;
+}
+static double pgl_fl_last;
+/* t_2d934e23: flush wall-clock split (release / context take / read-back). */
+static int pgl_tprof_on = -1;
+static unsigned long long pgl_tp_n, pgl_tp_rel_ns, pgl_tp_take_ns, pgl_tp_lock_ns,
+                          pgl_tp_pend0, pgl_tp_takefail;
+/* t_2d934e23: DQ8_XFER_FAST=0 forces the reference (per-pixel) write-back and
+   the reference display-transfer conversion loop — one knob, both A/B paths. */
+static int pgl_wb_fast_on = -1;
+static int pgl_wb_verify;
+static unsigned long long pgl_wb_fast;
 /* t_8c05fac8: dst vs zdst copy split + copy counts (which side drains). */
 static unsigned long long pgl_ph_dst_ns, pgl_ph_zdst_ns;
 /* t_8c05fac8 round 2: draw_ms sub-split (uniforms+tex / vbo+attribs / submit). */
@@ -568,12 +992,80 @@ static unsigned long long pgl_d_on, pgl_d_test, pgl_d_oldz_used;
      read   - dest actually consumed: must copy the draw box. */
 static unsigned long long pgl_b_ident, pgl_b_nodest_only, pgl_b_read;
 static unsigned long long pgl_blend_gl_draws, pgl_blend_sw_draws;
-static int pgl_blend_gl_on;       /* opt-in: DQ8_GL_BLENDS=1 */
+/* t_6b81015d: framebuffer-fetch feedback-loop ordering (see pgl_dst_barrier). */
+static int pgl_rt_wrote;          /* RT written since the last barrier */
+/* t_2d934e23: boxes of the RT writes since the last barrier.  The fb-fetch
+   surface is read SCREEN-ALIGNED (imageLoad(u_dstimg, ivec2(gl_FragCoord.xy))),
+   so a draw can only observe prior writes that overlap its own box.  Each
+   rect is a conservative superset of written pixels (the draw's clamped bbox)
+   and the list holds every unbarriered draw's rect (capped; on overflow two
+   rects are merged, which only ever makes the test more conservative), so
+   skipping the barrier when no rect intersects cannot change a single output
+   pixel. */
+#define PGL_WRECT_MAX 8
+static int pgl_wrect[PGL_WRECT_MAX][4];
+static int pgl_nwrect;
+static void pgl_wrect_add(int x0, int y0, int x1, int y1) {
+    if (pgl_nwrect < PGL_WRECT_MAX) {
+        int *r = pgl_wrect[pgl_nwrect++];
+        r[0] = x0; r[1] = y0; r[2] = x1; r[3] = y1;
+        return;
+    }
+    if (pgl_nwrect >= 2) {   /* merge the two oldest into one */
+        int *a = pgl_wrect[0], *b = pgl_wrect[1];
+        int i, *last;
+        if (b[0] < a[0]) a[0] = b[0];
+        if (b[1] < a[1]) a[1] = b[1];
+        if (b[2] > a[2]) a[2] = b[2];
+        if (b[3] > a[3]) a[3] = b[3];
+        last = pgl_wrect[--pgl_nwrect];
+        for (i = 0; i < 4; ++i) b[i] = last[i];
+        pgl_wrect_add(x0, y0, x1, y1);
+    } else {
+        int *a = pgl_wrect[0];
+        if (x0 < a[0]) a[0] = x0;
+        if (y0 < a[1]) a[1] = y0;
+        if (x1 > a[2]) a[2] = x1;
+        if (y1 > a[3]) a[3] = y1;
+    }
+}
+static int pgl_wrect_hit(int x0, int y0, int x1, int y1) {
+    int i;
+    for (i = 0; i < pgl_nwrect; ++i) {
+        const int *r = pgl_wrect[i];
+        if (!(x1 < r[0] || x0 > r[2] || y1 < r[1] || y0 > r[3])) return 1;
+    }
+    return 0;
+}
+static unsigned long long pgl_texbar_skip;
+static unsigned long long pgl_texbarriers;
+static int pgl_texbarrier_on = -1;
+static int pgl_blend_gl_on;       /* DQ8_GL_BLENDS=0 disables (default on) */
+static int pgl_perbuf_blend;      /* glBlendFunci/glBlendEquationi present */
+static int pgl_blend_depth_guard = 1; /* DQ8_GL_BLENDDEPTH=0 skips the guard
+                                         (A/B: reproduces the pre-fix bug) */
+static unsigned long long pgl_blend_gl_depthfix; /* blend draws drawn with the
+                                                    depth attachment replaced */
+/* t_d559a510: the GL blend state (draw buffer 0 factors + the per-buffer
+   REPLACE on the depth attachment) is PERSISTENT context state: it only has to
+   be re-applied when the PICA blend configuration changes.  Applying it per
+   draw costs two indexed blend calls per draw, and llvmpipe re-validates its
+   rasteriser variant on every per-buffer blend change (~1.2 ms/draw measured at
+   the operator's menu) — that is the whole saving of the fixed-function path.
+   pgl_blend_key holds the last applied PICA configuration;
+   pgl_blend_state_sets counts real applications (GLPHASE glb_sets). */
+static int pgl_blend_applied = -1;   /* -1 = nothing applied yet */
+static unsigned pgl_blend_key[6];
+static PGfloat pgl_blend_key_const[4];
+static int pgl_blend_guard_armed;    /* COLOR_ATTACHMENT1 = replace is set */
+static unsigned long long pgl_blend_state_sets;
+static int pgl_blend_enabled = -1;   /* last glEnable/glDisable(GL_BLEND) */
 /* t_8c05fac8: framebuffer fetch.  1 = the fragment shader imageLoads the
    render-target textures directly (GL_ARB_shader_image_load_store, no
    per-draw FBO read => no llvmpipe queue drain); 0 = legacy per-draw
-   glCopyTexSubImage2D path.  Decided once in pgl_setup from
-   DQ8_GL_FBFETCH (default on) + extension presence + DQ8_GL_DSTALWAYS. */
+   glCopyTexSubImage2D path.  Decided once in pgl_setup: t_9651f10a DEFAULT
+   ON for the known-good renderer allowlist (llvmpipe/softpipe/swrast +
+   radeonsi), opt-in elsewhere, DQ8_GL_FBFETCH=0 forces the copies. */
 static int pgl_fbfetch;
 /* t_cb8723ae: guest-thread enqueue accounting for the GL worker split
    (GLPHASE enq_ms).  Atomic because the worker's pgl_ph_report reads/resets
@@ -581,6 +1073,20 @@ static int pgl_fbfetch;
 static _Atomic unsigned long long pgl_enq_n, pgl_enq_ns, pgl_enq_full_waits;
 static unsigned long long pgl_split_draw_fail; /* worker: draw_locked returned 0 */
 static double pgl_ph_last;
+/* t_5ddc492f: fragment-shader specialisation state reported by
+   pgl_ph_report (the cache itself is defined next to pgl_build_program). */
+static int pgl_nspec;
+static unsigned long long pgl_spec_draws, pgl_spec_gen_draws, pgl_spec_fail;
+static unsigned long long pgl_verify_n, pgl_verify_cmism, pgl_verify_zmism;
+static void pgl_shape_report(void);
+static void pgl_spec_report(void);
+
+/* t_6f9e3fed: why the split path did or did not re-sync the FBO at enqueue
+   (the counters pgl_refr_needed's gate is judged by).  need = capture ran the
+   diff, skip = the guest had not touched the render target, ff = need because
+   pgl_force_full was set, gd = need because a guest store hit the RT range. */
+static unsigned long long pgl_scap_need, pgl_scap_skip, pgl_scap_ff, pgl_scap_gd;
+
 static void pgl_ph_report(void) {
     double now = (double)pica_pqt_now_ns() / 1e9;
     if (pgl_ph_last == 0.0) { pgl_ph_last = now; return; }
@@ -591,7 +1097,13 @@ static void pgl_ph_report(void) {
             "d_on=%llu d_test=%llu d_oldz=%llu "
             "b_read=%llu b_ident=%llu b_nodst=%llu "
             "u_ms=%.1f vbo_ms=%.1f sub_ms=%.1f "
-            "enq_n=%llu enq_ms=%.1f fullwait_ms=%.1f split_fail=%llu\n", pgl_ph_n,
+            "enq_n=%llu enq_ms=%.1f fullwait_ms=%.1f split_fail=%llu "
+            "texbar=%llu tbskip=%llu glb_depth=%llu glb_sets=%llu "
+            "clear_pins=%llu clear_clobber=%llu cmask_depth=%llu "
+            "ens_ms=%.1f ref_ms=%.1f refeq=%llu zrefeq=%llu refuni=%llu refblk=%llu "
+            "scap=%llu/%llu scapff=%llu scapgd=%llu "
+            "boxpx=%llu wbfast=%llu spec=%llu gen=%llu schfail=%llu nvar=%d "
+            "vn=%llu vcmis=%llu vzmis=%llu\n", pgl_ph_n,
             (double)pgl_ph_setup_ns / 1e6, (double)pgl_ph_copy_ns / 1e6,
             (double)pgl_ph_draw_ns / 1e6,
             (double)(pgl_ph_setup_ns + pgl_ph_copy_ns + pgl_ph_draw_ns) /
@@ -606,8 +1118,25 @@ static void pgl_ph_report(void) {
             (unsigned long long)atomic_load_explicit(&pgl_enq_n, memory_order_relaxed),
             (double)atomic_load_explicit(&pgl_enq_ns, memory_order_relaxed) / 1e6,
             (double)atomic_load_explicit(&pgl_enq_full_waits, memory_order_relaxed) / 1e6,
-            pgl_split_draw_fail);
+            pgl_split_draw_fail, pgl_texbarriers, pgl_texbar_skip,
+            pgl_blend_gl_depthfix,
+            pgl_blend_state_sets, pgl_clear_pins, pgl_clear_would_clobber,
+            pgl_draws_cmask_depth,
+            (double)pgl_ph_ens_ns / 1e6, (double)pgl_ph_ref_ns / 1e6,
+            pgl_ph_ref_eq, pgl_ph_zref_eq, pgl_ph_ref_uniform, pgl_ph_ref_blocks,
+            pgl_scap_need, pgl_scap_skip, pgl_scap_ff, pgl_scap_gd,
+            pgl_ph_box_px / (pgl_ph_n ? pgl_ph_n : 1u), pgl_wb_fast,
+            pgl_spec_draws, pgl_spec_gen_draws, pgl_spec_fail, pgl_nspec,
+            pgl_verify_n, pgl_verify_cmism, pgl_verify_zmism);
+    pgl_spec_draws = pgl_spec_gen_draws = pgl_spec_fail = 0;
+    pgl_verify_n = pgl_verify_cmism = pgl_verify_zmism = 0;
+    pgl_shape_report();
+    pgl_spec_report();
     pgl_ph_n = pgl_ph_setup_ns = pgl_ph_copy_ns = pgl_ph_draw_ns = 0;
+    pgl_ph_ens_ns = pgl_ph_ref_ns = 0;
+    pgl_ph_ref_eq = pgl_ph_zref_eq = 0;
+    pgl_ph_ref_uniform = pgl_ph_ref_blocks = pgl_ph_box_px = 0;
+    pgl_wb_fast = 0;
     pgl_ph_dst_ns = pgl_ph_zdst_ns = 0;
     pgl_ph_u_ns = pgl_ph_vbo_ns = pgl_ph_sub_ns = 0;
     atomic_store_explicit(&pgl_enq_n, 0, memory_order_relaxed);
@@ -670,6 +1199,29 @@ static void pgl_request_resync(void) {
     }
 }
 
+/* t_8510204b: DEPTH-ONLY invalidation.  The depth mirror (ATT1) and the real
+   D32F attachment are refreshed from guest depth memory only when the guest
+   bytes differ from pgl_zshadow; pgl_zshadow is declared "in sync" after every
+   write-back.  But pgl_wb_depth deliberately SKIPS pixels the guest rewrote
+   after the draw ("later guest write wins"), and those pixels leave the
+   attachment holding the rendered value while the shadow claims the guest
+   value.  A later guest fill/clear of the depth region then compares equal to
+   the shadow and skips the refresh, so the attachment keeps the PREVIOUS
+   frame's depth: every fragment of the new frame fails the test there and the
+   colour attachment shows the clear colour - the black diagonal bands and the
+   sky wedge through the terrain holes seen in battle (field never triggers a
+   mid-frame guest depth write, which is why the same build looked right
+   there).  Raising the force-full flag when a write-back skips a pixel keeps
+   the shadow honest: the next refresh re-uploads the region the guest owns,
+   exactly as the guest-write case already did. */
+static void pgl_request_zresync(void) {
+    if (pgl_split_on) {
+        atomic_store_explicit(&pgl_split_resync, 1, memory_order_release);
+    } else {
+        pgl_zforce_full = 1;
+    }
+}
+
 static const char *pgl_err_name(PGenum e) {
     switch (e) {
     case 0x0500u: return "GL_INVALID_ENUM";
@@ -697,6 +1249,17 @@ static unsigned pgl_drain_errors(const char *stage, PGenum *first_err) {
             fprintf(stderr, "GL debug: %s: err=0x%04X %s (draw #%llu)\n",
                     stage, (unsigned)e, pgl_err_name(e),
                     (unsigned long long)pgl_draws);
+        /* t_a22413f1 run3: a diagnostic binary cannot be gated on
+           DQ8_GL_DEBUG (the operator's log must show the failures without a
+           rebuild), so the first 40 errors are always logged. */
+        if (!pgl_debug && pgl_errs_logged < 40u) {
+            ++pgl_errs_logged;
+            fprintf(stderr, "GL ERROR: %s: err=0x%04X %s (draw #%llu, "
+                            "depth=%s)\n",
+                    stage, (unsigned)e, pgl_err_name(e),
+                    (unsigned long long)pgl_draws,
+                    pgl_depth_hw ? "HARDWARE" : "IN-SHADER");
+        }
         if (++count >= 64u) break; /* pathological loop guard */
     }
     return count;
@@ -753,6 +1316,8 @@ static const char pgl_fs_src[] =
     "uniform float u_alpha_ref;\n"
     /* Depth test/write (mirrors pica_fragment_depth/pica_depth_test_write). */
     "uniform int u_depth_on;\n"
+    "uniform int u_depth_hw;\n"
+    "/* t_a22413f1 run3: 1 = hardware depth attachment path. */\n"
     "uniform int u_depth_test;\n"
     "uniform int u_depth_write;\n"
     "uniform int u_depth_func;\n"
@@ -785,6 +1350,9 @@ static const char pgl_fs_src[] =
     "out vec4 frag;\n"
     "out float frag_z;\n"
     "float sat(float x) { return min(1.0, max(0.0, x)); }\n"
+    "vec2 sat(vec2 v) { return clamp(v, 0.0, 1.0); }\n"
+    "vec3 sat(vec3 v) { return clamp(v, 0.0, 1.0); }\n"
+    "vec4 sat(vec4 v) { return clamp(v, 0.0, 1.0); }\n"
     "vec4 sel_src(int s, vec4 prim, vec4 tex, vec4 prev, vec4 buf, vec4 cst) {\n"
     "    if (s == 0) return prim;\n"
     "    if (s == 3) return tex;\n"
@@ -918,31 +1486,50 @@ static const char pgl_fs_src[] =
     "        if (!pass) discard;\n"
     "    }\n"
     /* Depth test/write (pica_write_fragment runs it before blending; a
-       failed test writes nothing at all).  z = trunc(depth * zmax) is kept
-       as an exact integer-valued float in the R32F buffer. */
+       failed test writes nothing at all).
+       t_a22413f1: the TEST and the WRITE are done by the rasterizer against
+       the real GL depth attachment (gl_FragDepth = zf/2^24, an exact power-of-
+       two scaling, so the float ordering IS the integer z ordering and equal
+       zf compare exactly equal).  The shader therefore no longer reads "old"
+       depth from the emulated R32F mirror: a per-draw snapshot of that mirror
+       (or a spec-undefined imageLoad of it) made two triangles of ONE draw
+       test against the pre-draw depth instead of each other, so the last-
+       rasterised triangle won even when farther — the "holes"/wrong-surface
+       patches on a character model (one draw, hundreds of overlapping
+       triangles).  attr frag_z still carries the raw integer z for the guest
+       write-back path; it is colour-masked off when depth writing is off. */
+    "    gl_FragDepth = gl_FragCoord.z;\n"
     "    if (u_depth_on != 0) {\n"
     "        float depth = zw * u_depth_scale + u_depth_offset;\n"
     "        if (u_depth_zbuf == 0 && iw > 0.0) depth /= iw;\n"
     "        depth = sat(depth);\n"
     "        float zf = floor(depth * u_depth_zmax);\n"
+    "        frag_z = zf;\n"
+    "        if (u_depth_hw != 0) {\n"
+    "            gl_FragDepth = clamp(zf * (1.0 / 16777216.0), 0.0, 1.0);\n"
+    "        } else {\n"
+    "            float oldz;\n"
+    "            if (u_zdst_used != 0) {\n"
     "#if DQ8_FBFETCH\n"
-    "        float oldz = (u_zdst_used != 0) ? imageLoad(u_zimg, ivec2(px)).r : 0.0;\n"
+    "                oldz = imageLoad(u_zimg, ivec2(px)).r;\n"
     "#else\n"
-    "        float oldz = (u_zdst_used != 0) ? texelFetch(u_zdst, ivec2(px) - ivec2(u_dst_off), 0).r : 0.0;\n"
+    "                oldz = texelFetch(u_zdst, ivec2(px) - ivec2(u_dst_off), 0).r;\n"
     "#endif\n"
-    "        if (u_depth_test != 0) {\n"
-    "            bool pass;\n"
-    "            if (u_depth_func == 0) pass = false;\n"
-    "            else if (u_depth_func == 1) pass = true;\n"
-    "            else if (u_depth_func == 2) pass = (zf == oldz);\n"
-    "            else if (u_depth_func == 3) pass = (zf != oldz);\n"
-    "            else if (u_depth_func == 4) pass = (zf < oldz);\n"
-    "            else if (u_depth_func == 5) pass = (zf <= oldz);\n"
-    "            else if (u_depth_func == 6) pass = (zf > oldz);\n"
-    "            else pass = (zf >= oldz);\n"
-    "            if (!pass) discard;\n"
+    "            } else { oldz = 0.0; }\n"
+    "            if (u_depth_test != 0) {\n"
+    "                bool zpass;\n"
+    "                if (u_depth_func == 0) zpass = false;\n"
+    "                else if (u_depth_func == 1) zpass = true;\n"
+    "                else if (u_depth_func == 2) zpass = (zf == oldz);\n"
+    "                else if (u_depth_func == 3) zpass = (zf != oldz);\n"
+    "                else if (u_depth_func == 4) zpass = (zf < oldz);\n"
+    "                else if (u_depth_func == 5) zpass = (zf <= oldz);\n"
+    "                else if (u_depth_func == 6) zpass = (zf > oldz);\n"
+    "                else zpass = (zf >= oldz);\n"
+    "                if (!zpass) discard;\n"
+    "            }\n"
+    "            frag_z = (u_depth_write != 0) ? zf : oldz;\n"
     "        }\n"
-    "        frag_z = (u_depth_write != 0) ? zf : oldz;\n"
     "    } else {\n"
     "        frag_z = 0.0;\n"
     "    }\n"
@@ -1057,6 +1644,41 @@ static int pgl_load(PicaGlGetProc getproc) {
     pgl_glGetStringi = (PFN_glGetStringi)getproc("glGetStringi");
     pgl_glBindImageTexture =
         (PFN_glBindImageTexture)getproc("glBindImageTexture");
+    /* t_6b81015d: ordering primitive for the live-image reads above. */
+    pgl_glTextureBarrier = (PFN_glTextureBarrier)getproc("glTextureBarrier");
+    if (!pgl_glTextureBarrier)
+        pgl_glTextureBarrier =
+            (PFN_glTextureBarrier)getproc("glTextureBarrierNV");
+    pgl_glMemoryBarrier = (PFN_glMemoryBarrier)getproc("glMemoryBarrier");
+    if (!pgl_glMemoryBarrier)
+        pgl_glMemoryBarrier = (PFN_glMemoryBarrier)getproc("glMemoryBarrierEXT");
+    /* t_d559a510: per-draw-buffer blend state (GL 4.0 core, or
+       ARB_draw_buffers_blend as glBlendFuncSeparateiARB).  Soft-loaded: when
+       absent the fixed-function blend path refuses depth draws, which keeps
+       the emulated depth buffer (COLOR_ATTACHMENT1) out of the blend. */
+    pgl_glBlendFunci = (PFN_glBlendFunci)getproc("glBlendFunci");
+    if (!pgl_glBlendFunci)
+        pgl_glBlendFunci = (PFN_glBlendFunci)getproc("glBlendFuncSeparatei");
+    pgl_glBlendEquationi = (PFN_glBlendEquationi)getproc("glBlendEquationi");
+    if (!pgl_glBlendEquationi)
+        pgl_glBlendEquationi = (PFN_glBlendEquationi)getproc("glBlendEquationSeparatei");
+    pgl_perbuf_blend = (pgl_glBlendFunci && pgl_glBlendEquationi) ? 1 : 0;
+    /* t_993e6fb6: per-buffer colour mask.  Without it the PICA colour mask is
+       applied to COLOR_ATTACHMENT1 too, so a colour-masked (depth-only) draw
+       silently drops its depth-mirror write and every later depth test reads
+       stale z. */
+    pgl_glColorMaski = (PFN_glColorMaski)getproc("glColorMaski");
+    if (!pgl_glColorMaski)
+        pgl_glColorMaski = (PFN_glColorMaski)getproc("glColorMaskIndexedEXT");
+    /* t_a22413f1: the hardware depth test/write state.  Core GL 1.0; if a
+       loader cannot resolve them the backend refuses depth draws (see
+       pica_gl_depth_ok) instead of silently rendering without a depth test. */
+    pgl_glDepthFunc = (PFN_glDepthFunc)getproc("glDepthFunc");
+    pgl_glDepthMask = (PFN_glDepthMask)getproc("glDepthMask");
+    pgl_depth_ok = (pgl_glDepthFunc && pgl_glDepthMask) ? 1 : 0;
+    if (!pgl_depth_ok)
+        fprintf(stderr, "GL backend: glDepthFunc/glDepthMask unavailable -> "
+                        "depth draws stay on the software rasterizer\n");
     return 1;
 }
 
@@ -1084,6 +1706,1114 @@ static PGuint pgl_compile(PGenum type, const char *src) {
     return sh;
 }
 
+/* ---- t_5ddc492f: fragment-shader specialisation -------------------------
+   The generic fragment shader (pgl_fs_src) evaluates the WHOLE PICA pipeline
+   from uniforms for every fragment: the 6-stage TEV combiner chain (18 source
+   selectors, 18 modifiers and 12 combine ops as dynamic selector chains), the
+   depth probe (an imageLoad of the R32F target) and the shader blend (another
+   imageLoad of the RGBA8 target).  llvmpipe JITs that as straight-line code
+   and charges it per covered pixel; measured on the savestate scene it is
+   63-65 % of wall (~1.8 ms per draw of a ~34 k-px box, GLPHASE sub_ms).
+
+   A scene only uses a handful of state shapes, so the backend now GENERATES a
+   fragment shader per shape - TEV stages unrolled with source selectors,
+   modifiers, operators and shifts baked as literals; no destination/depth
+   image read when the draw never consumes it; alpha test, depth compare and
+   blend factors baked - and caches the linked programs.  Entry 0 is always
+   the generic program and every failure path (compile error, cache full,
+   DQ8_GL_SPEC=0) falls back to it, so correctness cannot regress.  The
+   generated code performs the SAME float operations in the SAME order as
+   pgl_fs_src / pica_tev() (src/pica_vs.c).
+
+   Knobs:
+     DQ8_GL_SPEC=0         disable (generic program only) - A/B reference
+     DQ8_GL_SPEC_MAX=n     cache size, includes the generic entry (40)
+     DQ8_GL_SPEC_DEBUG=1   dump every generated source to stderr
+     DQ8_GL_SPEC_VERIFY=n  in-process A/B: re-render up to n draws that do not
+                           read the target with the generic program and compare
+                           the colour/depth box hashes (pgl_spec_verify)
+     DQ8_GL_SHAPEHIST=1    report the per-feature draw histogram (GLPHASE)
+*/
+typedef struct { char *p; size_t n, cap; } PglSb;
+
+static void pgl_sb_add(PglSb *b, const char *s) {
+    size_t l = strlen(s);
+    if (b->n + l + 1u > b->cap) {
+        size_t nc = b->cap ? b->cap : 8192u;
+        char *np;
+        while (nc < b->n + l + 1u) nc *= 2u;
+        np = (char *)realloc(b->p, nc);
+        if (!np) { free(b->p); b->p = NULL; b->n = b->cap = 0; return; }
+        b->p = np;
+        b->cap = nc;
+    }
+    memcpy(b->p + b->n, s, l + 1u);
+    b->n += l;
+}
+static void pgl_sb_f(PglSb *b, const char *fmt, ...) {
+    char tmp[1024];
+    va_list ap;
+    int k;
+    va_start(ap, fmt);
+    k = vsnprintf(tmp, sizeof tmp, fmt, ap);
+    va_end(ap);
+    if (k > 0) pgl_sb_add(b, tmp);
+}
+/* Print a float as a GLSL literal that round-trips to the same float (9
+   significant digits is exactly that guarantee) with an explicit fraction, so
+   1 prints as "1.0" and never as an int literal. */
+static void pgl_ffl(float v, char *out, size_t n) {
+    snprintf(out, n, "%.9g", (double)v);
+    if (!strpbrk(out, ".eE")) {
+        size_t l = strlen(out);
+        if (l + 3u < n) { out[l] = '.'; out[l + 1u] = '0'; out[l + 2u] = 0; }
+    }
+}
+/* Operand source, as pica_tev_source() selects it. */
+static void pgl_src_str(char *dst, size_t n, int src, int s) {
+    switch (src) {
+    case 0:  snprintf(dst, n, "prim"); break;
+    case 3:  snprintf(dst, n, "texel"); break;
+    case 13: snprintf(dst, n, "buffer"); break;
+    case 14: snprintf(dst, n, "u_const_c[%d]", s); break;
+    case 15: snprintf(dst, n, "previous"); break;
+    default: snprintf(dst, n, "vec4(0.0)"); break;
+    }
+}
+/* Colour modifier (mod_color): (m & 1) negates, the rest picks the channel. */
+static void pgl_emit_cmod(PglSb *b, int m, int src, int s) {
+    char ex[128], base[192];
+    pgl_src_str(ex, sizeof ex, src, s);
+    if (m < 2)       snprintf(base, sizeof base, "(%s).rgb", ex);
+    else if (m < 4)  snprintf(base, sizeof base, "vec3((%s).a)", ex);
+    else if (m < 6)  snprintf(base, sizeof base, "vec3((%s).r)", ex);
+    else if (m < 10) snprintf(base, sizeof base, "vec3((%s).g)", ex);
+    else             snprintf(base, sizeof base, "vec3((%s).b)", ex);
+    if (m & 1) pgl_sb_f(b, "(vec3(1.0) - %s)", base);
+    else       pgl_sb_add(b, base);
+}
+/* Alpha modifier (mod_alpha). */
+static void pgl_emit_amod(PglSb *b, int m, int src, int s) {
+    char ex[128], base[192];
+    const char *ch = (m < 2) ? "a" : (m < 4) ? "r" : (m < 6) ? "g" : "b";
+    pgl_src_str(ex, sizeof ex, src, s);
+    snprintf(base, sizeof base, "(%s).%s", ex, ch);
+    if (m & 1) pgl_sb_f(b, "(1.0 - %s)", base);
+    else       pgl_sb_add(b, base);
+}
+/* tev_op as an inline expression over three scalar expressions. */
+static void pgl_emit_op(PglSb *b, int op, const char *a, const char *bb,
+                        const char *c) {
+    switch (op) {
+    case 0: pgl_sb_add(b, a); break;
+    case 1: pgl_sb_f(b, "(%s * %s)", a, bb); break;
+    case 2: pgl_sb_f(b, "(%s + %s)", a, bb); break;
+    case 3: pgl_sb_f(b, "(%s + %s - 0.5)", a, bb); break;
+    case 4: pgl_sb_f(b, "(%s * %s + %s * (1.0 - %s))", a, c, bb, c); break;
+    case 5: pgl_sb_f(b, "(%s - %s)", a, bb); break;
+    case 8: pgl_sb_f(b, "(%s * %s + %s)", a, bb, c); break;
+    case 9: pgl_sb_f(b, "(min(%s + %s, 1.0) * %s)", a, bb, c); break;
+    default: pgl_sb_add(b, "0.0"); break;
+    }
+}
+/* blend_factor as an inline scalar expression for channel k (0..3). */
+static void pgl_emit_bf(PglSb *b, int f, int k) {
+    switch (f) {
+    case 0: pgl_sb_add(b, "0.0"); break;
+    case 1: pgl_sb_add(b, "1.0"); break;
+    case 2: pgl_sb_f(b, "source[%d]", k); break;
+    case 3: pgl_sb_f(b, "(1.0 - source[%d])", k); break;
+    case 4: pgl_sb_f(b, "dest[%d]", k); break;
+    case 5: pgl_sb_f(b, "(1.0 - dest[%d])", k); break;
+    case 6: pgl_sb_add(b, "source[3]"); break;
+    case 7: pgl_sb_add(b, "(1.0 - source[3])"); break;
+    case 8: pgl_sb_add(b, "dest[3]"); break;
+    case 9: pgl_sb_add(b, "(1.0 - dest[3])"); break;
+    case 10: pgl_sb_f(b, "u_blend_const[%d]", k); break;
+    case 11: pgl_sb_f(b, "(1.0 - u_blend_const[%d])", k); break;
+    case 12: pgl_sb_add(b, "u_blend_const[3]"); break;
+    case 13: pgl_sb_add(b, "(1.0 - u_blend_const[3])"); break;
+    case 14:
+        if (k == 3) pgl_sb_add(b, "1.0");
+        else        pgl_sb_add(b, "min(source[3], 1.0 - dest[3])");
+        break;
+    default: pgl_sb_add(b, "0.0"); break;
+    }
+}
+
+/* EVERY state field hashed here must be baked by pgl_spec_src(); everything
+   else stays a uniform and is passed bit-exactly. */
+static unsigned long long pgl_key_u(unsigned long long h, unsigned v) {
+    h ^= (unsigned long long)v;
+    return h * 1099511628211ull;
+}
+static unsigned long long pgl_key_f(unsigned long long h, float f) {
+    unsigned u;
+    memcpy(&u, &f, sizeof u);
+    return pgl_key_u(h, u);
+}
+static unsigned long long pgl_spec_key(const PicaGlState *st, int gl_blend,
+                                       int dst_used, int zdst_used) {
+    unsigned long long h = 1469598103934665603ull;
+    int j, s;
+    h = pgl_key_u(h, (unsigned)st->mode);
+    h = pgl_key_u(h, (st->mode == PICA_GL_TEV && st->tev.tex_en) ? 1u : 0u);
+    if (st->mode == PICA_GL_TEV) {
+        for (j = 0; j < 18; ++j) {
+            h = pgl_key_u(h, st->tev.src_c[j]);
+            h = pgl_key_u(h, st->tev.mod_c[j]);
+            h = pgl_key_u(h, st->tev.src_a[j]);
+            h = pgl_key_u(h, st->tev.mod_a[j]);
+        }
+        for (s = 0; s < 6; ++s) {
+            h = pgl_key_u(h, st->tev.cop[s] & 15u);
+            h = pgl_key_u(h, st->tev.aop[s] & 15u);
+            h = pgl_key_u(h, st->tev.buf_upd_c[s] ? 1u : 0u);
+            h = pgl_key_u(h, st->tev.buf_upd_a[s] ? 1u : 0u);
+            h = pgl_key_f(h, st->tev.scale_c[s]);
+            h = pgl_key_f(h, st->tev.scale_a[s]);
+        }
+    }
+    h = pgl_key_u(h, st->alpha_test ? (1u + (st->alpha_func & 7u)) : 0u);
+    if (st->depth_on) {
+        h = pgl_key_u(h, 1u + (st->depth_test ? 8u : 0u) +
+                         (st->depth_write ? 16u : 0u) +
+                         (st->depth_zbuf ? 32u : 0u) +
+                         (st->depth_func & 7u));
+    } else {
+        h = pgl_key_u(h, 0u);
+    }
+    h = pgl_key_u(h, (!gl_blend && st->blend) ? 1u : 0u);
+    if (!gl_blend && st->blend) {
+        h = pgl_key_u(h, st->blend_src_rgb & 15u);
+        h = pgl_key_u(h, st->blend_dst_rgb & 15u);
+        h = pgl_key_u(h, st->blend_src_a & 15u);
+        h = pgl_key_u(h, st->blend_dst_a & 15u);
+        h = pgl_key_u(h, st->blend_eq_rgb & 7u);
+        h = pgl_key_u(h, st->blend_eq_a & 7u);
+    }
+    h = pgl_key_u(h, dst_used ? 1u : 0u);
+    h = pgl_key_u(h, zdst_used ? 1u : 0u);
+    h = pgl_key_u(h, pgl_fbfetch ? 1u : 0u);
+    /* t_d8e5ab8c x t_5ddc492f: the depth path is baked into the generated
+       source, so the two variants must never share a cache entry. */
+    h = pgl_key_u(h, pgl_depth_hw ? 1u : 0u);
+    return h ? h : 1ull;   /* 0 is reserved for the generic program */
+}
+
+/* Build the specialised fragment shader source for a matching state. */
+static char *pgl_spec_src(const PicaGlState *st, int gl_blend, int dst_used,
+                          int zdst_used, size_t *out_len) {
+    PglSb sb;
+    const PicaTev *t = &st->tev;
+    int tev = (st->mode == PICA_GL_TEV);
+    int tex_en = tev && t->tex_en;
+    int blend_en = (!gl_blend && st->blend) ? 1 : 0;
+    int need_texel = 0, need_buffer = 0, need_const = 0, need_bconst = 0;
+    int depth_on = st->depth_on;
+    int use_dst = blend_en && dst_used;
+    int use_zdst = depth_on && zdst_used;
+    int s, i, k;
+    char num[64], num2[64];
+
+    memset(&sb, 0, sizeof sb);
+    if (tev) {
+        for (i = 0; i < 18; ++i) {
+            unsigned sc = t->src_c[i] & 15u, sa = t->src_a[i] & 15u;
+            if (sc == 3u || sa == 3u) need_texel = 1;
+            if (sc == 13u || sa == 13u) need_buffer = 1;
+            if (sc == 14u || sa == 14u) need_const = 1;
+        }
+    }
+    if (blend_en) {
+        const unsigned bf[4] = { st->blend_src_rgb & 15u, st->blend_dst_rgb & 15u,
+                                 st->blend_src_a & 15u, st->blend_dst_a & 15u };
+        for (i = 0; i < 4; ++i)
+            if (bf[i] >= 10u && bf[i] <= 13u) need_bconst = 1;
+    }
+    (void)num;
+
+    pgl_sb_add(&sb, "#version 330 core\n");
+    if (pgl_fbfetch && (use_dst || use_zdst))
+        pgl_sb_add(&sb, "#extension GL_ARB_shader_image_load_store : require\n");
+    pgl_sb_add(&sb, "flat in vec4 g0a, g0b, g0c, g1a, g1b, g1c, g2a, g2b, g2c;\n");
+    if (tex_en) pgl_sb_add(&sb, "uniform sampler2D u_tex;\n");
+    if (pgl_fbfetch) {
+        if (use_dst)
+            pgl_sb_add(&sb, "layout(rgba8) uniform readonly image2D u_dstimg;\n");
+        if (use_zdst)
+            pgl_sb_add(&sb, "layout(r32f) uniform readonly image2D u_zimg;\n");
+    } else {
+        if (use_dst) pgl_sb_add(&sb, "uniform sampler2D u_dst;\n");
+        if (use_zdst) pgl_sb_add(&sb, "uniform sampler2D u_zdst;\n");
+        if (use_dst || use_zdst) pgl_sb_add(&sb, "uniform vec2 u_dst_off;\n");
+    }
+    if (need_const) pgl_sb_add(&sb, "uniform vec4 u_const_c[6];\n");
+    if (need_buffer) pgl_sb_add(&sb, "uniform vec4 u_buf_init;\n");
+    if (st->alpha_test && (st->alpha_func & 7u) != 1u)
+        pgl_sb_add(&sb, "uniform float u_alpha_ref;\n");
+    if (depth_on)
+        pgl_sb_add(&sb, "uniform float u_depth_scale, u_depth_offset, u_depth_zmax;\n");
+    if (need_bconst) pgl_sb_add(&sb, "uniform vec4 u_blend_const;\n");
+    pgl_sb_add(&sb, "out vec4 frag;\nout float frag_z;\n");
+    pgl_sb_add(&sb, "float sat(float x) { return min(1.0, max(0.0, x)); }\n");
+    /* TEV expressions can reduce a whole vector in one call; GLSL has no
+       implicit component-wise overload, so provide the vector forms too. */
+    pgl_sb_add(&sb, "vec2 sat(vec2 v) { return clamp(v, 0.0, 1.0); }\n"
+                    "vec3 sat(vec3 v) { return clamp(v, 0.0, 1.0); }\n"
+                    "vec4 sat(vec4 v) { return clamp(v, 0.0, 1.0); }\n");
+    pgl_sb_add(&sb, "float edge_canon(vec2 u, vec2 v, vec2 p) {\n"
+                    "    bool flip = (v.x < u.x) || (v.x == u.x && v.y < u.y);\n"
+                    "    vec2 a = flip ? v : u;\n"
+                    "    vec2 b = flip ? u : v;\n"
+                    "    float e = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);\n"
+                    "    return flip ? -e : e;\n"
+                    "}\n");
+    pgl_sb_add(&sb, "void main() {\n");
+    pgl_sb_add(&sb, "    vec2 px = gl_FragCoord.xy;\n");
+    /* identical interpolation to the generic shader */
+    pgl_sb_add(&sb, "    float e0 = edge_canon(g1a.xy, g2a.xy, px);\n"
+                    "    float e1 = edge_canon(g2a.xy, g0a.xy, px);\n"
+                    "    float e2 = edge_canon(g0a.xy, g1a.xy, px);\n"
+                    "    float w0 = e0 * g0a.z, w1 = e1 * g1a.z, w2 = e2 * g2a.z;\n"
+                    "    float sum = w0 + w1 + w2;\n"
+                    "    if (abs(sum) < 1e-20) discard;\n"
+                    "    w0 /= sum; w1 /= sum; w2 /= sum;\n"
+                    "    float lsum = e0 + e1 + e2;\n"
+                    "    float zw = (lsum != 0.0) ? (e0 * g0a.w + e1 * g1a.w + e2 * g2a.w) / lsum : g0a.w;\n"
+                    "    float iw = (lsum != 0.0) ? (e0 * g0a.z + e1 * g1a.z + e2 * g2a.z) / lsum : g0a.z;\n");
+    if (tev) {
+        pgl_sb_add(&sb, "    vec4 prim;\n");
+        for (k = 0; k < 4; ++k)
+            pgl_sb_f(&sb, "    prim[%d] = sat(w0 * g0b[%d] + w1 * g1b[%d] + w2 * g2b[%d]);\n",
+                     k, k, k, k);
+        if (tex_en) {
+            pgl_sb_add(&sb, "    float tu = w0 * g0c[0] + w1 * g1c[0] + w2 * g2c[0];\n"
+                            "    float tv = w0 * g0c[1] + w1 * g1c[1] + w2 * g2c[1];\n"
+                            "    vec4 texel = texture(u_tex, vec2(tu, tv));\n");
+        } else if (need_texel) {
+            pgl_sb_add(&sb, "    vec4 texel = vec4(0.0);\n");
+        }
+        if (need_buffer)
+            pgl_sb_add(&sb, "    vec4 buffer = u_buf_init;\n"
+                            "    vec4 pending = buffer;\n");
+        pgl_sb_add(&sb, "    vec4 previous = prim;\n");
+        for (s = 0; s < 6; ++s) {
+            int cop = (int)(t->cop[s] & 15u), aop = (int)(t->aop[s] & 15u);
+            for (i = 0; i < 3; ++i) {
+                pgl_sb_f(&sb, "    vec3 c%d_%d = ", s, i);
+                pgl_emit_cmod(&sb, (int)(t->mod_c[s * 3 + i] & 15u),
+                              (int)(t->src_c[s * 3 + i] & 15u), s);
+                pgl_sb_add(&sb, ";\n");
+                pgl_sb_f(&sb, "    float a%d_%d = ", s, i);
+                pgl_emit_amod(&sb, (int)(t->mod_a[s * 3 + i] & 7u),
+                              (int)(t->src_a[s * 3 + i] & 15u), s);
+                pgl_sb_add(&sb, ";\n");
+            }
+            if (cop == 6 || cop == 7) {
+                pgl_sb_f(&sb, "    float d%d = 0.0;\n", s);
+                pgl_sb_f(&sb, "    d%d += (c%d_0.x - 0.5) * (c%d_1.x - 0.5) * 4.0;\n", s, s, s);
+                pgl_sb_f(&sb, "    d%d += (c%d_0.y - 0.5) * (c%d_1.y - 0.5) * 4.0;\n", s, s, s);
+                pgl_sb_f(&sb, "    d%d += (c%d_0.z - 0.5) * (c%d_1.z - 0.5) * 4.0;\n", s, s, s);
+                pgl_sb_f(&sb, "    vec3 n%d = vec3(sat(d%d));\n", s, s);
+                if (cop == 7) {
+                    /* reference: next[3] = next[0] for cop 7 only */
+                    pgl_sb_f(&sb, "    float na%d = n%d.x;\n", s, s);
+                } else {
+                    char aa[32], ab[32], ac[32];
+                    snprintf(aa, sizeof aa, "a%d_0", s);
+                    snprintf(ab, sizeof ab, "a%d_1", s);
+                    snprintf(ac, sizeof ac, "a%d_2", s);
+                    pgl_sb_f(&sb, "    float na%d = sat(", s);
+                    pgl_emit_op(&sb, aop, aa, ab, ac);
+                    pgl_sb_add(&sb, ");\n");
+                }
+            } else {
+                pgl_sb_f(&sb, "    vec3 n%d = vec3(\n", s);
+                for (k = 0; k < 3; ++k) {
+                    const char *cch = (k == 0) ? "x" : (k == 1) ? "y" : "z";
+                    char ea[32], eb[32], ec[32];
+                    snprintf(ea, sizeof ea, "c%d_0.%s", s, cch);
+                    snprintf(eb, sizeof eb, "c%d_1.%s", s, cch);
+                    snprintf(ec, sizeof ec, "c%d_2.%s", s, cch);
+                    pgl_sb_add(&sb, "        sat(");
+                    pgl_emit_op(&sb, cop, ea, eb, ec);
+                    pgl_sb_add(&sb, k < 2 ? "),\n" : "));\n");
+                }
+                {
+                    char aa[32], ab[32], ac[32];
+                    snprintf(aa, sizeof aa, "a%d_0", s);
+                    snprintf(ab, sizeof ab, "a%d_1", s);
+                    snprintf(ac, sizeof ac, "a%d_2", s);
+                    pgl_sb_f(&sb, "    float na%d = sat(", s);
+                    pgl_emit_op(&sb, aop, aa, ab, ac);
+                    pgl_sb_add(&sb, ");\n");
+                }
+            }
+            if (t->scale_c[s] != 1.0f) {
+                pgl_ffl(t->scale_c[s], num, sizeof num);
+                pgl_sb_f(&sb, "    n%d = sat(n%d * %s);\n", s, s, num);
+            }
+            if (t->scale_a[s] != 1.0f) {
+                pgl_ffl(t->scale_a[s], num2, sizeof num2);
+                pgl_sb_f(&sb, "    na%d = sat(na%d * %s);\n", s, s, num2);
+            }
+            if (need_buffer) pgl_sb_add(&sb, "    buffer = pending;\n");
+            if (need_buffer && s < 4) {
+                if (t->buf_upd_c[s]) pgl_sb_f(&sb, "    pending.rgb = n%d.rgb;\n", s);
+                if (t->buf_upd_a[s]) pgl_sb_f(&sb, "    pending.a = na%d;\n", s);
+            }
+            pgl_sb_f(&sb, "    previous = vec4(n%d, na%d);\n", s, s);
+        }
+        pgl_sb_add(&sb, "    vec4 source = previous;\n");
+    } else {
+        pgl_sb_add(&sb, "    vec4 source = clamp(g0b, 0.0, 1.0);\n");
+    }
+    /* alpha test */
+    if (st->alpha_test) {
+        int f = (int)(st->alpha_func & 7u);
+        if (f != 1) {
+            pgl_sb_add(&sb, "    {\n        float a = floor(source[3] * 255.0 + 0.5);\n"
+                            "        if (!(");
+            switch (f) {
+            case 2: pgl_sb_add(&sb, "a == u_alpha_ref"); break;
+            case 3: pgl_sb_add(&sb, "a != u_alpha_ref"); break;
+            case 4: pgl_sb_add(&sb, "a < u_alpha_ref"); break;
+            case 5: pgl_sb_add(&sb, "a <= u_alpha_ref"); break;
+            case 6: pgl_sb_add(&sb, "a > u_alpha_ref"); break;
+            case 7: pgl_sb_add(&sb, "a >= u_alpha_ref"); break;
+            default: pgl_sb_add(&sb, "false"); break;
+            }
+            pgl_sb_add(&sb, ")) discard;\n    }\n");
+        }
+    }
+    /* depth */
+    if (depth_on) {
+        pgl_sb_add(&sb, "    float depth = zw * u_depth_scale + u_depth_offset;\n");
+        if (!st->depth_zbuf)
+            pgl_sb_add(&sb, "    if (iw > 0.0) depth /= iw;\n");
+        pgl_sb_add(&sb, "    depth = sat(depth);\n"
+                        "    float zf = floor(depth * u_depth_zmax);\n");
+        if (pgl_depth_hw) {
+            /* t_d8e5ab8c x t_5ddc492f: HARDWARE depth (the default).  The
+               rasterizer tests and writes the real DEPTH_COMPONENT32F
+               attachment, so the generated shader only has to hand it the
+               integer z scaled by an exact power of two (float ordering ==
+               integer ordering; equal zf compare exactly equal) and keep
+               frag_z for the guest ATT1 mirror.  No oldz read, no per-fragment
+               depth comparison — that in-shader comparison against a per-draw
+               snapshot was exactly what produced the character "holes".
+               DQ8_GL_DEPTH_ATTACH=0 selects the in-shader A/B below. */
+            pgl_sb_add(&sb, "    gl_FragDepth = clamp(zf * (1.0 / 16777216.0), 0.0, 1.0);\n"
+                            "    frag_z = zf;\n");
+        } else {
+        if (use_zdst) {
+            if (pgl_fbfetch)
+                pgl_sb_add(&sb, "    float oldz = imageLoad(u_zimg, ivec2(px)).r;\n");
+            else
+                pgl_sb_add(&sb, "    float oldz = texelFetch(u_zdst, ivec2(px) - ivec2(u_dst_off), 0).r;\n");
+        } else {
+            pgl_sb_add(&sb, "    float oldz = 0.0;\n");
+        }
+        if (st->depth_test) {
+            int f = (int)(st->depth_func & 7u);
+            if (f == 0) {
+                pgl_sb_add(&sb, "    discard;\n");
+            } else if (f != 1) {
+                switch (f) {
+                case 2: pgl_sb_add(&sb, "    if (!(zf == oldz)) discard;\n"); break;
+                case 3: pgl_sb_add(&sb, "    if (!(zf != oldz)) discard;\n"); break;
+                case 4: pgl_sb_add(&sb, "    if (!(zf < oldz)) discard;\n"); break;
+                case 5: pgl_sb_add(&sb, "    if (!(zf <= oldz)) discard;\n"); break;
+                case 6: pgl_sb_add(&sb, "    if (!(zf > oldz)) discard;\n"); break;
+                default: pgl_sb_add(&sb, "    if (!(zf >= oldz)) discard;\n"); break;
+                }
+            }
+        }
+        pgl_sb_add(&sb, st->depth_write ? "    frag_z = zf;\n" : "    frag_z = oldz;\n");
+        }
+    } else {
+        pgl_sb_add(&sb, "    frag_z = 0.0;\n");
+    }
+    /* blend */
+    if (blend_en) {
+        if (dst_used) {
+            if (pgl_fbfetch)
+                pgl_sb_add(&sb, "    vec4 dest = imageLoad(u_dstimg, ivec2(px));\n");
+            else
+                pgl_sb_add(&sb, "    vec4 dest = texelFetch(u_dst, ivec2(px) - ivec2(u_dst_off), 0);\n");
+        } else {
+            pgl_sb_add(&sb, "    vec4 dest = vec4(0.0);\n");
+        }
+        pgl_sb_add(&sb, "    vec4 value = source;\n");
+        for (k = 0; k < 4; ++k) {
+            int eq = (k == 3) ? (int)(st->blend_eq_a & 7u)
+                              : (int)(st->blend_eq_rgb & 7u);
+            int fs = (k == 3) ? (int)(st->blend_src_a & 15u)
+                              : (int)(st->blend_src_rgb & 15u);
+            int fd = (k == 3) ? (int)(st->blend_dst_a & 15u)
+                              : (int)(st->blend_dst_rgb & 15u);
+            pgl_sb_add(&sb, "    {\n        float fs = ");
+            pgl_emit_bf(&sb, fs, k);
+            pgl_sb_add(&sb, ";\n        float fd = ");
+            pgl_emit_bf(&sb, fd, k);
+            pgl_sb_f(&sb, ";\n        float sv = source[%d] * fs;\n"
+                          "        float dv = dest[%d] * fd;\n", k, k);
+            switch (eq) {
+            case 0: pgl_sb_f(&sb, "        value[%d] = sv + dv;\n", k); break;
+            case 1: pgl_sb_f(&sb, "        value[%d] = sv - dv;\n", k); break;
+            case 2: pgl_sb_f(&sb, "        value[%d] = dv - sv;\n", k); break;
+            case 3: pgl_sb_f(&sb, "        value[%d] = min(source[%d], dest[%d]);\n",
+                             k, k, k); break;
+            default: pgl_sb_f(&sb, "        value[%d] = max(source[%d], dest[%d]);\n",
+                              k, k, k); break;
+            }
+            pgl_sb_add(&sb, "    }\n");
+        }
+    } else {
+        pgl_sb_add(&sb, "    vec4 value = source;\n");
+    }
+    pgl_sb_add(&sb, "    frag = vec4(floor(sat(value[0]) * 255.0 + 0.5),\n"
+                    "                floor(sat(value[1]) * 255.0 + 0.5),\n"
+                    "                floor(sat(value[2]) * 255.0 + 0.5),\n"
+                    "                floor(sat(value[3]) * 255.0 + 0.5)) / 255.0;\n"
+                    "}\n");
+    if (!sb.p) return NULL;
+    if (out_len) *out_len = sb.n;
+    return sb.p;
+}
+
+/* ---- program cache ------------------------------------------------------ */
+typedef struct {
+    PGint rt, mode, tex, alpha_test, alpha_func, alpha_ref, tex_en, dst,
+          dst_off, zdst, dst_used, zdst_used, dstimg, zimg,
+          src_c, mod_c, src_a, mod_a, cop, aop, scale_c, scale_a, const_c,
+          const_c_e[6],
+          buf_init, buf_upd_c, buf_upd_a,
+          blend_en, eq_rgb, eq_a, f_src_rgb, f_dst_rgb, f_src_a, f_dst_a,
+          blend_const,
+          depth_on, depth_test, depth_write, depth_func, depth_zbuf,
+          depth_scale, depth_offset, depth_zmax, depth_hw;
+} PglULoc;
+
+#define PGL_SPEC_MAX 40
+typedef struct {
+    unsigned long long key;
+    PGuint prog;
+    PglULoc u;
+    unsigned long long draws, px, ns;
+    /* t_f8f2c1da: the depth path BAKED into this program's generated source
+       (pgl_spec_src branches on pgl_depth_hw).  -1 = entry 0, the generic
+       program, which selects the path at run time through u_depth_hw and is
+       valid in both modes.  Compared against the live mode on every use by the
+       DQ8_GL_SPEC_MODECHECK tripwire so a stale variant can never be served
+       silently again. */
+    int depth_hw;
+} PglProgSpec;
+
+static PglProgSpec pgl_spec[PGL_SPEC_MAX];
+/* pgl_nspec, pgl_spec_draws/gen_draws/fail and the verify counters are
+   declared above pgl_ph_report, which reports them. */
+static int pgl_spec_on = -1;          /* -1 = not decided, 0/1 = knob */
+static int pgl_spec_max = PGL_SPEC_MAX;
+static int pgl_spec_dbg = -1;
+/* t_f8f2c1da: tripwire state.  modecheck_n counts every use of a program whose
+   baked depth path disagrees with the live one (must stay 0).  The knob only
+   controls logging: -1 unparsed, 1 = log each violation, 2 = also abort. */
+static int pgl_spec_modecheck = -1;
+static unsigned long long pgl_spec_modecheck_n;
+static int pgl_depth_mode_ready;      /* set once the path is decided for good */
+static void pgl_spec_modecheck_use(const PglProgSpec *e, const char *where);
+static PGuint pgl_prog_cur;
+static unsigned long long pgl_spec_compiles;
+static int pgl_verify_on = -1, pgl_verify_limit;
+/* program/side of the draw currently being submitted */
+static PglProgSpec *pgl_cur_prog;
+static int pgl_cur_dst_used, pgl_cur_zdst_used;
+
+static void pgl_query_locs(PGuint prog, PglULoc *l) {
+#define PGL_LOC(f, name) l->f = pgl_glGetUniformLocation(prog, name)
+    PGL_LOC(rt, "u_rt");
+    PGL_LOC(mode, "u_mode");
+    PGL_LOC(tex, "u_tex");
+    PGL_LOC(alpha_test, "u_alpha_test");
+    PGL_LOC(alpha_func, "u_alpha_func");
+    PGL_LOC(alpha_ref, "u_alpha_ref");
+    PGL_LOC(tex_en, "u_tex_en");
+    PGL_LOC(dst, "u_dst");
+    PGL_LOC(dst_off, "u_dst_off");
+    PGL_LOC(dst_used, "u_dst_used");
+    PGL_LOC(zdst_used, "u_zdst_used");
+    PGL_LOC(src_c, "u_src_c");
+    PGL_LOC(mod_c, "u_mod_c");
+    PGL_LOC(src_a, "u_src_a");
+    PGL_LOC(mod_a, "u_mod_a");
+    PGL_LOC(cop, "u_cop");
+    PGL_LOC(aop, "u_aop");
+    PGL_LOC(scale_c, "u_scale_c");
+    PGL_LOC(scale_a, "u_scale_a");
+    PGL_LOC(const_c, "u_const_c");
+    {
+        int ci;
+        for (ci = 0; ci < 6; ++ci) {
+            char nm[32];
+            snprintf(nm, sizeof nm, "u_const_c[%d]", ci);
+            l->const_c_e[ci] = pgl_glGetUniformLocation(prog, nm);
+        }
+    }
+    PGL_LOC(buf_init, "u_buf_init");
+    PGL_LOC(buf_upd_c, "u_buf_upd_c");
+    PGL_LOC(buf_upd_a, "u_buf_upd_a");
+    PGL_LOC(blend_en, "u_blend_en");
+    PGL_LOC(eq_rgb, "u_eq_rgb");
+    PGL_LOC(eq_a, "u_eq_a");
+    PGL_LOC(f_src_rgb, "u_f_src_rgb");
+    PGL_LOC(f_dst_rgb, "u_f_dst_rgb");
+    PGL_LOC(f_src_a, "u_f_src_a");
+    PGL_LOC(f_dst_a, "u_f_dst_a");
+    PGL_LOC(blend_const, "u_blend_const");
+    PGL_LOC(zdst, "u_zdst");
+    PGL_LOC(depth_on, "u_depth_on");
+    PGL_LOC(depth_test, "u_depth_test");
+    PGL_LOC(depth_write, "u_depth_write");
+    PGL_LOC(depth_func, "u_depth_func");
+    PGL_LOC(depth_zbuf, "u_depth_zbuf");
+    PGL_LOC(depth_scale, "u_depth_scale");
+    PGL_LOC(depth_offset, "u_depth_offset");
+    PGL_LOC(depth_zmax, "u_depth_zmax");
+    /* t_a22413f1 run3: MUST be looked up — a location of 0 is a real
+       location, and glUniform1i(0, ...) then overwrites whatever uniform
+       sits at 0 (it made the first hardware-depth build render a black
+       frame).  Kept for the generic program (which still branches on it). */
+    PGL_LOC(depth_hw, "u_depth_hw");
+    PGL_LOC(dstimg, "u_dstimg");
+    PGL_LOC(zimg, "u_zimg");
+#undef PGL_LOC
+    /* t_8c05fac8: image-unit assignment is program state, set once. */
+    if (l->dstimg >= 0 || l->zimg >= 0) {
+        pgl_glUseProgram(prog);
+        if (l->dstimg >= 0) pgl_glUniform1i(l->dstimg, 0);
+        if (l->zimg >= 0) pgl_glUniform1i(l->zimg, 1);
+    }
+}
+
+/* Make entry e's program current and publish its uniform locations to the
+   pgl_u_* globals the uniform upload uses. */
+static void pgl_prog_use(PglProgSpec *e) {
+    const PglULoc *l = &e->u;
+    /* Uniform values live per program: when the draw switches to another
+       specialised variant (or back to the generic one) the depth-mode
+       uniform of THAT program is whatever it was last set to, or 0 for a
+       newly linked program, so the "already applied" cache must be
+       invalidated on every program change. */
+    if (pgl_prog_cur != e->prog) pgl_depth_hw_applied = -1;
+    pgl_prog_cur = e->prog;
+    pgl_glUseProgram(e->prog);
+    pgl_u_rt = l->rt; pgl_u_mode = l->mode; pgl_u_tex = l->tex;
+    pgl_u_alpha_test = l->alpha_test; pgl_u_alpha_func = l->alpha_func;
+    pgl_u_alpha_ref = l->alpha_ref; pgl_u_tex_en = l->tex_en;
+    pgl_u_dst = l->dst; pgl_u_dst_off = l->dst_off; pgl_u_zdst = l->zdst;
+    pgl_u_dst_used = l->dst_used; pgl_u_zdst_used = l->zdst_used;
+    pgl_u_dstimg = l->dstimg; pgl_u_zimg = l->zimg;
+    pgl_u_src_c = l->src_c; pgl_u_mod_c = l->mod_c;
+    pgl_u_src_a = l->src_a; pgl_u_mod_a = l->mod_a;
+    pgl_u_cop = l->cop; pgl_u_aop = l->aop;
+    pgl_u_scale_c = l->scale_c; pgl_u_scale_a = l->scale_a;
+    pgl_u_const_c = l->const_c; pgl_u_buf_init = l->buf_init;
+    memcpy(pgl_u_const_c_e, l->const_c_e, sizeof pgl_u_const_c_e);
+    pgl_u_buf_upd_c = l->buf_upd_c; pgl_u_buf_upd_a = l->buf_upd_a;
+    pgl_u_blend_en = l->blend_en; pgl_u_eq_rgb = l->eq_rgb;
+    pgl_u_eq_a = l->eq_a; pgl_u_f_src_rgb = l->f_src_rgb;
+    pgl_u_f_dst_rgb = l->f_dst_rgb; pgl_u_f_src_a = l->f_src_a;
+    pgl_u_f_dst_a = l->f_dst_a; pgl_u_blend_const = l->blend_const;
+    pgl_u_depth_on = l->depth_on; pgl_u_depth_test = l->depth_test;
+    pgl_u_depth_write = l->depth_write; pgl_u_depth_func = l->depth_func;
+    pgl_u_depth_zbuf = l->depth_zbuf; pgl_u_depth_scale = l->depth_scale;
+    pgl_u_depth_offset = l->depth_offset; pgl_u_depth_zmax = l->depth_zmax;
+    pgl_u_depth_hw = l->depth_hw;
+}
+
+/* Compile+link one generated fragment shader (vertex shader is shared). */
+static PGuint pgl_spec_link(const char *fs_src, unsigned long long key) {
+    PGuint vs, fs, prog;
+    PGint ok = 0;
+    vs = pgl_compile(PGGL_VERTEX_SHADER, pgl_vs_src);
+    fs = pgl_compile(PGGL_FRAGMENT_SHADER, fs_src);
+    if (!vs || !fs) {
+        if (vs) pgl_glDeleteShader(vs);
+        if (fs) pgl_glDeleteShader(fs);
+        return 0;
+    }
+    prog = pgl_glCreateProgram();
+    pgl_glAttachShader(prog, vs);
+    pgl_glAttachShader(prog, fs);
+    pgl_glLinkProgram(prog);
+    pgl_glGetProgramiv(prog, PGGL_LINK_STATUS, &ok);
+    pgl_glDeleteShader(vs);
+    pgl_glDeleteShader(fs);
+    if (!ok) {
+        char log[2048];
+        PGsizei n = 0;
+        memset(log, 0, sizeof log);
+        pgl_glGetProgramInfoLog(prog, sizeof log, &n, log);
+        fprintf(stderr, "GL backend: specialised program link failed "
+                "(key=%016llx):\n%.*s\n", key, (int)n, log);
+        return 0;
+    }
+    ++pgl_spec_compiles;
+    return prog;
+}
+
+/* Shapes the generator must NOT specialise yet.  Only a TEV stage that READS
+   the buffer (operand source 13) is refused: the reference pica_tev()
+   implements the buffer stage (source 13 + the reg 0xE0 pending updates) and
+   the generated code follows it, but the long-validated GENERIC shader
+   disagrees with both on buffer states (tools/gl_spec_test.c case "tev buffer
+   + mix": the generic result equals u_buf_init, i.e. it does not apply the
+   pending update).  The reg 0xE0 update flags ALONE are harmless - with
+   nothing reading the buffer the updates are dead code - and the savestate
+   scene sets them, so they must not disable the specialisation.
+   Nothing in the DQ8 scene reads the buffer. */
+/* Return the program for this draw: the specialised entry, or the generic
+   fallback (index 0) when specialisation is off / the cache is full / the
+   shape is unsupported / the generated source does not compile. */
+static PglProgSpec *pgl_spec_select(const PicaGlState *st, int gl_blend,
+                                    int dst_used, int zdst_used) {
+    unsigned long long key;
+    char *src;
+    size_t len = 0;
+    PGuint prog;
+    int i;
+    if (pgl_spec_on < 0) {
+        const char *e = getenv("DQ8_GL_SPEC");
+        const char *m = getenv("DQ8_GL_SPEC_MAX");
+        const char *d = getenv("DQ8_GL_SPEC_DEBUG");
+        pgl_spec_on = (e && e[0] == '0') ? 0 : 1;
+        if (m && m[0]) {
+            int v = atoi(m);
+            if (v >= 1 && v <= PGL_SPEC_MAX) pgl_spec_max = v;
+        }
+        pgl_spec_dbg = (d && d[0] && d[0] != '0') ? 1 : 0;
+        fprintf(stderr, "GL backend: fragment-shader specialisation %s "
+                "(cache %d, generic fallback always available)\n",
+                pgl_spec_on ? "ON" : "OFF (DQ8_GL_SPEC=0)", pgl_spec_max);
+    }
+    if (!pgl_spec_on || pgl_nspec <= 0) {
+        ++pgl_spec_gen_draws;
+        return &pgl_spec[0];
+    }
+    key = pgl_spec_key(st, gl_blend, dst_used, zdst_used);
+    for (i = 1; i < pgl_nspec; ++i)
+        if (pgl_spec[i].key == key) {
+            /* t_f8f2c1da: the key already carries the depth path, so this must
+               never fire — that is exactly why it is checked. */
+            pgl_spec_modecheck_use(&pgl_spec[i], "select/cache-hit");
+            return &pgl_spec[i];
+        }
+    if (pgl_nspec >= pgl_spec_max) {
+        ++pgl_spec_gen_draws;
+        return &pgl_spec[0];
+    }
+    /* t_f8f2c1da: a specialised program bakes the depth path, so the path MUST
+       already be decided (pgl_setup, before the first draw).  A generation
+       before that point is the same class of bug as a stale hit. */
+    if (!pgl_depth_mode_ready) {
+        ++pgl_spec_modecheck_n;
+        fprintf(stderr, "GL SPEC MODECHECK VIOLATION (generate): specialised "
+                        "program generated before the depth path was decided "
+                        "(draw=%llu)\n", (unsigned long long)pgl_draws);
+    }
+    src = pgl_spec_src(st, gl_blend, dst_used, zdst_used, &len);
+    if (!src) {
+        ++pgl_spec_gen_draws;
+        ++pgl_spec_fail;
+        return &pgl_spec[0];
+    }
+    if (pgl_spec_dbg)
+        fprintf(stderr, "GL backend: SPEC src key=%016llx mode=%d tex=%d "
+                "blend=%d depth=%d dst=%d zdst=%d len=%zu\n----\n%s----\n",
+                key, st->mode, st->tev.tex_en, (!gl_blend && st->blend),
+                st->depth_on, dst_used, zdst_used, len, src);
+    prog = pgl_spec_link(src, key);
+    free(src);
+    if (!prog) {
+        ++pgl_spec_gen_draws;
+        ++pgl_spec_fail;
+        return &pgl_spec[0];
+    }
+    i = pgl_nspec++;
+    pgl_spec[i].key = key;
+    pgl_spec[i].prog = prog;
+    pgl_spec[i].draws = pgl_spec[i].px = pgl_spec[i].ns = 0;
+    pgl_spec[i].depth_hw = pgl_depth_hw;   /* baked by pgl_spec_src */
+    memset(&pgl_spec[i].u, 0, sizeof pgl_spec[i].u);
+    pgl_query_locs(prog, &pgl_spec[i].u);
+    fprintf(stderr, "GL backend: specialised shader #%d (key=%016llx "
+            "mode=%d tex=%d blend=%d glblend=%d depth=%d/%d/%d alpha=%d "
+            "dst=%d zdst=%d)\n",
+            i, key, st->mode, st->tev.tex_en, st->blend, gl_blend,
+            st->depth_on, st->depth_test, st->depth_write, st->alpha_test,
+            dst_used, zdst_used);
+    return &pgl_spec[i];
+}
+
+/* t_d8e5ab8c x t_5ddc492f: drop every specialised variant.  The generated
+   source bakes the depth path (hardware gl_FragDepth vs the in-shader
+   comparison), so when pgl_depth_fallback flips the mode at run time the
+   cached variants are stale by construction.  Programs are leaked, not
+   deleted (glDeleteProgram is not loaded; the rebuild path does the same). */
+static void pgl_spec_reset(const char *why) {
+    int i, n = pgl_nspec;
+    for (i = 1; i < n; ++i) {
+        pgl_spec[i].prog = 0;
+        pgl_spec[i].key = 0;
+        pgl_spec[i].draws = pgl_spec[i].px = pgl_spec[i].ns = 0;
+        pgl_spec[i].depth_hw = -1;
+        memset(&pgl_spec[i].u, 0, sizeof pgl_spec[i].u);
+    }
+    if (n > 1)
+        fprintf(stderr, "GL backend: specialised cache reset (%s) — %d "
+                        "variant(s) dropped\n", why, n - 1);
+    pgl_nspec = 1;
+    pgl_prog_cur = 0;         /* force pgl_prog_use() to re-establish state */
+    pgl_depth_hw_applied = -1;
+}
+
+/* t_f8f2c1da: the depth path is a PROCESS-WIDE mode that the generated shader
+   source depends on, so it may only be changed through this function: the
+   specialised cache is invalidated in the same step.  Every writer used to do
+   that by hand (and the replay harness had to remember pgl_spec_reset() twice),
+   which is exactly how a stale variant could be served. */
+static void pgl_depth_hw_set(int hw, const char *why) {
+    int prev = pgl_depth_hw;
+    hw = hw ? 1 : 0;
+    pgl_depth_hw = hw;
+    pgl_depth_hw_applied = -1;
+    if (prev == hw) return;
+    /* Before pgl_depth_mode_ready nothing can have been generated yet: the
+       whole point is that the path is chosen ONCE, in pgl_setup, before the
+       first draw and therefore before the first specialised program. */
+    if (!pgl_depth_mode_ready) return;
+    ++pgl_depth_mode_changes;
+    fprintf(stderr, "GL backend: depth path %d -> %d (%s)\n",
+            prev, pgl_depth_hw, why ? why : "?");
+    pgl_spec_reset(why ? why : "depth path changed");
+    /* Guest depth memory may hold values written under the other path, and the
+       attachment/mirror contents are only meaningful for the old mode. */
+    if (!pgl_split_cur) pgl_zforce_full = 1;
+}
+
+/* t_f8f2c1da: tripwire.  Called for every draw that uses a SPECIALISED program
+   and for every cache hit, so a program generated under the other depth path
+   can never be used silently.  The counter is unconditional (one compare); the
+   environment knob only decides how loud it is. */
+static void pgl_spec_modecheck_use(const PglProgSpec *e, const char *where) {
+    /* Entry 0 is the generic program: it selects the path at run time through
+       u_depth_hw, so it is valid in both modes (its depth_hw is -1, but it is
+       also recognised by address because a static array starts zeroed). */
+    if (!e || e == &pgl_spec[0] || e->depth_hw < 0) return;
+    if (e->depth_hw == pgl_depth_hw) return;
+    ++pgl_spec_modecheck_n;
+    if (pgl_spec_modecheck < 0) {
+        const char *m = getenv("DQ8_GL_SPEC_MODECHECK");
+        pgl_spec_modecheck = (m && m[0]) ? atoi(m) : 0;
+    }
+    if (pgl_spec_modecheck > 0) {
+        fprintf(stderr, "GL SPEC MODECHECK VIOLATION (%s): program key=%016llx "
+                        "baked_depth_hw=%d live=%d draw=%llu #%llu\n",
+                where, e->key, e->depth_hw, pgl_depth_hw,
+                (unsigned long long)pgl_draws, pgl_spec_modecheck_n);
+        if (pgl_spec_modecheck >= 2) {
+            fflush(stderr);
+            abort();
+        }
+    }
+}
+
+/* Upload the draw's uniforms into the CURRENT program (pgl_prog_cur).  A
+   specialised program only declares the uniforms its shape needs; every
+   location is checked because the array packing in front of a glUniform* call
+   with location -1 is not free. */
+static void pgl_set_uniforms(const PicaGlState *st, int gl_blend,
+                             int dst_used, int zdst_used, PGint bx0, PGint by0) {
+    if (pgl_spec_dbg > 0)
+        fprintf(stderr, "SPECDBG prog=%u loc_const=%d loc_bufupd_c=%d "
+                "val_bufupd0=%u loc_blend_const=%d loc_tex=%d\n",
+                pgl_prog_cur, pgl_u_const_c, pgl_u_buf_upd_c,
+                st->mode == PICA_GL_TEV ? st->tev.buf_upd_c[0] : 999u,
+                pgl_u_blend_const, pgl_u_tex);
+    pgl_glUseProgram(pgl_prog_cur);
+    if (pgl_u_rt >= 0)
+        pgl_glUniform2f(pgl_u_rt, (PGfloat)st->rt_w, (PGfloat)st->rt_h);
+    if (pgl_u_mode >= 0)
+        pgl_glUniform1i(pgl_u_mode, st->mode == PICA_GL_TEV ? 1 : 0);
+    if (pgl_u_alpha_test >= 0)
+        pgl_glUniform1i(pgl_u_alpha_test, st->alpha_test ? 1 : 0);
+    if (pgl_u_alpha_func >= 0)
+        pgl_glUniform1i(pgl_u_alpha_func, (PGint)st->alpha_func);
+    if (pgl_u_alpha_ref >= 0)
+        pgl_glUniform1f(pgl_u_alpha_ref, st->alpha_ref);
+    if (pgl_u_dst_off >= 0)
+        pgl_glUniform2f(pgl_u_dst_off, (PGfloat)bx0, (PGfloat)by0);
+    if (pgl_u_dst >= 0) pgl_glUniform1i(pgl_u_dst, 1);
+    if (pgl_u_zdst >= 0) pgl_glUniform1i(pgl_u_zdst, 2);
+    if (pgl_u_dst_used >= 0)
+        pgl_glUniform1i(pgl_u_dst_used, dst_used ? 1 : 0);
+    if (pgl_u_zdst_used >= 0)
+        pgl_glUniform1i(pgl_u_zdst_used, zdst_used ? 1 : 0);
+    if (pgl_u_depth_on >= 0)
+        pgl_glUniform1i(pgl_u_depth_on, st->depth_on ? 1 : 0);
+    /* t_d8e5ab8c x t_5ddc492f: the GENERIC program (cache entry 0) still picks
+       the depth path at run time through u_depth_hw; the specialised variants
+       bake the choice into their generated source, so they do not declare the
+       uniform at all (location -1).  The applied value is per-program state —
+       pgl_prog_use() invalidates the cache on every program change — and
+       glUniform1i is never called with location 0 by accident (the location is
+       looked up in pgl_query_locs, never assumed). */
+    if (pgl_u_depth_hw >= 0 && pgl_depth_hw_applied != pgl_depth_hw) {
+        pgl_glUniform1i(pgl_u_depth_hw, pgl_depth_hw ? 1 : 0);
+        pgl_depth_hw_applied = pgl_depth_hw;
+    }
+    if (pgl_u_depth_test >= 0)
+        pgl_glUniform1i(pgl_u_depth_test, st->depth_test ? 1 : 0);
+    if (pgl_u_depth_write >= 0)
+        pgl_glUniform1i(pgl_u_depth_write, st->depth_write ? 1 : 0);
+    if (pgl_u_depth_func >= 0)
+        pgl_glUniform1i(pgl_u_depth_func, (PGint)st->depth_func);
+    if (pgl_u_depth_zbuf >= 0)
+        pgl_glUniform1i(pgl_u_depth_zbuf, st->depth_zbuf ? 1 : 0);
+    if (pgl_u_depth_scale >= 0)
+        pgl_glUniform1f(pgl_u_depth_scale, st->depth_scale);
+    if (pgl_u_depth_offset >= 0)
+        pgl_glUniform1f(pgl_u_depth_offset, st->depth_offset);
+    if (pgl_u_depth_zmax >= 0)
+        pgl_glUniform1f(pgl_u_depth_zmax, st->depth_zmax);
+    if (pgl_u_blend_en >= 0)
+        pgl_glUniform1i(pgl_u_blend_en, (!gl_blend && st->blend) ? 1 : 0);
+    if (pgl_u_eq_rgb >= 0)
+        pgl_glUniform1i(pgl_u_eq_rgb, (PGint)st->blend_eq_rgb);
+    if (pgl_u_eq_a >= 0)
+        pgl_glUniform1i(pgl_u_eq_a, (PGint)st->blend_eq_a);
+    if (pgl_u_f_src_rgb >= 0)
+        pgl_glUniform1i(pgl_u_f_src_rgb, (PGint)st->blend_src_rgb);
+    if (pgl_u_f_dst_rgb >= 0)
+        pgl_glUniform1i(pgl_u_f_dst_rgb, (PGint)st->blend_dst_rgb);
+    if (pgl_u_f_src_a >= 0)
+        pgl_glUniform1i(pgl_u_f_src_a, (PGint)st->blend_src_a);
+    if (pgl_u_f_dst_a >= 0)
+        pgl_glUniform1i(pgl_u_f_dst_a, (PGint)st->blend_dst_a);
+    if (pgl_u_blend_const >= 0)
+        pgl_glUniform4f(pgl_u_blend_const, st->blend_const[0], st->blend_const[1],
+                        st->blend_const[2], st->blend_const[3]);
+    if (st->mode == PICA_GL_TEV) {
+        PGint iv[18];
+        unsigned s, j;
+        if (pgl_u_src_c >= 0) {
+            for (j = 0; j < 18u; ++j) iv[j] = (PGint)st->tev.src_c[j];
+            pgl_glUniform1iv(pgl_u_src_c, 18, iv);
+        }
+        if (pgl_u_mod_c >= 0) {
+            for (j = 0; j < 18u; ++j) iv[j] = (PGint)st->tev.mod_c[j];
+            pgl_glUniform1iv(pgl_u_mod_c, 18, iv);
+        }
+        if (pgl_u_src_a >= 0) {
+            for (j = 0; j < 18u; ++j) iv[j] = (PGint)st->tev.src_a[j];
+            pgl_glUniform1iv(pgl_u_src_a, 18, iv);
+        }
+        if (pgl_u_mod_a >= 0) {
+            for (j = 0; j < 18u; ++j) iv[j] = (PGint)st->tev.mod_a[j];
+            pgl_glUniform1iv(pgl_u_mod_a, 18, iv);
+        }
+        if (pgl_u_cop >= 0) {
+            for (j = 0; j < 6u; ++j) iv[j] = (PGint)st->tev.cop[j];
+            pgl_glUniform1iv(pgl_u_cop, 6, iv);
+        }
+        if (pgl_u_aop >= 0) {
+            for (j = 0; j < 6u; ++j) iv[j] = (PGint)st->tev.aop[j];
+            pgl_glUniform1iv(pgl_u_aop, 6, iv);
+        }
+        if (pgl_u_buf_upd_c >= 0) {
+            for (j = 0; j < 6u; ++j) iv[j] = (PGint)st->tev.buf_upd_c[j];
+            pgl_glUniform1iv(pgl_u_buf_upd_c, 6, iv);
+        }
+        if (pgl_u_buf_upd_a >= 0) {
+            for (j = 0; j < 6u; ++j) iv[j] = (PGint)st->tev.buf_upd_a[j];
+            pgl_glUniform1iv(pgl_u_buf_upd_a, 6, iv);
+        }
+        if (pgl_u_scale_c >= 0) pgl_glUniform1fv(pgl_u_scale_c, 6, st->tev.scale_c);
+        if (pgl_u_scale_a >= 0) pgl_glUniform1fv(pgl_u_scale_a, 6, st->tev.scale_a);
+        if (pgl_u_const_c >= 0)
+            for (s = 0; s < 6u; ++s)
+                if (pgl_u_const_c_e[s] >= 0)
+                    pgl_glUniform4f(pgl_u_const_c_e[s], st->tev.const_c[s][0],
+                                    st->tev.const_c[s][1], st->tev.const_c[s][2],
+                                    st->tev.const_c[s][3]);
+        if (pgl_u_buf_init >= 0)
+            pgl_glUniform4f(pgl_u_buf_init, st->tev.buf_init[0],
+                            st->tev.buf_init[1], st->tev.buf_init[2],
+                            st->tev.buf_init[3]);
+        if (pgl_u_tex_en >= 0)
+            pgl_glUniform1i(pgl_u_tex_en, st->tev.tex_en ? 1 : 0);
+    } else if (pgl_u_tex_en >= 0) {
+        pgl_glUniform1i(pgl_u_tex_en, 0);
+    }
+    if (pgl_u_tex >= 0) pgl_glUniform1i(pgl_u_tex, 0);
+}
+
+/* ---- t_5ddc492f shape histogram (baseline classification) ----------------
+   Independent of the program cache, so DQ8_GL_SHAPEHIST=1 also classifies the
+   draws when the specialisation is off (the A/B reference run). */
+typedef struct {
+    unsigned mask, draws;
+    unsigned long long px, ns;
+} PglShape;
+#define PGL_SHAPE_MAX 128
+static PglShape pgl_shape[PGL_SHAPE_MAX];
+static int pgl_shape_n;
+static int pgl_shape_on = -1;
+
+static unsigned pgl_shape_mask(const PicaGlState *st, int gl_blend,
+                               int dst_used, int zdst_used) {
+    unsigned m = 0, nact = 0;
+    int s, i;
+    if (st->mode == PICA_GL_TEV) {
+        m |= 1u;
+        if (st->tev.tex_en) m |= 2u;
+        for (s = 0; s < 6; ++s) {
+            if ((st->tev.cop[s] & 15u) != 0u || (st->tev.aop[s] & 15u) != 0u) ++nact;
+            for (i = 0; i < 3; ++i) {
+                if ((st->tev.src_c[s * 3 + i] & 15u) == 3u ||
+                    (st->tev.src_a[s * 3 + i] & 15u) == 3u) m |= 2u;
+            }
+        }
+    }
+    if (st->blend) m |= gl_blend ? 8u : 4u;
+    if (st->depth_on) {
+        m |= 16u;
+        if (st->depth_test) m |= 32u;
+        if (st->depth_write) m |= 64u;
+    }
+    if (st->alpha_test) m |= 128u;
+    if (dst_used) m |= 256u;
+    if (zdst_used) m |= 512u;
+    return m | (nact << 10);
+}
+static void pgl_shape_add(unsigned mask, unsigned long long px,
+                          unsigned long long ns) {
+    int i;
+    if (pgl_shape_on < 0) {
+        const char *e = getenv("DQ8_GL_SHAPEHIST");
+        pgl_shape_on = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    if (!pgl_shape_on) return;
+    for (i = 0; i < pgl_shape_n; ++i)
+        if (pgl_shape[i].mask == mask) {
+            ++pgl_shape[i].draws;
+            pgl_shape[i].px += px;
+            pgl_shape[i].ns += ns;
+            return;
+        }
+    if (pgl_shape_n >= PGL_SHAPE_MAX) return;
+    pgl_shape[pgl_shape_n].mask = mask;
+    pgl_shape[pgl_shape_n].draws = 1;
+    pgl_shape[pgl_shape_n].px = px;
+    pgl_shape[pgl_shape_n].ns = ns;
+    ++pgl_shape_n;
+}
+static void pgl_shape_str(unsigned k, char *out, size_t n) {
+    snprintf(out, n, "%s%s%s%s%s%s%s%s%s%s st%u",
+             (k & 1u) ? "tev" : "solid",
+             (k & 2u) ? "+tex" : "",
+             (k & 4u) ? "+blend" : "",
+             (k & 8u) ? "+glblend" : "",
+             (k & 16u) ? "+depth" : "",
+             (k & 32u) ? "+dtest" : "",
+             (k & 64u) ? "+dwrite" : "",
+             (k & 128u) ? "+alpha" : "",
+             (k & 256u) ? "+dst" : "",
+             (k & 512u) ? "+zdst" : "",
+             (k >> 10) & 7u);
+}
+static void pgl_shape_report(void) {
+    int i;
+    char desc[96];
+    for (i = 0; i < pgl_shape_n; ++i) {
+        if (!pgl_shape[i].draws) continue;
+        pgl_shape_str(pgl_shape[i].mask, desc, sizeof desc);
+        fprintf(stderr, "GLSHAPE %-52s draws=%u px=%llu ms=%.1f\n", desc,
+                pgl_shape[i].draws, pgl_shape[i].px,
+                (double)pgl_shape[i].ns / 1e6);
+        pgl_shape[i].draws = 0;
+        pgl_shape[i].px = 0;
+        pgl_shape[i].ns = 0;
+    }
+}
+static void pgl_spec_report(void) {
+    int i;
+    for (i = 1; i < pgl_nspec; ++i) {
+        if (!pgl_spec[i].draws) continue;
+        fprintf(stderr, "GLSPEC var=%d key=%016llx draws=%llu px_per=%llu "
+                "sub_ms=%.1f us_per_draw=%.0f\n", i, pgl_spec[i].key,
+                pgl_spec[i].draws,
+                pgl_spec[i].px / (pgl_spec[i].draws ? pgl_spec[i].draws : 1u),
+                (double)pgl_spec[i].ns / 1e6,
+                (double)pgl_spec[i].ns / 1e3 /
+                    (double)(pgl_spec[i].draws ? pgl_spec[i].draws : 1u));
+        pgl_spec[i].draws = pgl_spec[i].px = pgl_spec[i].ns = 0;
+    }
+}
+
+/* ---- t_5ddc492f in-process A/B of one draw -------------------------------
+   For a draw that never reads the target (no blend, no destination/depth
+   image read) the framebuffer write is a pure function of the flat payload,
+   so re-rendering the SAME triangles with the generic program must produce
+   the same pixels.  Rare enough to run with a per-draw glReadPixels. */
+static void pgl_spec_verify(const PicaGlState *st, PglProgSpec *cur,
+                            int gl_blend, int dst_used, int zdst_used,
+                            int bx0, int by0, int bx1, int by1,
+                            unsigned ntri) {
+    int box[4];
+    unsigned long long h1 = 0, h2 = 0, s1 = 0, s2 = 0, z1 = 0, z2 = 0, zs1 = 0, zs2 = 0;
+    if (pgl_verify_on < 0) {
+        const char *e = getenv("DQ8_GL_SPEC_VERIFY");
+        pgl_verify_on = (e && e[0] && e[0] != '0') ? 1 : 0;
+        pgl_verify_limit = (e && e[0]) ? atoi(e) : 0;
+        if (pgl_verify_limit <= 0) pgl_verify_limit = pgl_verify_on ? 200 : 0;
+    }
+    if (!pgl_verify_on || (int)pgl_verify_n >= pgl_verify_limit) return;
+    if (pgl_nspec < 2 || pgl_nspec <= 0 || cur == &pgl_spec[0]) return;
+    if (gl_blend || st->blend) return;
+    if (dst_used || zdst_used) return;
+    if (!ntri || bx0 > bx1 || by0 > by1) return;
+    box[0] = bx0; box[1] = by0; box[2] = bx1; box[3] = by1;
+    if (!pgl_dh_box(box, &h1, &s1)) return;
+    if (st->depth_on && !pgl_dh_zbox(box, &z1, &zs1)) return;
+    pgl_prog_use(&pgl_spec[0]);
+    pgl_set_uniforms(st, gl_blend, dst_used, zdst_used, (PGint)bx0, (PGint)by0);
+    pgl_glDrawArraysInstanced(PGGL_TRIANGLES, 0, 3, (PGsizei)ntri);
+    if (!pgl_dh_box(box, &h2, &s2)) return;
+    if (st->depth_on && !pgl_dh_zbox(box, &z2, &zs2)) return;
+    ++pgl_verify_n;
+    if (h1 != h2) {
+        ++pgl_verify_cmism;
+        if (pgl_verify_cmism <= 10)
+            fprintf(stderr, "GLSPECVERIFY MISMATCH draw#%llu colour "
+                    "spec=%016llx/%llu generic=%016llx/%llu box=%d,%d..%d,%d\n",
+                    (unsigned long long)pgl_draws, h1, s1, h2, s2,
+                    bx0, by0, bx1, by1);
+    }
+    if (st->depth_on && z1 != z2) {
+        ++pgl_verify_zmism;
+        if (pgl_verify_zmism <= 10)
+            fprintf(stderr, "GLSPECVERIFY MISMATCH draw#%llu depth "
+                    "spec=%016llx/%llu generic=%016llx/%llu\n",
+                    (unsigned long long)pgl_draws, z1, zs1, z2, zs2);
+    }
+    /* the FBO now holds the generic result, which just compared equal */
+    pgl_prog_use(cur);
+    pgl_set_uniforms(st, gl_blend, dst_used, zdst_used, (PGint)bx0, (PGint)by0);
+}
+
 /* (Re)build the shader program and refresh uniform locations.  Called at
    init, and again from pgl_ensure_objects() when another GL user on this
    thread (SDL's window machinery with an OPENGL-capable driver) has deleted
@@ -1094,6 +2824,11 @@ static int pgl_build_program(void) {
     char *fs_buf = NULL;
     const char *fs_src = pgl_fs_src;
     if (pgl_program && pgl_glIsProgram(pgl_program)) return 1;
+    /* t_d559a510: a rebuilt program may come with a fresh context; never trust
+       the cached blend state across it. */
+    pgl_blend_applied = -1;
+    pgl_blend_enabled = -1;
+    pgl_blend_guard_armed = 0;
     /* t_8c05fac8: inject the framebuffer-fetch preamble right after the
        #version line.  The extension directive must precede other
        non-preprocessor tokens; DQ8_FBFETCH gates the imageLoad/texelFetch
@@ -1141,57 +2876,481 @@ static int pgl_build_program(void) {
     pgl_obj_used |= 1u;
     pgl_glDeleteShader(vs);
     pgl_glDeleteShader(fs);
-    pgl_u_rt = pgl_glGetUniformLocation(pgl_program, "u_rt");
-    pgl_u_mode = pgl_glGetUniformLocation(pgl_program, "u_mode");
-    pgl_u_tex = pgl_glGetUniformLocation(pgl_program, "u_tex");
-    pgl_u_alpha_test = pgl_glGetUniformLocation(pgl_program, "u_alpha_test");
-    pgl_u_alpha_func = pgl_glGetUniformLocation(pgl_program, "u_alpha_func");
-    pgl_u_alpha_ref = pgl_glGetUniformLocation(pgl_program, "u_alpha_ref");
-    pgl_u_tex_en = pgl_glGetUniformLocation(pgl_program, "u_tex_en");
-    pgl_u_dst = pgl_glGetUniformLocation(pgl_program, "u_dst");
-    pgl_u_dst_off = pgl_glGetUniformLocation(pgl_program, "u_dst_off");
-    pgl_u_dst_used = pgl_glGetUniformLocation(pgl_program, "u_dst_used");
-    pgl_u_zdst_used = pgl_glGetUniformLocation(pgl_program, "u_zdst_used");
-    pgl_u_src_c = pgl_glGetUniformLocation(pgl_program, "u_src_c");
-    pgl_u_mod_c = pgl_glGetUniformLocation(pgl_program, "u_mod_c");
-    pgl_u_src_a = pgl_glGetUniformLocation(pgl_program, "u_src_a");
-    pgl_u_mod_a = pgl_glGetUniformLocation(pgl_program, "u_mod_a");
-    pgl_u_cop = pgl_glGetUniformLocation(pgl_program, "u_cop");
-    pgl_u_aop = pgl_glGetUniformLocation(pgl_program, "u_aop");
-    pgl_u_scale_c = pgl_glGetUniformLocation(pgl_program, "u_scale_c");
-    pgl_u_scale_a = pgl_glGetUniformLocation(pgl_program, "u_scale_a");
-    pgl_u_const_c = pgl_glGetUniformLocation(pgl_program, "u_const_c");
-    pgl_u_buf_init = pgl_glGetUniformLocation(pgl_program, "u_buf_init");
-    pgl_u_buf_upd_c = pgl_glGetUniformLocation(pgl_program, "u_buf_upd_c");
-    pgl_u_buf_upd_a = pgl_glGetUniformLocation(pgl_program, "u_buf_upd_a");
-    pgl_u_blend_en = pgl_glGetUniformLocation(pgl_program, "u_blend_en");
-    pgl_u_eq_rgb = pgl_glGetUniformLocation(pgl_program, "u_eq_rgb");
-    pgl_u_eq_a = pgl_glGetUniformLocation(pgl_program, "u_eq_a");
-    pgl_u_f_src_rgb = pgl_glGetUniformLocation(pgl_program, "u_f_src_rgb");
-    pgl_u_f_dst_rgb = pgl_glGetUniformLocation(pgl_program, "u_f_dst_rgb");
-    pgl_u_f_src_a = pgl_glGetUniformLocation(pgl_program, "u_f_src_a");
-    pgl_u_f_dst_a = pgl_glGetUniformLocation(pgl_program, "u_f_dst_a");
-    pgl_u_blend_const = pgl_glGetUniformLocation(pgl_program, "u_blend_const");
-    pgl_u_zdst = pgl_glGetUniformLocation(pgl_program, "u_zdst");
-    pgl_u_depth_on = pgl_glGetUniformLocation(pgl_program, "u_depth_on");
-    pgl_u_depth_test = pgl_glGetUniformLocation(pgl_program, "u_depth_test");
-    pgl_u_depth_write = pgl_glGetUniformLocation(pgl_program, "u_depth_write");
-    pgl_u_depth_func = pgl_glGetUniformLocation(pgl_program, "u_depth_func");
-    pgl_u_depth_zbuf = pgl_glGetUniformLocation(pgl_program, "u_depth_zbuf");
-    pgl_u_depth_scale = pgl_glGetUniformLocation(pgl_program, "u_depth_scale");
-    pgl_u_depth_offset = pgl_glGetUniformLocation(pgl_program, "u_depth_offset");
-    pgl_u_depth_zmax = pgl_glGetUniformLocation(pgl_program, "u_depth_zmax");
-    pgl_u_dst_used = pgl_glGetUniformLocation(pgl_program, "u_dst_used");
-    pgl_u_zdst_used = pgl_glGetUniformLocation(pgl_program, "u_zdst_used");
-    pgl_u_dstimg = pgl_glGetUniformLocation(pgl_program, "u_dstimg");
-    pgl_u_zimg = pgl_glGetUniformLocation(pgl_program, "u_zimg");
-    if (pgl_fbfetch) {
-        /* t_8c05fac8: image-unit assignment is program state, set once. */
-        pgl_glUseProgram(pgl_program);
-        pgl_glUniform1i(pgl_u_dstimg, 0);
-        pgl_glUniform1i(pgl_u_zimg, 1);
-    }
+    /* t_5ddc492f: cache entry 0 is always the generic shader and the fallback
+       for every shape the specialised cache cannot serve. */
+    memset(&pgl_spec[0].u, 0, sizeof pgl_spec[0].u);
+    pgl_query_locs(pgl_program, &pgl_spec[0].u);
+    pgl_spec[0].prog = pgl_program;
+    pgl_spec[0].key = 0;
+    pgl_spec[0].draws = pgl_spec[0].px = pgl_spec[0].ns = 0;
+    if (pgl_nspec < 1) pgl_nspec = 1;
+    pgl_prog_cur = pgl_program;
+    pgl_depth_hw_applied = -1;   /* fresh program: uniform 0 is unknown */
     return 1;
+}
+
+/* forward declaration: defined after pgl_ensure_rt */
+static void pgl_depth_fallback(const char *why);
+
+/* t_a22413f1 run3: DEPTH PATH SELF-TEST — runs once per context, on the
+   operator's own driver, because the failure that made this necessary
+   (D32F depth attachment -> almost fully black frame on radeonsi) cannot be
+   reproduced on this host (llvmpipe only).  It exercises exactly the GL
+   features the HARDWARE depth path depends on:
+     - a 4x4 FBO whose depth attachment is DEPTH_COMPONENT32F is COMPLETE;
+     - a fragment shader writing gl_FragDepth actually controls the test;
+     - the depth test rejects a farther fragment of the SAME draw;
+     - the depth attachment reads back (the guest write-back mirrors it).
+   One full-screen triangle is drawn three times with a constant gl_FragDepth:
+     0.25 -> must pass (depth cleared to 1.0, GL_LESS)
+     0.75 -> must be REJECTED (the colour must still show 0.25)
+     0.20 -> must pass
+   The colour channel carries the depth the shader wrote, so a driver that
+   ignores gl_FragDepth (or a depth attachment that is silently disabled)
+   turns step 2 or 3 red here instead of presenting the operator a black
+   screen.  Returns 1 = pass, -1 = fail (caller falls back to IN-SHADER). */
+static int pgl_depth_selftest_run(void) {
+    static const char vs_src[] =
+        "#version 330 core\n"
+        "layout(location = 0) in vec2 a_pos;\n"
+        "void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }\n";
+    static const char fs_src[] =
+        "#version 330 core\n"
+        "uniform float u_z;\n"
+        "out vec4 o_colour;\n"
+        "void main() { gl_FragDepth = u_z; o_colour = vec4(u_z, 0.0, 0.0, 1.0); }\n";
+    PGuint fbo = 0, ctex = 0, dtex = 0, vao = 0, vbo = 0, vs = 0, fs = 0, prog = 0;
+    PGenum status, buf0 = PGGL_COLOR_ATTACHMENT0;
+    float verts[6] = { -1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f };
+    float zclear = 1.0f, zval;
+    unsigned char px[64];
+    float dz[16];
+    char log[512];
+    PGsizei n = 0;
+    PGint loc, ok_prog = 0;
+    int r0 = -1, r1 = -1, r2 = -1, d0 = -1, res = -1;
+
+    memset(px, 0, sizeof px);
+    memset(dz, 0, sizeof dz);
+    memset(log, 0, sizeof log);
+
+    /* ---- shaders ---- */
+    vs = pgl_glCreateShader(PGGL_VERTEX_SHADER);
+    if (!vs) goto done;
+    {   const char *src_one = vs_src;
+        pgl_glShaderSource(vs, 1, &src_one, NULL);
+    }
+    pgl_glCompileShader(vs);
+    pgl_glGetShaderiv(vs, PGGL_COMPILE_STATUS, &ok_prog);
+    if (!ok_prog) {
+        pgl_glGetShaderInfoLog(vs, (PGsizei)sizeof log, &n, log);
+        fprintf(stderr, "GL backend: depth self-test: vertex shader failed: %.*s\n", (int)n, log);
+        goto done;
+    }
+    fs = pgl_glCreateShader(PGGL_FRAGMENT_SHADER);
+    if (!fs) goto done;
+    {   const char *src_one = fs_src;
+        pgl_glShaderSource(fs, 1, &src_one, NULL);
+    }
+    pgl_glCompileShader(fs);
+    pgl_glGetShaderiv(fs, PGGL_COMPILE_STATUS, &ok_prog);
+    if (!ok_prog) {
+        pgl_glGetShaderInfoLog(fs, (PGsizei)sizeof log, &n, log);
+        fprintf(stderr, "GL backend: depth self-test: fragment shader failed: %.*s\n", (int)n, log);
+        goto done;
+    }
+    prog = pgl_glCreateProgram();
+    if (!prog) goto done;
+    pgl_glAttachShader(prog, vs);
+    pgl_glAttachShader(prog, fs);
+    pgl_glLinkProgram(prog);
+    pgl_glGetProgramiv(prog, PGGL_LINK_STATUS, &ok_prog);
+    if (!ok_prog) {
+        pgl_glGetProgramInfoLog(prog, (PGsizei)sizeof log, &n, log);
+        fprintf(stderr, "GL backend: depth self-test: link failed: %.*s\n", (int)n, log);
+        goto done;
+    }
+    loc = pgl_glGetUniformLocation(prog, "u_z");
+
+    /* ---- geometry ---- */
+    pgl_glGenVertexArrays(1, &vao);
+    pgl_glGenBuffers(1, &vbo);
+    pgl_glBindVertexArray(vao);
+    pgl_glBindBuffer(PGGL_ARRAY_BUFFER, vbo);
+    pgl_glBufferData(PGGL_ARRAY_BUFFER, (PGsizei)sizeof verts, verts, 0x88E4u /* GL_STATIC_DRAW */);
+    pgl_glEnableVertexAttribArray(0);
+    pgl_glVertexAttribPointer(0, 2, PGGL_FLOAT, 0 /* GL_FALSE */, 0, NULL);
+
+    /* ---- 4x4 colour + D32F depth FBO ---- */
+    pgl_glGenFramebuffers(1, &fbo);
+    pgl_glGenTextures(1, &ctex);
+    pgl_glGenTextures(1, &dtex);
+    pgl_glBindTexture(PGGL_TEXTURE_2D, ctex);
+    pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_RGBA8, 4, 4, 0, PGGL_RGBA,
+                     PGGL_UNSIGNED_BYTE, NULL);
+    pgl_glBindTexture(PGGL_TEXTURE_2D, dtex);
+    pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_DEPTH_COMPONENT32F, 4, 4, 0,
+                     PGGL_DEPTH_COMPONENT, PGGL_FLOAT, NULL);
+    pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, fbo);
+    pgl_glFramebufferTexture2D(PGGL_FRAMEBUFFER, PGGL_COLOR_ATTACHMENT0,
+                               PGGL_TEXTURE_2D, ctex, 0);
+    pgl_glFramebufferTexture2D(PGGL_FRAMEBUFFER, PGGL_DEPTH_ATTACHMENT,
+                               PGGL_TEXTURE_2D, dtex, 0);
+    status = pgl_glCheckFramebufferStatus(PGGL_FRAMEBUFFER);
+    if (status != PGGL_FRAMEBUFFER_COMPLETE) {
+        fprintf(stderr, "GL backend: depth self-test: FAIL: 4x4 RGBA8 + "
+                        "DEPTH_COMPONENT32F FBO incomplete (0x%04X, complete=0x%04X)\n",
+                (unsigned)status, (unsigned)PGGL_FRAMEBUFFER_COMPLETE);
+        goto done;
+    }
+
+    /* ---- draw the known sequence ---- */
+    pgl_glViewport(0, 0, 4, 4);
+    pgl_glDrawBuffers(1, &buf0);
+    pgl_glColorMask(1, 1, 1, 1);
+    pgl_glDisable(PGGL_BLEND);
+    pgl_glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    pgl_glClear(PGGL_COLOR_BUFFER_BIT);
+    pgl_glDepthMask(1);
+    pgl_glClearBufferfv(PGGL_DEPTH, 0, &zclear);
+    pgl_glEnable(PGGL_DEPTH_TEST);
+    pgl_glDepthFunc(PGGL_LESS);
+    pgl_glUseProgram(prog);
+
+    zval = 0.25f; pgl_glUniform1f(loc, zval);
+    pgl_glDrawArrays(PGGL_TRIANGLES, 0, 3);
+    pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
+    pgl_glReadPixels(0, 0, 4, 4, PGGL_RGBA, PGGL_UNSIGNED_BYTE, px);
+    r0 = (int)px[0];
+
+    zval = 0.75f; pgl_glUniform1f(loc, zval);
+    pgl_glDrawArrays(PGGL_TRIANGLES, 0, 3);
+    pgl_glReadPixels(0, 0, 4, 4, PGGL_RGBA, PGGL_UNSIGNED_BYTE, px);
+    r1 = (int)px[0];
+
+    zval = 0.20f; pgl_glUniform1f(loc, zval);
+    pgl_glDrawArrays(PGGL_TRIANGLES, 0, 3);
+    pgl_glReadPixels(0, 0, 4, 4, PGGL_RGBA, PGGL_UNSIGNED_BYTE, px);
+    r2 = (int)px[0];
+    pgl_glReadPixels(0, 0, 4, 4, PGGL_DEPTH_COMPONENT, PGGL_FLOAT, dz);
+    d0 = (int)(dz[0] * 1000.0f + 0.5f);
+
+    /* 0.25 -> 64, 0.75 rejected, 0.20 -> 51, depth read back ~0.200 */
+    if (r0 < 63 || r0 > 65) {
+        fprintf(stderr, "GL backend: depth self-test: FAIL: first depth draw "
+                        "did not pass (colour %d, expected 64)\n", r0);
+        goto done;
+    }
+    if (r1 != r0) {
+        fprintf(stderr, "GL backend: depth self-test: FAIL: the farther "
+                        "fragment (z=0.75) was NOT rejected by the depth test "
+                        "(colour %d, expected %d)\n", r1, r0);
+        goto done;
+    }
+    if (r2 < 50 || r2 > 52) {
+        fprintf(stderr, "GL backend: depth self-test: FAIL: the nearer "
+                        "fragment (z=0.20) did not pass (colour %d, expected 51)\n", r2);
+        goto done;
+    }
+    if (d0 < 195 || d0 > 205) {
+        fprintf(stderr, "GL backend: depth self-test: FAIL: depth attachment "
+                        "read-back = %d/1000, expected ~200\n", d0);
+        goto done;
+    }
+    fprintf(stderr, "GL backend: depth self-test: PASS (FBO complete, "
+                    "gl_FragDepth 0.25 pass / 0.75 rejected / 0.20 pass, "
+                    "depth read-back %d/1000)\n", d0);
+    res = 1;
+
+done:
+    if (prog) pgl_glUseProgram(0);
+    if (vbo) pgl_glDeleteBuffers(1, &vbo);
+    if (vao) pgl_glDeleteVertexArrays(1, &vao);
+    if (fbo) pgl_glDeleteFramebuffers(1, &fbo);
+    if (ctex) pgl_glDeleteTextures(1, &ctex);
+    if (dtex) pgl_glDeleteTextures(1, &dtex);
+    if (vs) pgl_glDeleteShader(vs);
+    if (fs) pgl_glDeleteShader(fs);
+    /* the program object is leaked on purpose: glDeleteProgram is not loaded
+       and this runs exactly once per context */
+    pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, 0);
+    pgl_glDisable(PGGL_DEPTH_TEST);
+    if (res != 1 && pgl_errs_logged < 40u) {
+        PGenum e = 0;
+        if (pgl_drain_errors("depth-selftest", &e) != 0) {
+            ++pgl_errs_logged;
+            fprintf(stderr, "GL backend: depth self-test: first GL error "
+                            "0x%04X %s\n", (unsigned)e, pgl_err_name(e));
+        }
+    } else {
+        pgl_drain_errors("depth-selftest", NULL);
+    }
+    return res;
+}
+
+/* t_599a43f7: DEPTH SELF-TEST, PART 2 — the PRODUCTION pipeline.
+   pgl_depth_selftest_run() above proves the driver can write gl_FragDepth and
+   test against a D32F attachment, in a one-colour-attachment 4x4 FBO, with the
+   depth write mask forced on.  It PASSED on the operator's Radeon while the real
+   path presented a black screen, so it does not cover what actually broke:
+     - the production FBO layout: COLOR_ATTACHMENT0 RGBA8 + COLOR_ATTACHMENT1
+       R32F (the guest depth mirror) + DEPTH_ATTACHMENT D32F;
+     - the production ORDER inside a frame: ... draws leave glDepthMask(0)
+       behind, then the frame's depth clear happens.  glClearBufferfv on a
+       depth attachment is gated by that mask, so a clear written without
+       forcing the mask clears NOTHING and every later fragment fails GL_LESS —
+       exactly the DQ8_SPLIT_GL black frame (the worker-thread clear had lost
+       the t_d8e5ab8c fix);
+     - the mirror/depth read-back the guest write-back depends on.
+   Every clear here goes through pgl_depth_attachment_clear(), the same helper
+   the runtime uses, so a regression in either thread shows up at startup.
+   Returns 1 = pass, -1 = fail (caller falls back to IN-SHADER).  Each stage
+   prints PASS/FAIL on its own line: on a driver we cannot test locally, that
+   line names the broken feature. */
+static int pgl_depth_selftest_pipeline(void) {
+    static const char vs_src[] =
+        "#version 330 core\n"
+        "layout(location = 0) in vec2 a_pos;\n"
+        "layout(location = 1) in float a_z;\n"
+        "layout(location = 2) in vec3 a_col;\n"
+        "flat out float v_z;\n"
+        "flat out vec3 v_col;\n"
+        "void main() { v_z = a_z; v_col = a_col;\n"
+        "              gl_Position = vec4(a_pos, 0.0, 1.0); }\n";
+    static const char fs_src[] =
+        "#version 330 core\n"
+        "flat in float v_z;\n"
+        "flat in vec3 v_col;\n"
+        "layout(location = 0) out vec4 o_col;\n"
+        "layout(location = 1) out vec4 o_z;\n"
+        "void main() { gl_FragDepth = clamp(v_z, 0.0, 1.0);\n"
+        "              o_col = vec4(v_col, 1.0);\n"
+        "              o_z = vec4(v_z * 16777216.0, 0.0, 0.0, 1.0); }\n";
+    enum { N = 16 };
+    PGuint fbo = 0, ctex = 0, ztex = 0, dtex = 0, vao = 0, vbo = 0, vs = 0, fs = 0, prog = 0;
+    PGenum status, bufs[2] = { PGGL_COLOR_ATTACHMENT0, PGGL_COLOR_ATTACHMENT1 };
+    float v[18];              /* 3 verts x (x,y,z,r,g,b) — unused placeholder */
+    (void)v;
+    unsigned char px[4 * 4 * 4];
+    float rd[4];
+    float zclear = 1.0f;
+    char log[512];
+    PGsizei n = 0;
+    PGint loc_a = -1, loc_z = -1, loc_c = -1, ok = 0;
+    int order = -1, clearmask = -1, mirror = -1, zread = -1, reject = -1;
+    int res = -1;
+
+    pgl_selftest_active = 1;
+    memset(log, 0, sizeof log);
+    memset(px, 0, sizeof px);
+    memset(rd, 0, sizeof rd);
+
+    /* ---- program ---- */
+    vs = pgl_glCreateShader(PGGL_VERTEX_SHADER);
+    if (!vs) goto done;
+    { const char *s = vs_src; pgl_glShaderSource(vs, 1, &s, NULL); }
+    pgl_glCompileShader(vs);
+    pgl_glGetShaderiv(vs, PGGL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        pgl_glGetShaderInfoLog(vs, (PGsizei)sizeof log, &n, log);
+        fprintf(stderr, "GL backend: depth self-test[2]: vertex shader failed: %.*s\n",
+                (int)n, log);
+        goto done;
+    }
+    fs = pgl_glCreateShader(PGGL_FRAGMENT_SHADER);
+    if (!fs) goto done;
+    { const char *s = fs_src; pgl_glShaderSource(fs, 1, &s, NULL); }
+    pgl_glCompileShader(fs);
+    pgl_glGetShaderiv(fs, PGGL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        pgl_glGetShaderInfoLog(fs, (PGsizei)sizeof log, &n, log);
+        fprintf(stderr, "GL backend: depth self-test[2]: fragment shader failed: %.*s\n",
+                (int)n, log);
+        goto done;
+    }
+    prog = pgl_glCreateProgram();
+    pgl_glAttachShader(prog, vs);
+    pgl_glAttachShader(prog, fs);
+    pgl_glLinkProgram(prog);
+    pgl_glGetProgramiv(prog, PGGL_LINK_STATUS, &ok);
+    if (!ok) {
+        pgl_glGetProgramInfoLog(prog, (PGsizei)sizeof log, &n, log);
+        fprintf(stderr, "GL backend: depth self-test[2]: link failed: %.*s\n",
+                (int)n, log);
+        goto done;
+    }
+    loc_a = 0; loc_z = 1; loc_c = 2;   /* layout(location=..) in vs_src */
+
+    /* ---- PRODUCTION FBO LAYOUT ---- */
+    pgl_glGenFramebuffers(1, &fbo);
+    pgl_glGenTextures(1, &ctex);
+    pgl_glGenTextures(1, &ztex);
+    pgl_glGenTextures(1, &dtex);
+    pgl_glBindTexture(PGGL_TEXTURE_2D, ctex);
+    pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_RGBA8, N, N, 0, PGGL_RGBA,
+                     PGGL_UNSIGNED_BYTE, NULL);
+    pgl_glBindTexture(PGGL_TEXTURE_2D, ztex);
+    pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_R32F, N, N, 0, PGGL_RED,
+                     PGGL_FLOAT, NULL);
+    pgl_glBindTexture(PGGL_TEXTURE_2D, dtex);
+    pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_DEPTH_COMPONENT32F, N, N, 0,
+                     PGGL_DEPTH_COMPONENT, PGGL_FLOAT, NULL);
+    pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, fbo);
+    pgl_glFramebufferTexture2D(PGGL_FRAMEBUFFER, PGGL_COLOR_ATTACHMENT0,
+                               PGGL_TEXTURE_2D, ctex, 0);
+    pgl_glFramebufferTexture2D(PGGL_FRAMEBUFFER, PGGL_COLOR_ATTACHMENT1,
+                               PGGL_TEXTURE_2D, ztex, 0);
+    pgl_glFramebufferTexture2D(PGGL_FRAMEBUFFER, PGGL_DEPTH_ATTACHMENT,
+                               PGGL_TEXTURE_2D, dtex, 0);
+    pgl_glDrawBuffers(2, bufs);
+    status = pgl_glCheckFramebufferStatus(PGGL_FRAMEBUFFER);
+    pgl_glViewport(0, 0, N, N);
+    pgl_glDisable(PGGL_BLEND);
+    pgl_glColorMask(1, 1, 1, 1);
+    pgl_glEnable(PGGL_DEPTH_TEST);
+    pgl_glDepthFunc(PGGL_LESS);
+    {
+        int layout_ok = (status == PGGL_FRAMEBUFFER_COMPLETE);
+        fprintf(stderr, "GL backend: depth self-test[2] layout: %s "
+                        "(RGBA8+R32F+D32F status=0x%04X complete=0x%04X)\n",
+                layout_ok ? "PASS" : "FAIL", (unsigned)status,
+                (unsigned)PGGL_FRAMEBUFFER_COMPLETE);
+        if (!layout_ok) goto done;
+    }
+
+    /* ---- geometry: full-screen triangles ---- */
+    pgl_glGenVertexArrays(1, &vao);
+    pgl_glGenBuffers(1, &vbo);
+    pgl_glBindVertexArray(vao);
+    pgl_glBindBuffer(PGGL_ARRAY_BUFFER, vbo);
+    pgl_glBufferData(PGGL_ARRAY_BUFFER, (PGsizei)(36 * sizeof(float)), NULL, 0x88E8u /* GL_DYNAMIC_DRAW */);
+    if (loc_a >= 0) {
+        pgl_glEnableVertexAttribArray((PGuint)loc_a);
+        pgl_glVertexAttribPointer((PGuint)loc_a, 2, PGGL_FLOAT, 0, 6 * (PGint)sizeof(float), (const void *)0);
+    }
+    if (loc_z >= 0) {
+        pgl_glEnableVertexAttribArray((PGuint)loc_z);
+        pgl_glVertexAttribPointer((PGuint)loc_z, 1, PGGL_FLOAT, 0, 6 * (PGint)sizeof(float),
+                                  (const void *)(2 * sizeof(float)));
+    }
+    if (loc_c >= 0) {
+        pgl_glEnableVertexAttribArray((PGuint)loc_c);
+        pgl_glVertexAttribPointer((PGuint)loc_c, 3, PGGL_FLOAT, 0, 6 * (PGint)sizeof(float),
+                                  (const void *)(3 * sizeof(float)));
+    }
+    pgl_glUseProgram(prog);
+
+    /* ---- stage A: clear, then TWO triangles of ONE draw, near one second ---- */
+    pgl_glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    pgl_glColorMask(1, 1, 1, 1);
+    pgl_glClear(PGGL_COLOR_BUFFER_BIT);
+    pgl_depth_attachment_clear(zclear);      /* the production helper */
+    pgl_glDepthMask(1);
+    pgl_depth_mask_applied = -1;
+    {
+        /* tri 0: z=0.75 red (far)   tri 1: z=0.25 green (near), ONE draw */
+        static const float quad[36] = {
+            -1, -1, 0.75f, 1, 0, 0,   3, -1, 0.75f, 1, 0, 0,   -1,  3, 0.75f, 1, 0, 0,
+            -1, -1, 0.25f, 0, 1, 0,   3, -1, 0.25f, 0, 1, 0,   -1,  3, 0.25f, 0, 1, 0
+        };
+        pgl_glBufferSubData(PGGL_ARRAY_BUFFER, 0, (PGsizei)sizeof quad, quad);
+        pgl_glDrawArrays(PGGL_TRIANGLES, 0, 6);
+    }
+    pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
+    pgl_glReadPixels(N / 2, N / 2, 1, 1, PGGL_RGBA, PGGL_UNSIGNED_BYTE, px);
+    order = (px[0] < 8 && px[1] > 247 && px[2] < 8) ? 1 : 0;
+    fprintf(stderr, "GL backend: depth self-test[2] same-draw order: %s "
+                    "(near triangle of ONE draw must win: %u,%u,%u)\n",
+            order == 1 ? "PASS" : "FAIL", px[0], px[1], px[2]);
+
+    /* ---- stage B: THE REGRESSION — depth clear after a depth-write-off draw ----
+       PICA leaves glDepthMask(0) behind all the time; the frame's depth clear
+       must still clear.  pgl_depth_attachment_clear() is what forces the mask,
+       so this stage fails if that safety is ever dropped from either thread. */
+    pgl_glDepthMask(0);              /* exactly what a depth-write-off draw leaves */
+    pgl_depth_mask_applied = 0;
+    pgl_depth_attachment_clear(zclear);
+    {
+        const float tris[18] = { -1, -1, 0.9f, 0, 0, 1,   3, -1, 0.9f, 0, 0, 1,
+                                 -1,  3, 0.9f, 0, 0, 1 };
+        pgl_glBufferSubData(PGGL_ARRAY_BUFFER, 0, (PGsizei)sizeof tris, tris);
+        pgl_glDepthMask(1);          /* what the draw path does for a write-on draw */
+        pgl_depth_mask_applied = -1;
+        pgl_glDrawArrays(PGGL_TRIANGLES, 0, 3);
+    }
+    pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
+    pgl_glReadPixels(N / 2, N / 2, 1, 1, PGGL_RGBA, PGGL_UNSIGNED_BYTE, px);
+    clearmask = (px[0] < 8 && px[1] < 8 && px[2] > 247) ? 1 : 0;
+    if (clearmask == 1)
+        fprintf(stderr, "GL backend: depth self-test[2] clear-after-mask0: PASS "
+                        "(the depth clear after a depth-write-off draw is not a "
+                        "no-op: %u,%u,%u)\n", px[0], px[1], px[2]);
+    else
+        fprintf(stderr, "GL backend: depth self-test[2] clear-after-mask0: FAIL "
+                        "(%u,%u,%u — the depth clear was gated by the write mask: "
+                        "stale depth, every fragment fails, BLACK FRAME)\n",
+                px[0], px[1], px[2]);
+
+    /* ---- stage C: the mirror and the attachment carry the same depth ---- */
+    pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT1);
+    pgl_glReadPixels(N / 2, N / 2, 1, 1, PGGL_RED, PGGL_FLOAT, rd);
+    mirror = (rd[0] > 0.9f * 16777216.0f - 64.0f &&
+              rd[0] < 0.9f * 16777216.0f + 64.0f) ? 1 : 0;
+    fprintf(stderr, "GL backend: depth self-test[2] att1 mirror: %s "
+                    "(R32F read-back %.0f, expected %.0f)\n",
+            mirror == 1 ? "PASS" : "FAIL", (double)rd[0], 0.9 * 16777216.0);
+    memset(rd, 0, sizeof rd);
+    pgl_glReadPixels(N / 2, N / 2, 1, 1, PGGL_DEPTH_COMPONENT, PGGL_FLOAT, rd);
+    zread = (rd[0] > 0.899f && rd[0] < 0.901f) ? 1 : 0;
+    fprintf(stderr, "GL backend: depth self-test[2] D32F read-back: %s "
+                    "(%.6f, expected 0.9)\n", zread == 1 ? "PASS" : "FAIL",
+            (double)rd[0]);
+
+    /* ---- stage D: a farther fragment must be rejected ---- */
+    {
+        const float tris[18] = { -1, -1, 0.95f, 1, 1, 0,   3, -1, 0.95f, 1, 1, 0,
+                                 -1,  3, 0.95f, 1, 1, 0 };
+        pgl_glBufferSubData(PGGL_ARRAY_BUFFER, 0, (PGsizei)sizeof tris, tris);
+        pgl_glDrawArrays(PGGL_TRIANGLES, 0, 3);
+    }
+    pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
+    pgl_glReadPixels(N / 2, N / 2, 1, 1, PGGL_RGBA, PGGL_UNSIGNED_BYTE, px);
+    reject = (px[2] > 247 && px[0] < 8) ? 1 : 0;
+    fprintf(stderr, "GL backend: depth self-test[2] farther rejected: %s "
+                    "(%u,%u,%u — must still be the blue pass)\n",
+            reject == 1 ? "PASS" : "FAIL", px[0], px[1], px[2]);
+
+    if (order == 1 && clearmask == 1 && mirror == 1 && zread == 1 && reject == 1) {
+        fprintf(stderr, "GL backend: depth self-test[2]: PASS (production FBO "
+                        "layout, same-draw order, clear-after-mask0, mirror and "
+                        "D32F read-back, farther-rejected)\n");
+        res = 1;
+    } else {
+        fprintf(stderr, "GL backend: depth self-test[2]: FAIL "
+                        "(order=%d clearmask=%d mirror=%d zread=%d reject=%d)\n",
+                order, clearmask, mirror, zread, reject);
+    }
+
+done:
+    pgl_selftest_active = 0;
+    if (prog) pgl_glUseProgram(0);
+    if (vbo) pgl_glDeleteBuffers(1, &vbo);
+    if (vao) pgl_glDeleteVertexArrays(1, &vao);
+    if (fbo) pgl_glDeleteFramebuffers(1, &fbo);
+    if (ctex) pgl_glDeleteTextures(1, &ctex);
+    if (ztex) pgl_glDeleteTextures(1, &ztex);
+    if (dtex) pgl_glDeleteTextures(1, &dtex);
+    if (vs) pgl_glDeleteShader(vs);
+    if (fs) pgl_glDeleteShader(fs);
+    pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, 0);
+    pgl_glDisable(PGGL_DEPTH_TEST);
+    pgl_glDepthMask(1);
+    pgl_drain_errors("depth-selftest2", NULL);
+    if (res != 1) {
+        /* Any stray GL error is part of the evidence on the operator's driver. */
+        fprintf(stderr, "GL backend: depth self-test[2]: result=%d\n", res);
+    }
+    return res;
 }
 
 static int pgl_setup(PicaGlGetProc getproc) {
@@ -1226,13 +3385,51 @@ static int pgl_setup(PicaGlGetProc getproc) {
     {
         const char *ef = getenv("DQ8_GL_FBFETCH");
         const char *ea = getenv("DQ8_GL_DSTALWAYS");
-        int want = (!ef || !ef[0] || ef[0] != '0');
+        /* t_9651f10a: framebuffer fetch is DEFAULT ON for every driver whose
+           live-image reads are verified pixel-clean: the software rasterisers
+           used by this machine (llvmpipe, softpipe, swrast — t_8c05fac8,
+           t_6b81015d, t_d559a510) and the operator's radeonsi/Mesa Radeon
+           (verified with the pgl_dst_barrier texture barriers that make a read
+           of the live render target well-defined, GL 4.5 §9.3).  The safety net
+           for everything else stays, but as a *known-good allowlist* rather
+           than a blanket off: a renderer outside the list (nVidia, Intel,
+           ...) is untested, and an unordered destination read on the UI's
+           translucent draws is exactly the show-through artefact t_6b81015d
+           fixed.  Such a driver keeps the per-draw copy path unless the
+           operator opts in with DQ8_GL_FBFETCH=1; DQ8_GL_FBFETCH=0 forces the
+           copies on any driver (A/B). */
+        static const char *const pgl_fbfetch_ok[] = {
+            "llvmpipe",   /* verified: t_8c05fac8, t_6b81015d, t_d559a510 */
+            "softpipe",   /* verified: t_8c05fac8 */
+            "swrast",     /* verified: t_8c05fac8 */
+            "radeonsi",   /* verified: operator Radeon (RX 6xxx), t_6b81015d */
+            NULL
+        };
+        int verified = 0, fbi;
+        if (pgl_renderer[0])
+            for (fbi = 0; pgl_fbfetch_ok[fbi]; ++fbi)
+                if (strstr(pgl_renderer, pgl_fbfetch_ok[fbi])) {
+                    verified = 1;
+                    break;
+                }
+        int have_env = ef && ef[0];
+        int want = have_env ? (ef[0] != '0') : verified;
+        if (!have_env)
+            fprintf(stderr, "GL backend: renderer %s is %s the verified list "
+                    "(llvmpipe, softpipe, swrast, radeonsi) -> framebuffer fetch "
+                    "%s by default (set DQ8_GL_FBFETCH=1 to force the live-image "
+                    "path, =0 to force per-draw copies)\n",
+                    pgl_renderer[0] ? pgl_renderer : "(unknown)",
+                    verified ? "on" : "not on", verified ? "on" : "off");
         int legacy = (ea && ea[0] && ea[0] != '0');
         int have_ext = 0;
         if (want && !legacy) {
-            const char *s = (const char *)pgl_glGetString(PGGL_EXT_STR);
-            if (s) have_ext = strstr(s, "GL_ARB_shader_image_load_store") != NULL;
-            else if (pgl_glGetStringi) {
+            /* t_d8e5ab8c: glGetString(GL_EXTENSIONS) is GL_INVALID_ENUM in a
+               core profile — that was the "setup-program: err=0x0500
+               GL_INVALID_ENUM" line every run logged.  glGetStringi is the
+               core-profile query; only fall back to the legacy string on a
+               context that has no indexed query (GL < 3.0). */
+            if (pgl_glGetStringi) {
                 PGint n = 0, i;
                 pgl_glGetIntegerv(PGGL_NUM_EXTENSIONS, &n);
                 for (i = 0; i < n; ++i) {
@@ -1243,8 +3440,22 @@ static int pgl_setup(PicaGlGetProc getproc) {
                         break;
                     }
                 }
+            } else {
+                const char *s = (const char *)pgl_glGetString(PGGL_EXT_STR);
+                if (s) have_ext = strstr(s, "GL_ARB_shader_image_load_store") != NULL;
             }
             if (have_ext && !pgl_glBindImageTexture) have_ext = 0;
+            /* t_6b81015d: the live-image reads need an ordering primitive.
+               Reading texels written by an earlier draw without a barrier is
+               undefined (GL 4.5 §9.3), so a context that exposes image
+               load/store but no barrier keeps the well-defined per-draw copy
+               path instead of risking driver-dependent panel corruption. */
+            if (have_ext && !pgl_glTextureBarrier && !pgl_glMemoryBarrier) {
+                have_ext = 0;
+                fprintf(stderr, "GL backend: image load/store without "
+                        "glTextureBarrier/glMemoryBarrier -> framebuffer "
+                        "fetch off (per-draw FBO copies)\n");
+            }
             if (!have_ext)
                 fprintf(stderr, "GL backend: image load/store unavailable -> "
                         "framebuffer fetch off (per-draw FBO copies)\n");
@@ -1253,6 +3464,45 @@ static int pgl_setup(PicaGlGetProc getproc) {
     }
     fprintf(stderr, "GL backend: framebuffer fetch (imageLoad) = %s\n",
             pgl_fbfetch ? "on" : "off (per-draw FBO copies)");
+    /* ---- t_a22413f1 run3 / t_d8e5ab8c: DEPTH PATH SELECTION -------------
+       The D32F depth attachment + gl_FragDepth is the CORRECT path (the PICA
+       depth test runs per fragment in raster order, so overlapping triangles
+       of ONE draw test against each other) and since t_d8e5ab8c it renders
+       pixel-identical to the software rasterizer on the operator's Radeon
+       (DX 580/570, radeonsi).  It is the DEFAULT; it is still gated on the
+       per-driver self-test below and on the main FBO coming back COMPLETE, and
+       a failing driver falls back to IN-SHADER automatically with one startup
+       line.  DQ8_GL_DEPTH_ATTACH=0 forces the in-shader path (the pre-fix
+       behaviour, kept for A/B). */
+    {
+        const char *e = getenv("DQ8_GL_DEPTH_ATTACH");
+        const char *af = getenv("DQ8_GL_DEPTH_AUTOFALLBACK");
+        /* t_599a43f7: the automatic switch to the in-shader path is ON by
+           default.  A black 3D frame is never an acceptable outcome, and the
+           in-shader path always draws the scene; the only cost of a needless
+           fallback is the model holes coming back.  DQ8_GL_DEPTH_AUTOFALLBACK=0
+           restores the opt-in behaviour for A/B. */
+        pgl_depth_autofallback = !(af && af[0] == '0' && !af[1]);
+        pgl_depth_hw_env = (e && e[0]) ? (e[0] != '0') : 1;
+        pgl_depth_hw = 0;                      /* before the first set */
+        pgl_depth_hw_set(pgl_depth_hw_env,
+                         "startup: DQ8_GL_DEPTH_ATTACH / default");
+        {
+            const char *cm = getenv("DQ8_GL_DEPTH_CLEARMASK");
+            const char *pr = getenv("DQ8_GL_DEPTH_PROBE");
+            pgl_depth_clearmask_fix = (cm && cm[0] == '0') ? 0 : 1;
+            pgl_depth_probe_left = (pr && pr[0] && pr[0] != '0')
+                                   ? (unsigned)atoi(pr) : 0u;
+        }
+        if (pgl_depth_hw && !pgl_depth_ok) {
+            pgl_depth_hw_set(0, "glDepthFunc/glDepthMask unavailable");
+            pgl_depth_off_why = "glDepthFunc/glDepthMask unavailable";
+        } else if (!pgl_depth_hw) {
+            pgl_depth_off_why = pgl_depth_hw_env
+                ? "requested but disabled"
+                : "DQ8_GL_DEPTH_ATTACH=0 (in-shader path forced)";
+        }
+    }
     if (!pgl_build_program()) return 0;
     pgl_drain_errors("setup-program", NULL);
     pgl_glGenVertexArrays(1, &pgl_vao);
@@ -1269,6 +3519,7 @@ static int pgl_setup(PicaGlGetProc getproc) {
     pgl_glGenTextures(1, &pgl_dst_tex);
     pgl_glGenTextures(1, &pgl_z_tex);
     pgl_glGenTextures(1, &pgl_zdst_tex);
+    pgl_glGenTextures(1, &pgl_dtex);   /* t_a22413f1: real depth attachment */
     pgl_glPixelStorei(PGGL_PACK_ALIGNMENT, 1);
     pgl_glPixelStorei(PGGL_UNPACK_ALIGNMENT, 1);
     pgl_drain_errors("setup-objects", NULL);
@@ -1282,16 +3533,36 @@ static int pgl_setup(PicaGlGetProc getproc) {
         const char *hold = getenv("DQ8_GL_CTX_HOLD");
         pgl_hold_on = !(hold && hold[0] == '0');
         {
-            /* t_77ac52ce: fixed-function blending removes the per-draw u_dst
-               copy and its pipeline drain — a big win on a real GPU, neutral
-               on llvmpipe (the drain moves to the next sync).  Off by
-               default: it is a second pixel path with 1-LSB rounding
-               differences.  DQ8_GL_BLENDS=1 opts in. */
+            /* t_9651f10a: fixed-function blending is DEFAULT ON
+               (t_77ac52ce removed the per-draw u_dst copy and its pipeline
+               drain; t_d559a510 made the per-buffer depth REPLACE guard keep
+               the emulated depth attachment out of the fixed-function blend).
+               The PICA blend configurations DQ8 issues (factors 0..14/eq 0..4)
+               have exact GL equivalents and the pixel result matches the
+               shader (software) blend to <=1 LSB of RGBA8 rounding, so the
+               gate is an OPT-OUT: any explicit DQ8_GL_BLENDS=0 restores the
+               shader blend path (A/B). */
             const char *bl = getenv("DQ8_GL_BLENDS");
-            if (bl && bl[0] == '1' && !bl[1]) {
-                pgl_blend_gl_on = 1;
-                fprintf(stderr, "GL backend: fixed-function blending ON "
-                        "(no per-draw u_dst copy for mappable PICA blends)\n");
+            pgl_blend_gl_on = !(bl && bl[0] == '0');
+            fprintf(stderr, "GL backend: fixed-function blending %s "
+                    "(renderer: %s; DQ8_GL_BLENDS=0 for the shader blend path)\n",
+                    pgl_blend_gl_on ? "ON (default)" : "off (DQ8_GL_BLENDS=0)",
+                    pgl_renderer[0] ? pgl_renderer : "unknown");
+            if (pgl_blend_gl_on)
+                fprintf(stderr, "GL backend: fixed-function blend depth guard "
+                        "= %s\n", pgl_perbuf_blend
+                        ? "per-buffer blend state (COLOR_ATTACHMENT1 = replace)"
+                        : "off (no glBlendFunci/glBlendEquationi -> shader "
+                          "blend path: the depth attachment must not be "
+                          "blended)");
+            {
+                const char *dg = getenv("DQ8_GL_BLENDDEPTH");
+                if (dg && dg[0] == '0' && !dg[1]) {
+                    pgl_blend_depth_guard = 0;
+                    fprintf(stderr, "GL backend: DQ8_GL_BLENDDEPTH=0 — the "
+                            "depth attachment is blended again (A/B of the "
+                            "pre-fix bug)\n");
+                }
             }
         }
         {
@@ -1306,6 +3577,75 @@ static int pgl_setup(PicaGlGetProc getproc) {
                         sk, pgl_skip_mask);
             }
         }
+    }
+    /* t_a22413f1 run3: validate the hardware depth path on THIS driver before
+       any game draw uses it. */
+    if (pgl_depth_hw) {
+        /* t_599a43f7: BOTH stages.  Stage 1 is the driver-capability check in a
+           minimal FBO; stage 2 is the PRODUCTION pipeline (three-attachment FBO,
+           depth clear after a depth-write-off draw, mirror + D32F read-back,
+           same-draw ordering).  Stage 1 passed on the operator's Radeon while
+           the real path was black, so stage 2 is what makes the gate real. */
+        int st1 = pgl_depth_selftest_run();
+        int st2 = pgl_depth_selftest_pipeline();
+        pgl_depth_selftest = (st1 == 1 && st2 == 1) ? 1 : -1;
+        /* DQ8_GL_DEPTH_FORCEFAIL=1: exercise the automatic fallback on a
+           healthy driver (the path the operator relies on if the D32F
+           attachment ever breaks again). */
+        {
+            const char *ff = getenv("DQ8_GL_DEPTH_FORCEFAIL");
+            if (ff && ff[0] && ff[0] != '0') pgl_depth_selftest = -1;
+        }
+        if (pgl_depth_selftest != 1)
+            pgl_depth_fallback(st1 == 1
+                ? "production-depth self-test failed on this driver"
+                : "depth self-test failed on this driver");
+    }
+    fprintf(stderr, "GL backend: depth path = %s%s (DQ8_GL_DEPTH_ATTACH=%d)%s\n",
+            pgl_depth_hw ? "HARDWARE D32F depth attachment"
+                         : "IN-SHADER emulation (ATT1 mirror)",
+            pgl_depth_hw ? " + gl_FragDepth" : "",
+            pgl_depth_hw_env,
+            pgl_depth_hw ? "" : "");
+    if (!pgl_depth_hw)
+        fprintf(stderr, "GL backend: depth path reason = %s \n",
+                pgl_depth_off_why ? pgl_depth_off_why : "?");
+    {   /* t_599a43f7: ONE line that answers the operator's report without a
+           second round trip.  Printed on every driver, every run. */
+        const char *ver = (const char *)pgl_glGetString(PGGL_VERSION);
+        if (pgl_frame_guard_off < 0) {
+            const char *g = getenv("DQ8_GL_FRAME_GUARD");
+            pgl_frame_guard_off = (g && g[0] == '0' && !g[1]) ? 1 : 0;
+        }
+        fprintf(stderr, "GL backend: DEPTH DIAG renderer=\"%s\" gl_version=\"%s\" "
+                        "fbo_layout=%s att0=RGBA8 att1=R32F depth=%s "
+                        "hw_requested=%d hw_active=%d selftest=%d "
+                        "fbo_builds=%u clearmask_fix=%d guard=%s lit_threshold=%d%% "
+                        "autofallback=%d split_gl=%d zdepth_inject=%d\n",
+                pgl_renderer[0] ? pgl_renderer : "?",
+                ver ? ver : "?",
+                pgl_depth_hw ? "RGBA8+R32F+D32F" : "RGBA8+R32F",
+                pgl_depth_hw ? "D32F" : "none",
+                pgl_depth_hw_env, pgl_depth_hw, pgl_depth_selftest,
+                pgl_depth_fbo_builds, pgl_depth_clearmask_fix,
+                pgl_frame_guard_off ? "off (DQ8_GL_FRAME_GUARD=0)" : "armed",
+                pgl_frame_guard_lit > 0 ? pgl_frame_guard_lit : 5,
+                pgl_depth_autofallback, pgl_split_on, pgl_zinject_near());
+    }
+    /* Fresh context: every cached GL state we track is unknown. */
+    pgl_depth_test_applied = -1;
+    pgl_depth_mask_applied = -1;
+    pgl_depth_hw_applied = -1;
+    /* t_f8f2c1da: the depth path is now FINAL for this process.  From here on
+       any change goes through pgl_depth_hw_set(), which drops the specialised
+       cache in the same step, and pgl_spec_select() may generate programs. */
+    pgl_depth_mode_ready = 1;
+    pgl_spec[0].depth_hw = -1;   /* generic program: no baked path */
+    {
+        const char *m = getenv("DQ8_GL_SPEC_MODECHECK");
+        if (m && m[0])
+            fprintf(stderr, "GL backend: SPEC MODECHECK armed (%d)%s\n", atoi(m),
+                    atoi(m) >= 2 ? " — violation aborts" : "");
     }
     pgl_ready = 1;
     return 1;
@@ -1477,12 +3817,19 @@ static int pica_gl_init(void) {
        stays with its owner.  Failure falls back to the synchronous path. */
     env = getenv("DQ8_SPLIT_GL");
     if (env && env[0] && env[0] != '0' && !pgl_external_ctx) {
-        if (pgl_split_start()) {
+        const char *batch = getenv("DQ8_GL_BATCH");
+        if (batch && batch[0] == '0') {
+            /* DQ8_GL_BATCH=0 restores per-draw write-back semantics; the
+               split path is batched by construction — do not silently mix. */
+            fprintf(stderr, "GL backend: DQ8_GL_BATCH=0 needs the synchronous "
+                    "path; ignoring DQ8_SPLIT_GL\n");
+        } else if (pgl_split_start()) {
             atexit(pica_gl_shutdown);
             return pgl_ready;
+        } else {
+            fprintf(stderr, "GL backend: worker-thread split failed to start; "
+                    "continuing on the synchronous path\n");
         }
-        fprintf(stderr, "GL backend: worker-thread split failed to start; "
-                "continuing on the synchronous path\n");
     }
     if (!pgl_bringup()) return 0;
     atexit(pica_gl_shutdown);
@@ -1492,9 +3839,35 @@ static int pica_gl_init(void) {
 static int pica_gl_active(void) { return pgl_ready; }
 static unsigned long long pica_gl_draw_count(void) { return pgl_draws; }
 static const char *pica_gl_renderer(void) { return pgl_renderer; }
+/* t_5ddc492f test hook (tools/gl_spec_test.c): force the fragment-shader
+   specialisation on/off so one process can A/B the same draw state.  The
+   game never calls it (the env knob decides). */
+static void pica_gl_spec_set(int on) { pgl_spec_on = on ? 1 : 0; }
 
 static void pica_gl_shutdown(void) {
     unsigned i;
+    /* t_f8f2c1da: the stale-specialised-program tripwire.  A clean run prints
+       violations=0 and (outside the replay harness) depth_mode_changes=0. */
+    fprintf(stderr, "GL SPEC MODECHECK: violations=%llu depth_mode_changes=%u "
+            "baked_variants=%d depth_path=%s\n",
+            pgl_spec_modecheck_n, pgl_depth_mode_changes,
+            pgl_nspec > 1 ? pgl_nspec - 1 : 0,
+            pgl_depth_hw ? "hardware-d32f" : "in-shader");
+    if (pgl_clear_pins || pgl_clear_would_clobber)
+        fprintf(stderr, "GL clear pin: colour-only clears pinned=%llu "
+                "would_clobber_att1=%llu cmask_depth_draws=%llu\n",
+                pgl_clear_pins, pgl_clear_would_clobber, pgl_draws_cmask_depth);
+    /* t_599a43f7: the black-frame guard's verdict for this run.  A run that
+       needed a fallback says so here with the reason; depth_fallbacks follows. */
+    fprintf(stderr, "GL DEPTH GUARD: frames=%u best_lit=%u.%u%% dark_flat=%u "
+            "dark_draws=%u armed=%d probes=%u clear_checks=%u clear_bad=%u "
+            "fallbacks=%u reason=\"%s\" depth_path=%s\n",
+            pgl_frame_no, pgl_lit_best_pmille / 10u, pgl_lit_best_pmille % 10u,
+            pgl_dark_frames, pgl_dark_draws, pgl_hw_bright_frames,
+            pgl_frame_guard_probes, pgl_dclear_checks, pgl_dclear_bad,
+            pgl_depth_fallback_count,
+            pgl_depth_hw ? "-" : (pgl_depth_off_why ? pgl_depth_off_why : "?"),
+            pgl_depth_hw ? "hardware-d32f" : "in-shader");
     if (!pgl_ready) return;
     pica_gl_context_release(); /* hand the thread back before teardown */
     pgl_ready = 0;
@@ -1641,7 +4014,16 @@ static void pica_gl_context_release(void) {
    + FBO to be re-specified/re-attached. */
 static int pgl_ensure_objects(void) {
     unsigned lost = 0, used = pgl_obj_used, i;
-    if (!pgl_glIsProgram(pgl_program)) { pgl_program = 0; lost |= 1u; }
+    if (!pgl_glIsProgram(pgl_program)) {
+        int si;
+        pgl_program = 0;
+        lost |= 1u;
+        /* t_5ddc492f: the specialised programs went with the same context
+           loss; drop them and let the draw path regenerate on demand. */
+        for (si = 1; si < pgl_nspec; ++si) pgl_spec[si].key = 0;
+        pgl_nspec = 1;
+        pgl_prog_cur = 0;
+    }
     if ((lost & 1u) && !pgl_build_program()) return 0;
     if ((used & 2u) && !pgl_glIsVertexArray(pgl_vao)) { pgl_glGenVertexArrays(1, &pgl_vao); lost |= 2u; }
     if ((used & 4u) && !pgl_glIsBuffer(pgl_vbo)) { pgl_glGenBuffers(1, &pgl_vbo); lost |= 4u; }
@@ -1672,7 +4054,11 @@ static int pgl_ensure_objects(void) {
         pgl_glGenTextures(1, &pgl_zdst_tex);
         lost |= 256u;
     }
-    if (lost & (8u | 16u | 128u)) {
+    if ((used & 512u) && !pgl_glIsTexture(pgl_dtex)) {
+        pgl_glGenTextures(1, &pgl_dtex);
+        lost |= 512u;
+    }
+    if (lost & (8u | 16u | 128u | 512u)) {
         pgl_rt_w = pgl_rt_h = 0; /* re-specify + re-attach */
         /* FBO content lost with the objects: the guest thread owns the
            shadows under the split, so route through the resync atomic. */
@@ -1694,6 +4080,42 @@ static int pgl_ensure_objects(void) {
     return 1;
 }
 
+/* t_a22413f1 run3: leave the hardware depth path at runtime.  The operator's
+   Radeon rendered an almost fully black screen with the D32F depth attachment;
+   nothing here can be debugged from llvmpipe, so the backend must never be able
+   to present that state: on a failed self-test, an incomplete FBO or a run of
+   black frames the depth attachment is detached and the shader resumes the
+   in-shader test (the pre-fix behaviour, which at least draws the scene). */
+static void pgl_depth_fallback(const char *why) {
+    if (!pgl_depth_hw) return;
+    pgl_depth_hw_set(0, why);      /* invalidates the specialised cache */
+    pgl_depth_off_why = why;
+    ++pgl_depth_fallback_count;
+    if (pgl_fbo != 0 && pgl_rt_tex != 0) {
+        PGenum st;
+        pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_fbo);
+        pgl_obj_used |= 8u;
+        pgl_glFramebufferTexture2D(PGGL_FRAMEBUFFER, PGGL_DEPTH_ATTACHMENT,
+                                   PGGL_TEXTURE_2D, 0, 0);
+        st = pgl_glCheckFramebufferStatus(PGGL_FRAMEBUFFER);
+        fprintf(stderr, "GL backend: DEPTH PATH FALLBACK -> IN-SHADER "
+                        "(%s); FBO status 0x%04X (complete=0x%04X)\n",
+                why, (unsigned)st, (unsigned)PGGL_FRAMEBUFFER_COMPLETE);
+    } else {
+        fprintf(stderr, "GL backend: DEPTH PATH FALLBACK -> IN-SHADER (%s)\n", why);
+    }
+    /* The applied state is unknown now: re-apply on the next draw. */
+    pgl_depth_test_applied = -1;
+    pgl_depth_mask_applied = -1;
+    pgl_depth_hw_applied = -1;
+    /* The specialised shaders baked the hardware depth path into their source,
+       so they cannot serve draws any more: pgl_depth_hw_set() already reset the
+       cache (t_f8f2c1da — one code path, no way to forget it). */
+    /* Guest depth memory may hold values written under the hardware path. */
+    if (!pgl_split_cur) pgl_zforce_full = 1;
+    pgl_drain_errors("depth-fallback", NULL);
+}
+
 /* Ensure FBO color attachment matches the render-target size. */
 static int pgl_ensure_rt(int w, int h) {
     if (pgl_fbo == 0 || w <= 0 || h <= 0) return 0;
@@ -1707,31 +4129,98 @@ static int pgl_ensure_rt(int w, int h) {
         pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_MAG_FILTER, PGGL_NEAREST);
         pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_RGBA8, w, h, 0, PGGL_RGBA,
                          PGGL_UNSIGNED_BYTE, NULL);
-        /* Depth attachment: R32F storing integer z values (exact). */
+        /* Depth attachment: R32F storing integer z values (exact).  This is the
+           GUEST-VISIBLE depth mirror (t_a22413f1: it is no longer the source of
+           the depth test — the real depth attachment below does that — but it
+           stays the authoritative value carrier for the write-back because it
+           is exactly what the software path stores). */
         pgl_glBindTexture(PGGL_TEXTURE_2D, pgl_z_tex);
         pgl_obj_used |= 128u;
         pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_MIN_FILTER, PGGL_NEAREST);
         pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_MAG_FILTER, PGGL_NEAREST);
         pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_R32F, w, h, 0, PGGL_RED,
                          PGGL_FLOAT, NULL);
+        /* t_a22413f1: real depth attachment the rasterizer tests/writes, so
+           fragments of ONE draw depth-test each other in raster order.  Only
+           built in HARDWARE mode (run3: opt-in, off by default). */
+        if (pgl_depth_hw) {
+            pgl_glBindTexture(PGGL_TEXTURE_2D, pgl_dtex);
+            pgl_obj_used |= 512u;
+            pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_MIN_FILTER, PGGL_NEAREST);
+            pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_MAG_FILTER, PGGL_NEAREST);
+            pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_DEPTH_COMPONENT32F, w, h, 0,
+                             PGGL_DEPTH_COMPONENT, PGGL_FLOAT, NULL);
+            pgl_dt_w = w;
+            pgl_dt_h = h;
+        }
         pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_fbo);
         pgl_obj_used |= 8u;
         pgl_glFramebufferTexture2D(PGGL_FRAMEBUFFER, PGGL_COLOR_ATTACHMENT0,
                                    PGGL_TEXTURE_2D, pgl_rt_tex, 0);
         pgl_glFramebufferTexture2D(PGGL_FRAMEBUFFER, PGGL_COLOR_ATTACHMENT1,
                                    PGGL_TEXTURE_2D, pgl_z_tex, 0);
+        pgl_glFramebufferTexture2D(PGGL_FRAMEBUFFER, PGGL_DEPTH_ATTACHMENT,
+                                   PGGL_TEXTURE_2D,
+                                   pgl_depth_hw ? pgl_dtex : 0, 0);
+        /* New depth attachment content is undefined: force a full re-upload. */
+        pgl_depth_test_applied = -1;
+        pgl_depth_mask_applied = -1;
         /* Under the split the GUEST thread mirrors the re-spec force flags
            (it owns pgl_zshadow); pgl_zforce_full is guest state there. */
         if (!pgl_split_cur) pgl_zforce_full = 1;
         fb_status = pgl_glCheckFramebufferStatus(PGGL_FRAMEBUFFER);
+        /* t_a22413f1 run3: ALWAYS report the build (a diagnostic run needs the
+           status of the working case, not only the failure). */
+        ++pgl_depth_fbo_builds;
+        fprintf(stderr, "GL backend: FBO build #%u %dx%d depth_attach=%s "
+                        "status=0x%04X (complete=0x%04X) draw=%llu\n",
+                pgl_depth_fbo_builds, w, h,
+                pgl_depth_hw ? "D32F" : "none",
+                (unsigned)fb_status, (unsigned)PGGL_FRAMEBUFFER_COMPLETE,
+                (unsigned long long)pgl_draws);
         if (fb_status != PGGL_FRAMEBUFFER_COMPLETE) {
-            fprintf(stderr, "GL backend: FBO incomplete at %dx%d (0x%04X)\n",
-                    w, h, (unsigned)fb_status);
-            return 0;
+            if (pgl_depth_hw) {
+                /* Never run a black scene: drop the depth attachment and
+                   retry the same build with the in-shader path. */
+                pgl_depth_fallback("incomplete FBO with the D32F depth attachment");
+                pgl_glFramebufferTexture2D(PGGL_FRAMEBUFFER, PGGL_DEPTH_ATTACHMENT,
+                                           PGGL_TEXTURE_2D, 0, 0);
+                fb_status = pgl_glCheckFramebufferStatus(PGGL_FRAMEBUFFER);
+                fprintf(stderr, "GL backend: FBO re-check without depth "
+                                "attachment: 0x%04X (complete=0x%04X)\n",
+                        (unsigned)fb_status,
+                        (unsigned)PGGL_FRAMEBUFFER_COMPLETE);
+            }
+            if (fb_status != PGGL_FRAMEBUFFER_COMPLETE) {
+                fprintf(stderr, "GL backend: FBO incomplete at %dx%d (0x%04X)\n",
+                        w, h, (unsigned)fb_status);
+                return 0;
+            }
         }
         if (pgl_debug)
             fprintf(stderr, "GL debug: FBO %u rt_tex %u %dx%d complete\n",
                     pgl_fbo, pgl_rt_tex, w, h);
+        /* t_d8e5ab8c: a newly attached depth attachment has UNDEFINED content
+           (in practice zeros on radeonsi), and the guest's own depth region is
+           only uploaded once it writes it.  A draw in between would test
+           against 0.0 and lose every fragment - the first frame of a run went
+           black.  Start from "far", exactly like a cleared PICA depth buffer. */
+        if (pgl_depth_hw) {
+            /* t_8510204b: clear to PICA's FAR value, not GL's 1.0.  The guest
+               clears its depth region to 0xFFFFFF, and a PICA fragment whose
+               integer z is 0xFFFFFF must FAIL less/lequal against it (the
+               in-shader path compares integers, so 0xFFFFFF < 0xFFFFFF is
+               false).  Clearing the attachment to 1.0 left ONE ulp of headroom
+               (0xFFFFFF/2^24 = 0.99999994 < 1.0), so every far-plane polygon —
+               the sky/backdrop quads that cover the screen in battle, and the
+               black occluders that write far depth — passed the hardware test
+               and painted over the scene, while the in-shader path rejected
+               them.  Clearing to the same 24-bit far keeps the two paths
+               identical. */
+            float fv = pgl_zfix_on() ? (float)(16777215.0 / 16777216.0) : 1.0f;
+            pgl_depth_attachment_clear(fv);   /* t_599a43f7: one clear path */
+            pgl_drain_errors("depth-init-clear", NULL);
+        }
     }
     pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_fbo);
     pgl_obj_used |= 8u;
@@ -1751,7 +4240,7 @@ static int pgl_ensure_rt(int w, int h) {
    (src-alpha-sat) and every equation 0..4 has an exact GL equivalent, and GL
    blends against the same 8-bit destination the u_dst copy would have
    supplied, so the result differs at most by the final 8-bit rounding. */
-static int pgl_factor_gl(unsigned f, PGenum *out) {
+static int pgl_factor_gl(unsigned f, int is_src, PGenum *out) {
     switch (f) {
     case 0:  *out = PGGL_ZERO; break;
     case 1:  *out = PGGL_ONE; break;
@@ -1767,7 +4256,17 @@ static int pgl_factor_gl(unsigned f, PGenum *out) {
     case 11: *out = PGGL_ONE_MINUS_CONSTANT_COLOR; break;
     case 12: *out = PGGL_CONSTANT_ALPHA; break;
     case 13: *out = PGGL_ONE_MINUS_CONSTANT_ALPHA; break;
-    default: return 0; /* 14 = src-alpha-sat (min(sa, 1-da)): no GL equivalent */
+    case 14:
+        /* t_d559a510: SRC_ALPHA_SATURATE.  pica_blend_factor(14) returns
+           min(sa, 1-da) for RGB and 1.0 for alpha; GL_SRC_ALPHA_SATURATE is
+           defined as exactly (min(As,1-Ad), min(As,1-Ad), min(As,1-Ad), 1),
+           so it matches term for term — but ONLY as a source factor.  As a
+           destination factor GL has no equivalent (the GL spec only allows it
+           in the source slot), so those draws stay on the shader path. */
+        if (!is_src) return 0;
+        *out = PGGL_SRC_ALPHA_SATURATE;
+        break;
+    default: return 0; /* 15 (unused) */
     }
     return 1;
 }
@@ -1786,10 +4285,20 @@ static int pgl_equation_gl(unsigned eq, PGenum *out) {
    configuration is expressible as fixed-function GL blending. */
 static int pgl_blend_state(const PicaGlState *st, PGenum f[4], PGenum eq[2]) {
     if (!pgl_blend_gl_on || !st->blend) return 0;
-    if (!pgl_factor_gl(st->blend_src_rgb, &f[0])) return 0;
-    if (!pgl_factor_gl(st->blend_dst_rgb, &f[1])) return 0;
-    if (!pgl_factor_gl(st->blend_src_a, &f[2])) return 0;
-    if (!pgl_factor_gl(st->blend_dst_a, &f[3])) return 0;
+    /* t_d559a510: a depth draw writes the emulated depth buffer in
+       COLOR_ATTACHMENT1.  Fixed-function blending would blend frag_z against
+       the old depth (GL applies the blend to every enabled draw buffer), which
+       corrupts the depth test for every later draw.  With per-buffer blend
+       state the depth buffer is switched back to a plain replace; without those
+       entry points the draw must not take the fixed-function path at all.
+       The shader writes frag_z to COLOR_ATTACHMENT1 on EVERY draw (0.0 when the
+       depth buffer is off), so the replace is needed whenever blending is on,
+       not only for depth draws. */
+    if (pgl_blend_depth_guard && !pgl_perbuf_blend) return 0;
+    if (!pgl_factor_gl(st->blend_src_rgb, 1, &f[0])) return 0;
+    if (!pgl_factor_gl(st->blend_dst_rgb, 0, &f[1])) return 0;
+    if (!pgl_factor_gl(st->blend_src_a, 1, &f[2])) return 0;
+    if (!pgl_factor_gl(st->blend_dst_a, 0, &f[3])) return 0;
     if (!pgl_equation_gl(st->blend_eq_rgb, &eq[0])) return 0;
     if (!pgl_equation_gl(st->blend_eq_a, &eq[1])) return 0;
     return 1;
@@ -1816,6 +4325,88 @@ static int pgl_blend_dst_read(const PicaGlState *st) {
         if (f != 0u || eq >= 3u) return 1;
     }
     return 0;
+}
+
+/* t_6b81015d: feedback-loop ordering for the framebuffer-fetch path.
+   GL 4.5 core spec §9.3 ("Feedback Loops Between Textures and the
+   Framebuffer"): a texel may be read and written by the SAME shader
+   invocation (the panel's per-fragment read-modify-write is explicitly
+   allowed), but "if a texel has been written, then in order to safely read
+   the result a texel fetch must be in a subsequent draw call separated by
+   void TextureBarrier(void)" — otherwise the read values are UNDEFINED.
+   With DQ8_GL_FBFETCH the shader imageLoads the live render target, so every
+   overlapping UI draw (panel fill, then its border/glyph quads) reads texels
+   written by an earlier draw.  Unbarriered that is undefined: llvmpipe and
+   softpipe rasterise strictly in order and return the right values, while a
+   tiled/async driver may return pre-draw contents — which shows up as the
+   background bleeding through the translucent panel in patches, with
+   partial/stale UI fragments inside it, flipping frame to frame.  One barrier
+   per dest-reading draw (only when a draw has written since the last one) is
+   the minimum the spec requires.  DQ8_GL_TEXBARRIER=0 restores the
+   unbarriered behaviour as an A/B. */
+static void pgl_dst_barrier(int x0, int y0, int x1, int y1) {
+    static int mode = -1;   /* 1 = texture barrier + box skip, 2 = image
+                               barrier + box skip, 4 = texture barrier, no skip,
+                               0 = no barrier at all */
+    if (pgl_texbarrier_on < 0) {
+        /* t_2d934e23: DEFAULT depends on the driver class.  The barrier only
+           exists to make a read of the live render target well-defined
+           (GL 4.5 §9.3): a tiled/async driver may return pre-draw contents.
+           llvmpipe/softpipe/swrast rasterise strictly IN ORDER (verified in
+           t_6b81015d: they return the right values unbarriered), so on those
+           renderers the barrier buys nothing and costs a full pipeline flush
+           per reading draw -- measured 3.03 -> 1.75 ms/draw of glDrawArrays
+           time (llvmpipe), i.e. ~40% of the GL drain, because a flush also
+           stops llvmpipe from batching consecutive draws.  Hardware drivers
+           keep the barrier.  DQ8_GL_TEXBARRIER=1/2/4 force it (=4 also
+           disables the box skip), =0 disables it everywhere (A/B). */
+        const char *e = getenv("DQ8_GL_TEXBARRIER");
+        int soft_inorder = pgl_renderer[0] &&
+            (strstr(pgl_renderer, "llvmpipe") || strstr(pgl_renderer, "softpipe") ||
+             strstr(pgl_renderer, "swrast"));
+        if (e && e[0] == '0')      { pgl_texbarrier_on = 0; mode = 0; }
+        else if (e && e[0] == '2') { pgl_texbarrier_on = 1; mode = 2; }
+        else if (e && e[0] == '4') { pgl_texbarrier_on = 1; mode = 4; }
+        else if (e && e[0] == '1') { pgl_texbarrier_on = 1; mode = 1; }
+        else {
+            pgl_texbarrier_on = soft_inorder ? 0 : 1;
+            mode = 1;
+            fprintf(stderr, "GL backend: fb-fetch ordering barrier %s (renderer %s: "
+                    "%s rasterisation; DQ8_GL_TEXBARRIER=1/2/4 force it, =0 off)\n",
+                    pgl_texbarrier_on ? "on" : "off",
+                    pgl_renderer[0] ? pgl_renderer : "(unknown)",
+                    soft_inorder ? "in-order software" : "hardware/tiled");
+        }
+    }
+    if (!pgl_texbarrier_on || !pgl_rt_wrote) return;
+    /* t_2d934e23: disjoint boxes -> this draw cannot observe the pending
+       writes (screen-aligned fetch, conservative write rects), so the pipeline
+       flush is not needed.  DQ8_GL_TEXBARRIER=4 forces the barrier for every
+       reading draw (A/B of this skip). */
+    if (mode != 4 && !pgl_wrect_hit(x0, y0, x1, y1)) {
+        ++pgl_texbar_skip;
+        return;
+    }
+    /* t_2d934e23: the fb-fetch surface is read through an IMAGE unit
+       (imageLoad), so glMemoryBarrier(SHADER_IMAGE_ACCESS_BARRIER_BIT|...) is
+       the spec primitive for it; glTextureBarrier orders texture FETCHES and
+       makes llvmpipe wait for every rasteriser thread (~1.3 ms/draw measured).
+       DQ8_GL_TEXBARRIER=2 selects the image barrier, =1 (default) the texture
+       barrier, =0 no barrier at all. */
+    if (mode == 1 && pgl_glTextureBarrier) {
+        pgl_glTextureBarrier();
+    } else if (pgl_glMemoryBarrier) {
+        pgl_glMemoryBarrier(PGGL_TEXTURE_FETCH_BARRIER_BIT |
+                            PGGL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                            PGGL_FRAMEBUFFER_BARRIER_BIT);
+    } else if (pgl_glTextureBarrier) {
+        pgl_glTextureBarrier();
+    } else {
+        return; /* no ordering primitive: fb-fetch is already disabled */
+    }
+    pgl_rt_wrote = 0;
+    pgl_nwrect = 0;
+    ++pgl_texbarriers;
 }
 
 static unsigned pica_gl_draw_locked(const PicaGlVertex *verts, unsigned nverts,
@@ -1847,6 +4438,134 @@ static void pgl_reset_drawn(void) {
     pgl_drawn_x1 = pgl_drawn_y1 = -1;
 }
 
+/* t_993e6fb6: colour-only clears must never touch COLOR_ATTACHMENT1.
+   glClear(GL_COLOR_BUFFER_BIT) clears EVERY buffer in the FBO's draw-buffer
+   list, and after any depth draw that list is {COLOR_ATTACHMENT0,
+   COLOR_ATTACHMENT1} — ATT1 being the emulated PICA depth mirror (R32F).
+   The uniform-fill fast clear below therefore wiped the depth mirror with the
+   FILL COLOUR while pgl_zshadow still reported it in sync (its memcmp fast
+   path then never restored it), so every later depth test compared integer z
+   (0..16777215) against a ~0..1 value and failed: the front faces of 3D
+   models drop out and the interior/back faces show through (in the extreme,
+   the scene goes black).  The software rasterizer has no such path, which is
+   why the SW backend is perfect.  Pin the draw-buffer list to ATT0 around the
+   colour clear (probe tools/gl_mrt_clear_probe.c T2/T4); the next draw
+   re-establishes its own list (glDrawBuffers(depth_on ? 2 : 1, ...)).
+   The counters make the interleaving visible in the operator's log. */
+static void pgl_clear_color_only(PGfloat r, PGfloat g, PGfloat b, PGfloat a) {
+    PGenum one[1] = { PGGL_COLOR_ATTACHMENT0 };
+    if (pgl_glGetIntegerv && pgl_glDrawBuffers) {
+        PGint db1 = 0;
+        /* GL_DRAW_BUFFER1 = 0x8826 (0x8830 is DRAW_BUFFER11 and always
+           GL_NONE here, which would silently hide the interception). */
+        pgl_glGetIntegerv(0x8826 /* GL_DRAW_BUFFER1 */, &db1);
+        if (db1 != 0) ++pgl_clear_would_clobber; /* ATT1 was in the list */
+        pgl_glColorMask(1, 1, 1, 1);
+        pgl_glDrawBuffers(1, one);
+    } else {
+        /* Cannot pin: the clear WILL wipe the depth mirror.  Force the next
+           depth refresh to re-upload from guest memory instead of trusting
+           the (now stale) shadow comparison. */
+        pgl_zforce_full = 1;
+    }
+    pgl_glClearColor(r, g, b, a);
+    pgl_glClear(PGGL_COLOR_BUFFER_BIT);
+    ++pgl_clear_pins;
+}
+
+/* t_993e6fb6: the PICA colour mask gates the COLOUR attachment only.
+   COLOR_ATTACHMENT1 is the emulated depth buffer, and the software path
+   (pica_depth_test_write_d) writes depth for colour-masked depth-only draws.
+   A plain glColorMask() applies to every enabled draw buffer, so a
+   colour-masked depth prepass silently dropped its depth-mirror write and
+   every later depth test compared against stale z — front faces dropped out
+   and the model interior showed through (GL only; SW has no such coupling).
+   glColorMaski splits them. */
+static void pgl_apply_color_mask(const PicaGlState *st) {
+    PGboolean r = (st->color_mask >> 0) & 1, g = (st->color_mask >> 1) & 1,
+              b = (st->color_mask >> 2) & 1, a = (st->color_mask >> 3) & 1;
+    if (pgl_glColorMaski) {
+        pgl_glColorMaski(0, r, g, b, a);
+        /* t_a22413f1: ATT1 carries the raw integer z for the guest write-back.
+           In HARDWARE mode the real depth test already killed failing
+           fragments, so ATT1 is written exactly when the PICA depth mask allows
+           it (never re-writing the previous z, which needed the undefined
+           read-back).  In IN-SHADER mode (run3: the pre-fix behaviour, and the
+           default) the shader itself stores oldz when the depth mask is off,
+           so ATT1 must stay writable for every depth draw. */
+        if (st->depth_on && (pgl_depth_hw ? (st->depth_write || pgl_hw_att1all) : 1))
+            pgl_glColorMaski(1, 1, 1, 1, 1);
+        else
+            pgl_glColorMaski(1, 0, 0, 0, 0);
+        return;
+    }
+    pgl_glColorMask(r, g, b, a);
+}
+
+/* t_a22413f1: hardware depth state for one draw.  PICA compare codes are
+   0=never 1=always 2=equal 3=notequal 4=less 5=lequal 6=greater 7=gequal. */
+static unsigned pgl_gl_depth_func(unsigned pica_func) {
+    switch (pica_func) {
+    case 0u: return PGGL_NEVER;
+    case 1u: return PGGL_ALWAYS;
+    case 2u: return PGGL_EQUAL;
+    case 3u: return PGGL_NOTEQUAL;
+    case 4u: return PGGL_LESS;
+    case 5u: return PGGL_LEQUAL;
+    case 6u: return PGGL_GREATER;
+    default: return PGGL_GEQUAL;
+    }
+}
+
+static void pgl_apply_depth_state(const PicaGlState *st) {
+    int on, mask;
+    unsigned func;
+    if (!pgl_glDepthFunc || !pgl_glDepthMask) return;
+    if (!pgl_depth_hw) {
+        /* t_a22413f1 run3: IN-SHADER mode — the fragment shader does the
+           compare/discard against the emulated ATT1 mirror, exactly like the
+           pre-fix backend, so the GL depth test must not also run. */
+        if (pgl_depth_test_applied != 0) {
+            pgl_glDisable(PGGL_DEPTH_TEST);
+            pgl_depth_test_applied = 0;
+        }
+        if (pgl_depth_mask_applied != 0) {
+            pgl_glDepthMask(0);
+            pgl_depth_mask_applied = 0;
+        }
+        return;
+    }
+    if (!st->depth_on) {
+        /* No depth buffer bound: no test, no write (gateway for the PICA
+           "unbound depth" case, which the software path also passes). */
+        if (pgl_depth_test_applied != 0) {
+            pgl_glDisable(PGGL_DEPTH_TEST);
+            pgl_depth_test_applied = 0;
+        }
+        if (pgl_depth_mask_applied != 0) {
+            pgl_glDepthMask(0);
+            pgl_depth_mask_applied = 0;
+        }
+        return;
+    }
+    on = (st->depth_test || st->depth_write) ? 1 : 0;
+    func = st->depth_test ? pgl_gl_depth_func(st->depth_func) : PGGL_ALWAYS;
+    mask = st->depth_write ? 1 : 0;
+    if (pgl_depth_test_applied != on) {
+        if (on) pgl_glEnable(PGGL_DEPTH_TEST);
+        else pgl_glDisable(PGGL_DEPTH_TEST);
+        pgl_depth_test_applied = on;
+    }
+    if (on && pgl_depth_func_applied != func) {
+        pgl_glDepthFunc((PGenum)func);
+        pgl_depth_func_applied = func;
+    }
+    if (pgl_depth_mask_applied != mask) {
+        pgl_glDepthMask((PGboolean)mask);
+        pgl_depth_mask_applied = mask;
+    }
+}
+
 /* Bring the FBO back in sync with guest memory after guest-side writes.
    `raw`/`len` are the render target's raw guest bytes (host->rt_raw).
    Fast paths: unchanged region (single memcmp), uniform raw pattern (GSP
@@ -1854,12 +4573,92 @@ static void pgl_reset_drawn(void) {
    Morton-block diff uploaded as sub-rectangles.  The Morton color buffer is
    laid out as 64-pixel (8x8) blocks in block-row-major order, so a block is
    one contiguous raw range (see pica_rt_off in the runtime). */
+/* ---- t_477973bb: refresh once per PICA list, not once per draw -----------
+   Every draw re-synced the FBO against guest memory with two full-surface
+   memcmp()s (colour 384 KB + depth).  On the RX 580 that is 36.8 us per draw,
+   ref_ms=256 ms/s = 27 % of the main thread (measured with GLPHASE on
+   dq8-b18) and 99.6 % of those compares find the buffer UNCHANGED
+   (refeq=6933/6963 per second).
+   The compare is only needed to catch GUEST-SIDE writes to the render target.
+   Between two draws of one submitted PICA command list the guest CPU cannot
+   run: the list is parsed synchronously on the submitting thread, so the
+   guest bytes are frozen for the whole list.  One refresh per list is
+   therefore equivalent, and a new list (pica_list_no, bumped by
+   pica_process_command_list) re-arms the compare — the very same signal the
+   batching design already uses.  A render-target switch (different raw
+   pointer/length), a rebuilt shadow or pgl_force_full also re-arm it.
+   DQ8_REFRESH_PER_DRAW=1 restores the old per-draw compare exactly. */
+static int pgl_refr_per_draw = -1;
+static const unsigned char *pgl_shadow_src;
+static const unsigned char *pgl_zshadow_src;
+/* Guest-write watch (t_477973bb): the ranges the render target and its depth
+   mirror occupy in guest RAM.  Every guest store (put8/16/32 in the runtime)
+   and every GSP fill reports here, so a refresh is only needed when the guest
+   actually touched those bytes — the memcmp only has to prove the common
+   "nothing changed" case, and this proves it without reading 576 KB. */
+static unsigned char *pgl_watch_lo, *pgl_watch_hi;
+static unsigned char *pgl_zwatch_lo, *pgl_zwatch_hi;
+static int pgl_guest_dirty;
+static int pgl_dirty_on = -1;   /* DQ8_REFRESH_DIRTY=0 -> legacy per-draw */
+
+void pica_gl_note_guest_write(const void *p, unsigned len) {
+    const unsigned char *c = (const unsigned char *)p;
+    if (pgl_guest_dirty || !len) return;
+    if (pgl_watch_lo && c < pgl_watch_hi && c + len > pgl_watch_lo) {
+        pgl_guest_dirty = 1;
+        return;
+    }
+    if (pgl_zwatch_lo && c < pgl_zwatch_hi && c + len > pgl_zwatch_lo)
+        pgl_guest_dirty = 1;
+}
+
+/* 1 = refresh this draw, 0 = the shadow already reflects guest memory,
+   -1 = host access failed. */
+static int pgl_refr_needed(const PicaGlState *st, const PicaGlHost *host,
+                           const unsigned char **raw, unsigned *len) {
+    if (pgl_refr_per_draw < 0) {
+        const char *e = getenv("DQ8_REFRESH_PER_DRAW");
+        const char *d = getenv("DQ8_REFRESH_DIRTY");
+        pgl_refr_per_draw = (e && e[0] && e[0] != '0') ? 1 : 0;
+        pgl_dirty_on = (d && d[0] == '0') ? 0 : 1;
+    }
+    if (!host->rt_raw(host->user, raw, len)) return -1;
+    if (*raw && *len) {
+        pgl_watch_lo = (unsigned char *)*raw;
+        pgl_watch_hi = pgl_watch_lo + *len;
+    } else {
+        pgl_watch_lo = pgl_watch_hi = NULL;
+    }
+    if (st->depth_on && host->depth_raw) {
+        const unsigned char *zr = NULL;
+        unsigned zl = 0;
+        if (!host->depth_raw(host->user, &zr, &zl)) return -1;
+        pgl_zwatch_lo = (unsigned char *)zr;
+        pgl_zwatch_hi = zr ? (unsigned char *)zr + zl : NULL;
+    } else {
+        pgl_zwatch_lo = pgl_zwatch_hi = NULL;
+    }
+    if (pgl_refr_per_draw || !pgl_dirty_on) return 1;
+    if (pgl_force_full || !pgl_shadow) return 1;
+    if (pgl_shadow_src != *raw || pgl_shadow_len != *len) return 1;
+    if (pgl_shadow_w != st->rt_w || pgl_shadow_h != st->rt_h) return 1;
+    if (pgl_shadow_bpp != (st->rt_bpp ? st->rt_bpp : 4u)) return 1;
+    if (pgl_guest_dirty) return 1;
+    if (st->depth_on && host->depth_raw) {
+        if (pgl_zforce_full || !pgl_zshadow) return 1;
+        if (pgl_zshadow_src != pgl_zwatch_lo ||
+            pgl_zshadow_len != (unsigned)(pgl_zwatch_hi - pgl_zwatch_lo))
+            return 1;
+    }
+    return 0;
+}
+
 static int pgl_refresh(const PicaGlState *st, const PicaGlHost *host,
                        const unsigned char *raw, unsigned len) {
     unsigned char *pixels;
     unsigned bs, blocks_x, nblocks, bi, x, y;
     int all = pgl_force_full;
-    if (!all && memcmp(pgl_shadow, raw, len) == 0) return 1;
+    if (!all && memcmp(pgl_shadow, raw, len) == 0) { ++pgl_ph_ref_eq; return 1; }
     ++pgl_refills;
     /* 1) uniform raw pattern: the whole region is a repeating 3- or 4-byte
           pattern (what gsp_memory_fill / memset write).  A pixel's decoded
@@ -1867,13 +4666,17 @@ static int pgl_refresh(const PicaGlState *st, const PicaGlHost *host,
           one color becomes an O(1) glClear. */
     {
         unsigned L = 0, i;
+        /* t_2d934e23: a uniform raw pattern of period 3 or 4 is exactly
+           memcmp(raw, raw + i, len - i) == 0.  The old per-byte
+           `raw[j] != raw[j % i]` loop did a modulo per byte — two full passes
+           over the 819 KB render target (~2-3 ms) on every fill-induced
+           refresh; memcmp is vectorised and costs ~50 us.  Identical
+           predicate, identical L. */
         for (i = 4; i >= 3; --i) {
-            unsigned j;
             if (len < i) continue;
-            for (j = 0; j < len; ++j)
-                if (raw[j] != raw[j % i]) break;
-            if (j == len) { L = i; break; }
+            if (memcmp(raw, raw + i, len - i) == 0) { L = i; break; }
         }
+        if (L) ++pgl_ph_ref_uniform;
         if (L) {
             unsigned char col[4][4], have[4] = {0, 0, 0, 0};
             int ok = 1, uniform = 1;
@@ -1892,10 +4695,8 @@ static int pgl_refresh(const PicaGlState *st, const PicaGlHost *host,
             if (ok && uniform) {
                 pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_fbo);
                 pgl_obj_used |= 8u;
-                pgl_glColorMask(1, 1, 1, 1);
-                pgl_glClearColor(col[0][0] / 255.0f, col[0][1] / 255.0f,
-                                 col[0][2] / 255.0f, col[0][3] / 255.0f);
-                pgl_glClear(PGGL_COLOR_BUFFER_BIT);
+                pgl_clear_color_only(col[0][0] / 255.0f, col[0][1] / 255.0f,
+                                     col[0][2] / 255.0f, col[0][3] / 255.0f);
                 ++pgl_cleared;
                 memcpy(pgl_shadow, raw, len);
                 pgl_force_full = 0;
@@ -1924,10 +4725,107 @@ static int pgl_refresh(const PicaGlState *st, const PicaGlHost *host,
         }
     }
     /* 2) generic: changed 8x8 Morton blocks -> sub-rectangle uploads. */
-    pixels = (unsigned char *)malloc(64u * 4u);
-    if (!pixels) return 0;
+    ++pgl_ph_ref_blocks;
     blocks_x = st->rt_w / 8u;
     bs = 64u * (st->rt_bpp ? st->rt_bpp : 4u);
+    if (blocks_x && (st->rt_w % 8u) == 0 && (st->rt_h % 8u) == 0 &&
+        (size_t)bs * blocks_x * (st->rt_h / 8u) <= (size_t)len && st->rt_bpp == 4u) {
+        /* t_2d934e23: RGBA8 guest buffer (fmt 0 = A,B,G,R bytes).  One
+           glTexSubImage2D per horizontal run of changed blocks in a block
+           row instead of one per 8x8 block (a full-screen diff was up to
+           3200 driver calls), and the pixels are decoded straight out of the
+           raw guest bytes (pica_get_pixel's tiling formula) instead of
+           64 rt_get() indirect calls -- each of which re-ran
+           guest_memory_range -- per block.  DQ8_REF_VERIFY=1 re-runs the old
+           path into a second buffer and byte-compares. */
+        static const unsigned xl[8] = {0u, 1u, 4u, 5u, 16u, 17u, 20u, 21u};
+        static const unsigned yl[8] = {0u, 2u, 8u, 10u, 32u, 34u, 40u, 42u};
+        unsigned by, run_bx, run_n, buffers = 0;
+        unsigned char *buf = (unsigned char *)malloc((size_t)blocks_x * 8u * 8u * 4u);
+        static int refver = -1;
+        if (!buf) { free(pixels); return 0; }
+        if (refver < 0) {
+            const char *e = getenv("DQ8_REF_VERIFY");
+            refver = (e && e[0] && e[0] != '0') ? 1 : 0;
+        }
+        for (by = 0; by < st->rt_h / 8u; ++by) {
+            int y0 = (int)st->rt_h - 1 - (int)(by * 8u + 7u);
+            for (run_bx = 0; run_bx < blocks_x;) {
+                unsigned bi = by * blocks_x + run_bx;
+                if (!all && memcmp(pgl_shadow + (size_t)bi * bs,
+                                   raw + (size_t)bi * bs, bs) == 0) {
+                    ++run_bx;
+                    continue;
+                }
+                for (run_n = 0; run_bx + run_n < blocks_x; ++run_n) {
+                    unsigned b = by * blocks_x + run_bx + run_n;
+                    if (!all && memcmp(pgl_shadow + (size_t)b * bs,
+                                       raw + (size_t)b * bs, bs) == 0)
+                        break;
+                }
+                {
+                    unsigned row, blk, ci;
+                    for (row = 0; row < 8u; ++row) {
+                        unsigned yi = 7u - row;   /* guest row inside block */
+                        unsigned yo = yl[yi];
+                        for (blk = 0; blk < run_n; ++blk) {
+                            const unsigned char *srcb =
+                                raw + (size_t)(by * blocks_x + run_bx + blk) * bs;
+                            unsigned char *drow = buf + (size_t)blk * 32u +
+                                                  (size_t)row * run_n * 32u;
+                            for (ci = 0; ci < 8u; ++ci) {
+                                const unsigned char *sp = srcb + (yo + xl[ci]) * 4u;
+                                unsigned char *dp = drow + (size_t)ci * 4u;
+                                dp[0] = sp[3]; dp[1] = sp[2];
+                                dp[2] = sp[1]; dp[3] = sp[0];
+                            }
+                        }
+                    }
+                    pgl_glBindTexture(PGGL_TEXTURE_2D, pgl_rt_tex);
+                    pgl_obj_used |= 16u;
+                    pgl_glTexSubImage2D(PGGL_TEXTURE_2D, 0,
+                                        (PGint)(run_bx * 8u), (PGint)y0,
+                                        (PGsizei)(run_n * 8u), 8,
+                                        PGGL_RGBA, PGGL_UNSIGNED_BYTE, buf);
+                    ++buffers;
+                    if (refver && buffers <= 64u) {
+                        unsigned char *ref = (unsigned char *)malloc(
+                            (size_t)run_n * 8u * 8u * 4u);
+                        if (ref) {
+                            unsigned r2, b2, c2, diffs = 0;
+                            for (r2 = 0; r2 < 8u; ++r2)
+                                for (b2 = 0; b2 < run_n; ++b2)
+                                    for (c2 = 0; c2 < 8u; ++c2) {
+                                        unsigned char rgba[4];
+                                        unsigned gx = (run_bx + b2) * 8u + c2;
+                                        if (!host->rt_get(host->user, (int)gx,
+                                                          y0 + (int)r2, rgba))
+                                            memset(rgba, 0, 4);
+                                        memcpy(ref + ((size_t)b2 * 8u + c2) * 4u +
+                                               (size_t)r2 * run_n * 32u, rgba, 4);
+                                    }
+                            for (r2 = 0; r2 < (unsigned)run_n * 8u * 8u * 4u; ++r2)
+                                if (ref[r2] != buf[r2]) ++diffs;
+                            fprintf(stderr, "REFVERIFY n=%u run=%u@%u,%u "
+                                    "bytes=%u diff=%u %s\n", buffers, run_n,
+                                    run_bx, by, run_n * 8u * 8u * 4u, diffs,
+                                    diffs ? "MISMATCH" : "IDENTICAL");
+                            free(ref);
+                        }
+                    }
+                }
+                run_bx += run_n;
+            }
+        }
+        free(buf);
+        free(pixels);
+        pgl_drain_errors("rt-subupload", NULL);
+        memcpy(pgl_shadow, raw, len);
+        pgl_force_full = 0;
+        return 1;
+    }
+    pixels = (unsigned char *)malloc(64u * 4u);
+    if (!pixels) return 0;
     if (blocks_x && (st->rt_w % 8u) == 0 && (st->rt_h % 8u) == 0 &&
         (size_t)bs * blocks_x * (st->rt_h / 8u) <= (size_t)len) {
         nblocks = blocks_x * (st->rt_h / 8u);
@@ -1995,10 +4893,33 @@ static int pgl_refresh(const PicaGlState *st, const PicaGlHost *host,
 static int pgl_refresh_depth(const PicaGlState *st, const PicaGlHost *host,
                              const unsigned char *raw, unsigned len) {
     unsigned bpp = st->depth_bpp ? st->depth_bpp : 2u, x, y;
+    if (pgl_dlog_on < 0) {
+        const char *e = getenv("DQ8_GL_DEPTHLOG");
+        pgl_dlog_on = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    /* t_8510204b diagnosis: DQ8_GL_ZFORCE=1 distrusts the shadow fast path and
+       re-uploads the guest depth region into both the mirror and the D32F
+       attachment on every depth refresh.  If the battle artifacts disappear
+       with it, the cause is a shadow/attachment desync, not the depth test. */
+    {
+        static int zf = -1;
+        if (zf < 0) {
+            const char *e = getenv("DQ8_GL_ZFORCE");
+            zf = (e && e[0] && e[0] != '0') ? 1 : 0;
+        }
+        if (zf) pgl_zforce_full = 1;
+    }
     if (!pgl_zforce_full && pgl_zshadow && pgl_zshadow_len == len &&
-        memcmp(pgl_zshadow, raw, len) == 0)
+        memcmp(pgl_zshadow, raw, len) == 0) {
+        ++pgl_ph_zref_eq;
+        if (pgl_dlog_on)
+            fprintf(stderr, "ZSYNC skip draw=%llu len=%u force=%d (shadow "
+                            "equals guest: attachment NOT refreshed)\n",
+                    (unsigned long long)pgl_draws, len, pgl_zforce_full);
         return 1;
+    }
     ++pgl_zrefills;
+    if (pgl_dlog_on) ++pgl_dlog_syncs;
     {   /* uniform z (GSP fills / memsets): one glClearBufferfv */
         unsigned z0 = raw[0] | ((unsigned)raw[1] << 8) |
                       (bpp > 2u ? ((unsigned)raw[2] << 16) : 0u);
@@ -2030,8 +4951,28 @@ static int pgl_refresh_depth(const PicaGlState *st, const PicaGlHost *host,
                 pgl_glColorMask(1, 1, 1, 1);
                 pgl_glDrawBuffers(2, zbufs);
                 pgl_glClearBufferfv(PGGL_COLOR, 1, v);
+                /* t_a22413f1: the real depth attachment must be cleared with
+                   the same value, scaled to the GL depth range (HARDWARE mode
+                   only — in IN-SHADER mode there is no depth attachment). */
+                if (pgl_depth_hw) {
+                    int mask_before = pgl_depth_mask_applied;
+                    /* t_599a43f7: single clear path — forces the depth write
+                       mask on (t_d8e5ab8c) so the clear cannot be a no-op. */
+                    pgl_depth_attachment_clear(
+                        (float)z0 * (1.0f / 16777216.0f));
+                    if (pgl_depth_probe_left)
+                        fprintf(stderr, "GL DEPTHCLEAR z0=%u (%.8f) "
+                                "mask_before=%d clearmask_fix=%d\n",
+                                z0, (double)((float)z0 * (1.0f / 16777216.0f)),
+                                mask_before, pgl_depth_clearmask_fix);
+                }
                 ok = pgl_drain_errors("z-clear", NULL) == 0;
             }
+            if (pgl_dlog_on)
+                fprintf(stderr, "ZSYNC clear draw=%llu rt=%ux%u z0=%u bpp=%u "
+                        "force=%d ok=%d\n",
+                        (unsigned long long)pgl_draws, st->rt_w, st->rt_h,
+                        z0, bpp, pgl_zforce_full, ok);
             if (ok) {
                 if (pgl_zshadow_len != len) {
                     unsigned char *grown =
@@ -2044,6 +4985,7 @@ static int pgl_refresh_depth(const PicaGlState *st, const PicaGlHost *host,
                 pgl_zforce_full = 0;
                 ++pgl_zflushes; /* count clear fast-path wins separately below */
                 --pgl_zflushes;
+                if (pgl_depth_hw) ++pgl_depth_syncs;
                 return 1;
             }
             /* Rejected by the driver: fall through to the full upload so the
@@ -2065,8 +5007,25 @@ static int pgl_refresh_depth(const PicaGlState *st, const PicaGlHost *host,
         pgl_obj_used |= 128u;
         pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_R32F, (PGsizei)st->rt_w,
                          (PGsizei)st->rt_h, 0, PGGL_RED, PGGL_FLOAT, img);
+        /* t_a22413f1: the same values, scaled into [0,1] with an exact
+           power-of-two factor, become the real depth attachment the
+           rasterizer tests against (zf ordering == float ordering). */
+        if (pgl_depth_hw) {
+            size_t n = (size_t)st->rt_w * st->rt_h, k;
+            for (k = 0; k < n; ++k) img[k] *= (1.0f / 16777216.0f);
+            pgl_glBindTexture(PGGL_TEXTURE_2D, pgl_dtex);
+            pgl_obj_used |= 512u;
+            pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_DEPTH_COMPONENT32F,
+                             (PGsizei)st->rt_w, (PGsizei)st->rt_h, 0,
+                             PGGL_DEPTH_COMPONENT, PGGL_FLOAT, img);
+        }
         free(img);
         pgl_drain_errors("z-upload", NULL);
+        if (pgl_dlog_on)
+            fprintf(stderr, "ZSYNC upload draw=%llu rt=%ux%u bpp=%u force=%d\n",
+                    (unsigned long long)pgl_draws, st->rt_w, st->rt_h, bpp,
+                    pgl_zforce_full);
+        if (pgl_depth_hw) ++pgl_depth_syncs;
     }
     if (pgl_zshadow_len != len) {
         unsigned char *grown =
@@ -2084,8 +5043,16 @@ static int pgl_refresh_depth(const PicaGlState *st, const PicaGlHost *host,
    on every flush with the FBO read-back, the depth read-back and the guest
    render-target/depth bytes, so a run's LAST flush describes the state that
    reaches the captured frame. */
+/* t_275eb521: DQ8_GL_DUMP_DIR is read from per-flush write-back code (two
+   lookups on every flush); resolve the string once per process. */
+static const char *pgl_env_dump_dir(void) {
+    static const char *v;
+    static int init;
+    if (!init) { init = 1; v = getenv("DQ8_GL_DUMP_DIR"); }
+    return v;
+}
 static void pgl_dump_snap(const char *name, const void *data, size_t bytes) {
-    const char *dd = getenv("DQ8_GL_DUMP_DIR");
+    const char *dd = pgl_env_dump_dir();
     char path[768];
     FILE *f;
     if (!dd || !dd[0] || !data) return;
@@ -2096,7 +5063,7 @@ static void pgl_dump_snap(const char *name, const void *data, size_t bytes) {
     fclose(f);
 }
 static void pgl_dump_box(const char *name, int x0, int y0, int x1, int y1) {
-    const char *dd = getenv("DQ8_GL_DUMP_DIR");
+    const char *dd = pgl_env_dump_dir();
     char path[768];
     FILE *f;
     if (!dd || !dd[0]) return;
@@ -2117,11 +5084,183 @@ static void pgl_dump_box(const char *name, int x0, int y0, int x1, int y1) {
 
 /* Write-back core for one depth read-back box (GUEST thread): the same skip
    rule as color — a guest-side write after the last sync wins. */
-static void pgl_wb_depth(const PicaGlHost *host, int have_raw,
+/* t_f8f2c1da: the ZDESYNC figures printed below describe ATT1 (the R32F
+   integer-z MIRROR), never the DEPTH_COMPONENT32F attachment the rasterizer
+   really tests against.  Two rounds of investigation read that number as "the
+   depth buffer is entirely far", so the log now names the surface it measured
+   and, for the first few events, measures the REAL depth attachment of the
+   same box as well. */
+static int pgl_zattach_stats(int x0, int y0, int x1, int y1,
+                             double *far_pct, double *min_z, double *max_z) {
+    int w = x1 - x0 + 1, h = y1 - y0 + 1, i, n;
+    float *z;
+    int nfar = 0;
+    double mn = 1.0, mx = 0.0;
+    if (w <= 0 || h <= 0 || pgl_fbo == 0 || pgl_dt_w == 0) return 0;
+    n = w * h;
+    z = (float *)malloc((size_t)n * sizeof(float));
+    if (!z) return 0;
+    pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_fbo);
+    pgl_obj_used |= 8u;
+    pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
+    pgl_glReadPixels(x0, y0, (PGsizei)w, (PGsizei)h, PGGL_DEPTH_COMPONENT,
+                     PGGL_FLOAT, z);
+    pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
+    pgl_drain_errors("zattach-stats", NULL);
+    for (i = 0; i < n; ++i) {
+        double v = (double)z[i];
+        if (v * 16777216.0 >= 16777215.0) ++nfar;
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+    }
+    free(z);
+    *far_pct = 100.0 * (double)nfar / (double)(n ? n : 1);
+    *min_z = mn * 16777216.0;      /* report in PICA integer z units */
+    *max_z = mx * 16777216.0;
+    return 1;
+}
+
+/* ---- t_7d18d1b6: block/parallel DEPTH write-back ------------------------
+   The generic loop below resolves host->depth_px_off + host->depth_put per
+   pixel (two indirect calls + Morton math + a per-pixel shadow memcmp), which
+   is exactly the shape the colour write-back had before t_2d934e23.  The
+   depth buffer is Morton-tiled in 8x8 blocks with the same tile layout as the
+   colour buffer (pica_depth_off == pica_rt_off, only the pixel size differs),
+   so the same treatment applies:
+
+     * one pgl_zwb_preclean() pass decides whether ANY pixel of the box has
+       been overwritten by the guest since the shadow snapshot (a block that
+       still matches its shadow bytes cannot contain a guest write),
+     * if none has (the common case), every pixel of the box is written, so the
+       band worker resolves depth_offset ONCE per 8x8 block and writes the
+       block's 64 pixels as tight 2/3-byte stores, in parallel over block rows
+       on the vertex pool,
+     * if any pixel HAS been overwritten, the untouched generic loop runs (it
+       owns the per-pixel "guest write wins" rule and the GL ZDESYNC report).
+
+   The fast path is therefore byte-identical to the generic one: it only runs
+   when every pixel would take the generic loop's write branch, and it
+   reproduces its z rounding (double + 0.5), far-plane clamp and 2/3-byte
+   store exactly.  DQ8_WB_ZBLK=0 restores the generic path (A/B + kill
+   switch); DQ8_WB_ZPAR=0 keeps the block path but writes it serially. */
+/* Parallel pool entry point, defined in pica_vs.c (same TU, emitted later). */
+static int pgl_par_run(void (*fn)(void *, unsigned, unsigned), void *ctx,
+                       unsigned lo, unsigned hi);
+
+typedef struct {
+    const PicaGlHost *host;
+    const unsigned char *raw;
+    const float *zbuf;
+    int x0, y0, x1, y1;
+    unsigned w, len, gw, gh, bpp;
+    unsigned bad;
+} PglWbZBand;
+
+static void pgl_wb_depth_band(void *vctx, unsigned by0, unsigned by1) {
+    PglWbZBand *c = (PglWbZBand *)vctx;
+    static const unsigned xl[8] = {0u, 1u, 4u, 5u, 16u, 17u, 20u, 21u};
+    static const unsigned yl[8] = {0u, 2u, 8u, 10u, 32u, 34u, 40u, 42u};
+    const unsigned bpp = c->bpp;
+    const unsigned blkbytes = 64u * bpp;
+    const float zmaxv = (bpp == 2u) ? 65535.0f : 16777215.0f;
+    unsigned by;
+    int bx;
+    for (by = by0; by < by1; ++by) {
+        for (bx = c->x0 >> 3; bx <= (c->x1 >> 3); ++bx) {
+            int gx0 = bx << 3, gy0 = (int)(by << 3);
+            unsigned boff;
+            int gy_lo, gy_hi, gx_lo, gx_hi, gy, gx;
+            /* depth_px_off flips GL y to guest y; with gh % 8 == 0 and gy0
+               aligned, GL row gy0+7 is guest row (gh-1-gy0-7), the block's
+               first (index 0) pixel, i.e. the block start. */
+            boff = c->host->depth_px_off(c->host->user, gx0, gy0 + 7);
+            if ((size_t)boff + blkbytes > c->len) { c->bad = 1; return; }
+            gy_lo = gy0 < c->y0 ? c->y0 : gy0;
+            gy_hi = gy0 + 7 > c->y1 ? c->y1 : gy0 + 7;
+            gx_lo = gx0 < c->x0 ? c->x0 : gx0;
+            gx_hi = gx0 + 7 > c->x1 ? c->x1 : gx0 + 7;
+            for (gy = gy_lo; gy <= gy_hi; ++gy) {
+                unsigned yidx = yl[(c->gh - 1u - (unsigned)gy) & 7u];
+                const float *src = c->zbuf + (size_t)(gy - c->y0) * c->w +
+                                   (size_t)(gx_lo - c->x0);
+                for (gx = gx_lo; gx <= gx_hi; ++gx, ++src) {
+                    /* Inside one 8x8 block the pixels are NOT contiguous: the
+                       byte offset of (gx,gy) within the block is
+                       (yl[guest_row&7] + xl[gx&7]) * bpp, exactly what
+                       pica_depth_off computes.  Walking `dst += bpp` (the
+                       first version of this band) writes every pixel onto its
+                       left neighbour's slot — caught by DQ8_WB_VERIFY, which
+                       byte-compares this band against the reference loop. */
+                    unsigned char *dst = (unsigned char *)c->raw + boff +
+                                         (yidx + xl[(unsigned)gx & 7u]) * bpp;
+                    float v = *src;
+                    unsigned zv;
+                    if (!(v >= 0.0f)) {
+                        zv = 0u;
+                    } else if ((double)v >= (double)zmaxv) {
+                        zv = (unsigned)zmaxv;
+                    } else {
+                        zv = (unsigned)((double)v + 0.5);
+                    }
+                    dst[0] = (unsigned char)(zv & 0xFFu);
+                    dst[1] = (unsigned char)((zv >> 8) & 0xFFu);
+                    if (bpp >= 3u) dst[2] = (unsigned char)((zv >> 16) & 0xFFu);
+                }
+            }
+        }
+    }
+}
+
+/* 1 = no pixel of the box carries a guest write since the shadow snapshot
+   (the fast path contract), 0 = fall back to the generic loop. */
+static int pgl_zwb_preclean(const PicaGlHost *host, const unsigned char *raw,
+                            unsigned len, unsigned bpp, unsigned gw,
+                            unsigned gh, int x0, int y0, int x1, int y1) {
+    unsigned by, blkbytes = 64u * bpp;
+    for (by = (unsigned)(y0 >> 3); by <= (unsigned)(y1 >> 3); ++by) {
+        int bx;
+        for (bx = x0 >> 3; bx <= (x1 >> 3); ++bx) {
+            unsigned boff = host->depth_px_off(host->user, bx << 3,
+                                               (int)(by << 3) + 7);
+            if ((size_t)boff + blkbytes > len) return 0;
+            if (memcmp(raw + boff, pgl_zshadow + boff, blkbytes) != 0)
+                return 0;
+        }
+    }
+    (void)gw; (void)gh;
+    return 1;
+}
+
+static int pgl_wb_depth_blocks(const PicaGlHost *host, const unsigned char *raw,
+                               unsigned len, unsigned bpp, const float *zbuf,
+                               unsigned w, int x0, int y0, int x1, int y1) {
+    static int par_on = -1;
+    PglWbZBand c;
+    unsigned by0, by1;
+    if (par_on < 0) {
+        const char *e = getenv("DQ8_WB_ZPAR");
+        par_on = (e && e[0] == '0') ? 0 : 1;
+    }
+    memset(&c, 0, sizeof c);
+    c.host = host; c.raw = raw; c.zbuf = zbuf;
+    c.x0 = x0; c.y0 = y0; c.x1 = x1; c.y1 = y1;
+    c.w = w; c.len = len; c.bpp = bpp;
+    c.gw = pgl_zshadow_w; c.gh = pgl_zshadow_h;
+    by0 = (unsigned)(y0 >> 3);
+    by1 = (unsigned)(y1 >> 3) + 1u;
+    if (par_on) pgl_par_run(pgl_wb_depth_band, &c, by0, by1);
+    else pgl_wb_depth_band(&c, by0, by1);
+    return c.bad ? 0 : 1;
+}
+
+/* Write-back core for one depth read-back box (GUEST thread): the same skip
+   rule as color — a guest-side write after the last sync wins. */
+static void pgl_wb_depth_generic(const PicaGlHost *host, int have_raw,
                          const float *buf, unsigned w, unsigned h,
                          int x0, int y0, int x1, int y1) {
     unsigned x, y, bpp = pgl_zshadow_bpp, len = 0;
     const unsigned char *raw = NULL;
+    unsigned long long skipped = 0;   /* t_8510204b: skip-desync witness */
     if (have_raw && host->depth_raw && !host->depth_raw(host->user, &raw, &len))
         raw = NULL;
     if (raw && (!pgl_zshadow || len != pgl_zshadow_len)) raw = NULL;
@@ -2153,15 +5292,22 @@ static void pgl_wb_depth(const PicaGlHost *host, int have_raw,
                        + 0.5f rounds to 16777216.0f (24-bit mantissa), whose
                        3-byte store writes 00 00 00 — turning the far plane
                        into depth 0 in guest memory and failing LEQUAL there
-                       on the next sync. Clamp instead (NaN/negative -> 0). */
+                       on the next sync. Clamp instead (NaN/negative -> 0).
+                       t_a22413f1: the rounding must be done in DOUBLE.  In
+                       float32 every odd z >= 2^23 (= 0x800000) has no
+                       representable +0.5 (spacing is 1.0), so `(unsigned)
+                       (v + 0.5f)` silently rounded it UP by one and wrote a
+                       +1-biased depth for the whole far half of the range —
+                       a 1-LSB depth mismatch against the software path on
+                       every GL depth draw. */
                     if (!(v >= 0.0f)) {
                         zv = 0u;
                         ++nclamp;
-                    } else if (v >= zmaxv) {
+                    } else if ((double)v >= (double)zmaxv) {
                         zv = (unsigned)zmaxv;
                         ++nclamp;
                     } else {
-                        zv = (unsigned)(v + 0.5f);
+                        zv = (unsigned)((double)v + 0.5);
                     }
                     if (zv == 0u) {
                         ++nzero;
@@ -2172,6 +5318,64 @@ static void pgl_wb_depth(const PicaGlHost *host, int have_raw,
                     }
                     host->depth_put(host->user, gx, gy, zv);
                     ++nwrite;
+                }
+            }
+        }
+        skipped = nskip;
+        if (skipped) {
+            static unsigned zdesync_n;
+            ++zdesync_n;
+            if (zdesync_n <= 6 || (zdesync_n % 500u) == 0u) {
+                unsigned k, smp = 0;
+                unsigned long long nfar_g = 0, nfar_a = 0, npx = (unsigned long long)w * h;
+                for (k = 0; k < npx; ++k) {
+                    float v = buf[k];
+                    if (v >= 0.9999f) ++nfar_a;
+                }
+                if (raw && bpp && host->depth_px_off) {
+                    for (k = 0; k < npx; ++k) {
+                        int gx = x0 + (int)(k % w), gy = y0 + (int)(k / w);
+                        unsigned off = host->depth_px_off(host->user, gx, gy);
+                        unsigned z;
+                        if ((size_t)off + bpp > len) continue;
+                        z = raw[off] | ((unsigned)raw[off + 1] << 8) |
+                            ((bpp > 2u) ? ((unsigned)raw[off + 2] << 16) : 0u);
+                        if (z >= (bpp == 2u ? 65535u : 16777215u)) ++nfar_g;
+                    }
+                }
+                fprintf(stderr, "GL ZDESYNC #%u: skip=%llu write=%llu of %llu "
+                        "pixels; guest-z far=%.1f%% att1-mirror far=%.1f%% "
+                        "box=%d,%d..%d,%d\n",
+                        zdesync_n, nskip, nwrite, npx,
+                        100.0 * (double)nfar_g / (double)(npx ? npx : 1u),
+                        100.0 * (double)nfar_a / (double)(npx ? npx : 1u),
+                        x0, y0, x1, y1);
+                /* t_f8f2c1da: the two percentages above are GUEST memory and
+                   the ATT1 R32F mirror — never the DEPTH_COMPONENT32F
+                   attachment the rasterizer tests against.  State the real
+                   attachment too (first 3 events only: one extra read-back). */
+                if (pgl_depth_hw && zdesync_n <= 3u) {
+                    double zfar = 0.0, zmin = 0.0, zmax = 0.0;
+                    if (pgl_zattach_stats(x0, y0, x1, y1, &zfar, &zmin, &zmax))
+                        fprintf(stderr, "GL ZATTACH #%u: D32F far=%.1f%% "
+                                "z=[%.0f..%.0f] of 16777216 box=%d,%d..%d,%d\n",
+                                zdesync_n, zfar, zmin, zmax, x0, y0, x1, y1);
+                }
+                /* four sample pixel pairs: what guest memory holds vs what the
+                   ATT1 R32F mirror holds, both as integer z (NOT the D32F
+                   depth attachment — see GL ZATTACH above) */
+                for (k = 0; k < 4u && smp < npx; ++k) {
+                    unsigned xi = (unsigned)(((unsigned long long)(k + 1) * npx) / 5u);
+                    int gx = x0 + (int)(xi % w), gy = y0 + (int)(xi / w);
+                    unsigned off = host->depth_px_off
+                                   ? host->depth_px_off(host->user, gx, gy) : 0u;
+                    unsigned gz = 0xFFFFFFFFu;
+                    if (raw && off + bpp <= len)
+                        gz = raw[off] | ((unsigned)raw[off + 1] << 8) |
+                             ((bpp > 2u) ? ((unsigned)raw[off + 2] << 16) : 0u);
+                    fprintf(stderr, "  px %d,%d guest_z=%u att1_z=%.1f\n",
+                            gx, gy, gz, (double)buf[xi]);
+                    ++smp;
                 }
             }
         }
@@ -2197,8 +5401,97 @@ static void pgl_wb_depth(const PicaGlHost *host, int have_raw,
         }
     }
     if (raw) memcpy(pgl_zshadow, raw, len);
+    /* t_8510204b: skipped pixels mean the attachment no longer matches the
+       shadow — never let the next depth refresh trust the memcmp fast path. */
+    if (skipped && pgl_zfix_on())
+        pgl_request_zresync();
     pgl_dump_snap("z_guest_last.raw", raw, len);
     ++pgl_zflushes;
+}
+
+/* t_7d18d1b6: depth write-back entry point.  Fast path (block/parallel) when
+   the box is whole 8x8 blocks inside the depth surface, the guest has not
+   touched it since the shadow snapshot, and nothing diagnostic forces the
+   reference loop; the untouched generic loop otherwise. */
+static int pgl_wbz_on = -1;
+static int pgl_zwb_verify = -1;   /* DQ8_WB_VERIFY=1: run BOTH depth paths */
+static unsigned long long pgl_wbz_fast, pgl_wbz_gen;
+static void pgl_wb_depth(const PicaGlHost *host, int have_raw,
+                         const float *buf, unsigned w, unsigned h,
+                         int x0, int y0, int x1, int y1) {
+    const unsigned char *raw = NULL;
+    unsigned len = 0, bpp = pgl_zshadow_bpp;
+    unsigned char *pre = NULL, *gen = NULL;
+    int tried = 0;
+    if (pgl_wbz_on < 0) {
+        const char *e = getenv("DQ8_WB_ZBLK");
+        pgl_wbz_on = (e && e[0] == '0') ? 0 : 1;
+        e = getenv("DQ8_WB_VERIFY");
+        pgl_zwb_verify = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    if (pgl_wbz_on && !pgl_rect_trace && pgl_zshadow && pgl_zshadow_len &&
+        have_raw && host->depth_raw && host->depth_px_off &&
+        (pgl_zshadow_w & 7u) == 0u && (pgl_zshadow_h & 7u) == 0u &&
+        (bpp == 2u || bpp == 4u) &&
+        x0 >= 0 && y0 >= 0 && x1 >= x0 && y1 >= y0 &&
+        x1 < (int)pgl_zshadow_w && y1 < (int)pgl_zshadow_h &&
+        host->depth_raw(host->user, &raw, &len) && raw &&
+        len == pgl_zshadow_len &&
+        pgl_zwb_preclean(host, raw, len, bpp, w, h, x0, y0, x1, y1)) {
+        int did = 0;
+        if (pgl_zwb_verify) {
+            /* Same in-process identity test the colour path has used since
+               t_2d934e23 (DQ8_WB_VERIFY=1): snapshot guest depth BEFORE any
+               write-back, run the reference per-pixel loop, keep its bytes,
+               restore the pre state, then let the block path produce its own
+               result from the identical input and compare the WHOLE depth
+               surface.  A cross-run A/B cannot prove this: two runs of the
+               same binary diverge within a few frames. */
+            pre = (unsigned char *)malloc(len ? len : 1u);
+            gen = (unsigned char *)malloc(len ? len : 1u);
+            if (!pre || !gen) { free(pre); free(gen); pre = gen = NULL; }
+            else {
+                unsigned long long tg;
+                memcpy(pre, raw, len);
+                tg = pica_pqt_now_ns();
+                pgl_wb_depth_generic(host, have_raw, buf, w, h, x0, y0, x1, y1);
+                tg = pica_pqt_now_ns() - tg;
+                memcpy(gen, raw, len);
+                memcpy((unsigned char *)raw, pre, len);
+                did = pgl_wb_depth_blocks(host, raw, len, bpp, buf, w, x0, y0, x1, y1);
+                tried = 1;
+                {
+                    unsigned i, diffs = 0, first = 0;
+                    if (did)
+                        for (i = 0; i < len; ++i)
+                            if (raw[i] != gen[i]) {
+                                if (!diffs) first = i;
+                                ++diffs;
+                            }
+                    fprintf(stderr, "ZWBVERIFY len=%u bpp=%u box=%d,%d..%d,%d "
+                            "diff_bytes=%u first=%u generic_ms=%.3f %s\n",
+                            len, bpp, x0, y0, x1, y1, diffs, first,
+                            (double)tg / 1e6,
+                            !did ? "DECLINED (generic kept)"
+                                 : (diffs ? "MISMATCH" : "IDENTICAL"));
+                }
+                if (!did) memcpy((unsigned char *)raw, gen, len);
+                free(pre); free(gen);
+            }
+        }
+        if (!did && !tried)
+            did = pgl_wb_depth_blocks(host, raw, len, bpp, buf, w,
+                                      x0, y0, x1, y1);
+        if (did) {
+            ++pgl_wbz_fast;
+            memcpy(pgl_zshadow, raw, len);
+            pgl_dump_snap("z_guest_last.raw", raw, len);
+            ++pgl_zflushes;
+            return;
+        }
+    }
+    ++pgl_wbz_gen;
+    pgl_wb_depth_generic(host, have_raw, buf, w, h, x0, y0, x1, y1);
 }
 
 /* Depth read-back (GL thread): attachment 1 -> caller-owned float box, or
@@ -2222,62 +5515,1103 @@ static float *pgl_rb_depth(int x0, int y0, int x1, int y1) {
     return buf;
 }
 
+/* t_2d934e23: block-wise write-back fast path for the scan-out case — guest
+   target is a TGBA8 (4-byte) Morton-tiled buffer whose dims are multiples of
+   8, which is what the 3DS colour buffer always is.  The generic loop below
+   resolves host->rt_px_off + host->rt_put PER PIXEL (two indirect calls, the
+   Morton math and a 4-byte guest-shadow memcmp each): measured ~8 ms for one
+   498x400 box.  Here the block's guest offset is resolved once per 8x8 block
+   and its 64 pixels are written as indexes inside one contiguous 256-byte
+   run; the "did the guest overwrite this pixel since the shadow snapshot"
+   test is hoisted to a single 256-byte block compare (a block that still
+   matches cannot contain a guest write, and every pixel in it is written
+   exactly as the generic loop would).  Returns 0 when the geometry/layout is
+   outside the fast-path contract so the caller keeps the generic path.
+
+   t_5a3c517a: the block rows are independent (disjoint 256-byte runs, read
+   the same shadow), so the box is written as a parallel job over block rows
+   on the vertex pool (DQ8_WB_PAR=0 restores the serial loop). */
+typedef struct {
+    const PicaGlHost *host;
+    const unsigned char *raw;
+    const unsigned char *pixels;
+    int x0, y0, x1, y1;
+    unsigned w, len, gw, gh;
+    unsigned bad;                 /* contract violation -> caller falls back */
+} PglWbBand;
+
+/* Parallel pool entry point, defined in pica_vs.c (same TU, emitted later). */
+static int pgl_par_run(void (*fn)(void *, unsigned, unsigned), void *ctx,
+                       unsigned lo, unsigned hi);
+
+static void pgl_wb_color_band(void *vctx, unsigned by0, unsigned by1) {
+    PglWbBand *c = (PglWbBand *)vctx;
+    static const unsigned xl[8] = {0u, 1u, 4u, 5u, 16u, 17u, 20u, 21u};
+    static const unsigned yl[8] = {0u, 2u, 8u, 10u, 32u, 34u, 40u, 42u};
+    unsigned by;
+    int bx;
+    for (by = by0; by < by1; ++by) {
+        for (bx = c->x0 >> 3; bx <= (c->x1 >> 3); ++bx) {
+            int gx0 = bx << 3, gy0 = (int)(by << 3);
+            unsigned boff;
+            int gy_lo, gy_hi, gx_lo, gx_hi, gy, gx, clean;
+            /* rt_px_off flips GL y to guest y; with gh % 8 == 0 and gy0
+               aligned, GL row gy0+7 is guest row (gh-1-gy0-7), the block's
+               first (index 0) pixel, i.e. the block start. */
+            boff = c->host->rt_px_off(c->host->user, gx0, gy0 + 7);
+            if ((size_t)boff + 256u > c->len) { c->bad = 1; return; }
+            gy_lo = gy0 < c->y0 ? c->y0 : gy0;
+            gy_hi = gy0 + 7 > c->y1 ? c->y1 : gy0 + 7;
+            gx_lo = gx0 < c->x0 ? c->x0 : gx0;
+            gx_hi = gx0 + 7 > c->x1 ? c->x1 : gx0 + 7;
+            clean = memcmp(c->raw + boff, pgl_shadow + boff, 256u) == 0;
+            if (clean) {
+                for (gy = gy_lo; gy <= gy_hi; ++gy) {
+                    unsigned yidx = yl[(c->gh - 1u - (unsigned)gy) & 7u];
+                    const unsigned char *src =
+                        c->pixels + ((size_t)(gy - c->y0) * c->w +
+                                     (size_t)(gx_lo - c->x0)) * 4u;
+                    for (gx = gx_lo; gx <= gx_hi; ++gx, src += 4u) {
+                        /* glReadPixels gives R,G,B,A; the guest colour buffer
+                           is A,B,G,R (pica_put_pixel's store order). */
+                        unsigned char *dp = (unsigned char *)c->raw + boff +
+                                            (yidx + xl[(unsigned)gx & 7u]) * 4u;
+                        dp[0] = src[3]; dp[1] = src[2];
+                        dp[2] = src[1]; dp[3] = src[0];
+                    }
+                }
+            } else {
+                for (gy = gy_lo; gy <= gy_hi; ++gy) {
+                    unsigned yidx = yl[(c->gh - 1u - (unsigned)gy) & 7u];
+                    for (gx = gx_lo; gx <= gx_hi; ++gx) {
+                        unsigned didx = boff + (yidx + xl[(unsigned)gx & 7u]) * 4u;
+                        if (memcmp(c->raw + didx, pgl_shadow + didx, 4u) == 0) {
+                            const unsigned char *src =
+                                c->pixels + ((size_t)(gy - c->y0) * c->w +
+                                             (size_t)(gx - c->x0)) * 4u;
+                            unsigned char *dp = (unsigned char *)c->raw + didx;
+                            dp[0] = src[3]; dp[1] = src[2];
+                            dp[2] = src[1]; dp[3] = src[0];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+static int pgl_wb_color_blocks(const PicaGlHost *host, const unsigned char *raw,
+                               const unsigned char *pixels,
+                               int x0, int y0, int x1, int y1, unsigned w,
+                               unsigned len) {
+    static int par_on = -1;
+    PglWbBand c;
+    unsigned by0, by1;
+    if ((pgl_shadow_w & 7u) || (pgl_shadow_h & 7u)) return 0;   /* need whole 8x8 blocks */
+    if (x0 < 0 || y0 < 0 || x1 >= (int)pgl_shadow_w || y1 >= (int)pgl_shadow_h) return 0;
+    if (par_on < 0) {
+        const char *e = getenv("DQ8_WB_PAR");
+        par_on = (e && e[0] == '0') ? 0 : 1;
+    }
+    memset(&c, 0, sizeof c);
+    c.host = host; c.raw = raw; c.pixels = pixels;
+    c.x0 = x0; c.y0 = y0; c.x1 = x1; c.y1 = y1;
+    c.w = w; c.len = len; c.gw = pgl_shadow_w; c.gh = pgl_shadow_h;
+    by0 = (unsigned)(y0 >> 3);
+    by1 = (unsigned)(y1 >> 3) + 1u;
+    if (par_on) pgl_par_run(pgl_wb_color_band, &c, by0, by1);
+    else pgl_wb_color_band(&c, by0, by1);
+    return c.bad ? 0 : 1;
+}
+/* t_2d934e23: byte-identity probe for the write-back (DQ8_RT_HASH=1).  After
+   every colour write-back the guest render-target bytes are hashed and
+   printed, so two runs (DQ8_XFER_FAST=1 fast paths vs =0 reference) can be
+   compared hash-sequence by hash-sequence. */
+static int pgl_rthash_on = -1;
+static unsigned long long pgl_rthash_n;
+static void pgl_rthash(const unsigned char *raw, unsigned len) {
+    unsigned long long h = 1469598103934665603ull;
+    unsigned i;
+    if (pgl_rthash_on < 0) {
+        const char *e = getenv("DQ8_RT_HASH");
+        pgl_rthash_on = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    if (!pgl_rthash_on || !raw) return;
+    for (i = 0; i < len; ++i) { h ^= raw[i]; h *= 1099511628211ull; }
+    fprintf(stderr, "RTHASH n=%llu len=%u h=%016llx\n",
+            ++pgl_rthash_n, len, h);
+}/* t_d8e5ab8c: DQ8_GL_DEPTH_PROBE=<n> reports, for the first n flushes, what
+   the real DEPTH_COMPONENT32F attachment contains compared with the emulated
+   ATT1 mirror that the guest write-back reads.  A hardware depth path that
+   renders black must show up here as "depth is 1.0/0.0 everywhere" or as a
+   systematic mismatch against ATT1; a correct frame shows the two agreeing
+   within a few LSB.  Diagnostic only (extra readback per flush). */
+static void pgl_depth_probe(const char *tag, int x0, int y0, int x1, int y1) {
+    unsigned w, h, i, n, ones = 0, zeros = 0, mid = 0, mism = 0;
+    float dmin = 1e30f, dmax = -1e30f;
+    double dsum = 0.0;
+    float *dbuf, *zbuf;
+    if (!pgl_depth_probe_left || !pgl_depth_hw) return;
+    if (x0 > x1 || y0 > y1 || pgl_rt_w <= 0 || pgl_rt_h <= 0) return;
+    if (x1 >= (int)pgl_rt_w) x1 = (int)pgl_rt_w - 1;
+    if (y1 >= (int)pgl_rt_h) y1 = (int)pgl_rt_h - 1;
+    w = (unsigned)(x1 - x0 + 1);
+    h = (unsigned)(y1 - y0 + 1);
+    n = w * h;
+    if (!n) return;
+    dbuf = (float *)malloc((size_t)n * sizeof(float));
+    zbuf = (float *)malloc((size_t)n * sizeof(float));
+    if (!dbuf || !zbuf) { free(dbuf); free(zbuf); return; }
+    pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_fbo);
+    pgl_obj_used |= 8u;
+    pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
+    pgl_glReadPixels(x0, y0, (PGsizei)w, (PGsizei)h, PGGL_DEPTH_COMPONENT,
+                     PGGL_FLOAT, dbuf);
+    pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT1);
+    pgl_glReadPixels(x0, y0, (PGsizei)w, (PGsizei)h, PGGL_RED, PGGL_FLOAT,
+                     zbuf);
+    pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
+    --pgl_depth_probe_left;
+    ++pgl_depth_probe_n;
+    for (i = 0; i < n; ++i) {
+        double d = (double)dbuf[i];
+        double z = (double)zbuf[i];
+        if (dbuf[i] < dmin) dmin = dbuf[i];
+        if (dbuf[i] > dmax) dmax = dbuf[i];
+        dsum += d;
+        if (!(dbuf[i] > 0.0f)) ++zeros;
+        else if (dbuf[i] >= 0.99999994f) ++ones;
+        else ++mid;
+        /* |depth*2^24 - att1_z| > 16 integer z units */
+        if (d * 16777216.0 - z > 16.0 || z - d * 16777216.0 > 16.0) ++mism;
+    }
+    fprintf(stderr, "GL DEPTHPROBE %s #%u box=%d,%d..%d,%d pixels=%u "
+            "depth[min=%.9f max=%.9f mean=%.9f] one=%.1f%% zero=%.1f%% "
+            "mid=%.1f%% att1_mismatch(>16z)=%.1f%%\n",
+            tag, pgl_depth_probe_n, x0, y0, x1, y1, n,
+            (double)dmin, (double)dmax, dsum / (double)n,
+            100.0 * (double)ones / (double)n, 100.0 * (double)zeros / (double)n,
+            100.0 * (double)mid / (double)n, 100.0 * (double)mism / (double)n);
+    free(dbuf);
+    free(zbuf);
+    pgl_drain_errors("depth-probe", NULL);
+}
 /* Write the FBO's not-yet-written-back content into guest memory.  Only the
    drawn box is read back; a pixel whose raw guest bytes changed since the
    FBO was last synchronized with guest memory (a later guest-side write)
    keeps the guest value — the guest write is newer and wins.  The shadow is
    then re-synchronized with guest memory.  Runs on OUR context (the public
    wrapper pica_gl_save/restore is pica_gl_flush). */
+/* Reference per-pixel write-back loop (the pre-t_2d934e23 code, verbatim, as
+   a function so the fast path and the verifier can both call it). */
+static void pgl_wb_color_generic(const PicaGlHost *host,
+                                 const unsigned char *raw, unsigned len,
+                                 unsigned bpp, const unsigned char *pixels,
+                                 int x0, int y0, int x1, int y1) {
+    unsigned x, y;
+    unsigned w = (unsigned)(x1 - x0 + 1), h = (unsigned)(y1 - y0 + 1);
+    unsigned long long nwrite = 0, nskip = 0;
+    int sx0 = 1 << 30, sy0 = 1 << 30, sx1 = -1, sy1 = -1;
+    for (y = 0; y < h; ++y) {
+        for (x = 0; x < w; ++x) {
+            const unsigned char *px = pixels + ((size_t)y * w + x) * 4u;
+            int gx = x0 + (int)x, gy = y0 + (int)y;
+            if (raw && bpp) {
+                unsigned off = host->rt_px_off(host->user, gx, gy);
+                if ((size_t)off + bpp <= len &&
+                    memcmp(raw + off, pgl_shadow + off, bpp) != 0) {
+                    ++nskip; /* guest wrote this pixel later: guest value wins */
+                    if (gx < sx0) sx0 = gx;
+                    if (gy < sy0) sy0 = gy;
+                    if (gx > sx1) sx1 = gx;
+                    if (gy > sy1) sy1 = gy;
+                    continue;
+                }
+            }
+            ++nwrite;
+            host->rt_put(host->user, gx, gy, px);
+        }
+    }
+    if (pgl_rect_trace && (nskip || nwrite < (unsigned long long)w * h))
+        fprintf(stderr, "GLRECT flush#%llu wrote=%llu skipped=%llu "
+                "skipbox=%d,%d..%d,%d box=%d,%d..%d,%d\n",
+                (unsigned long long)pgl_flushes, nwrite, nskip,
+                sx0, sy0, sx1, sy1, x0, y0, x1, y1);
+}
 /* Write-back core for one color read-back box (GUEST thread). */
 static void pgl_wb_color(const PicaGlHost *host, int have_raw,
                          const unsigned char *pixels,
                          int x0, int y0, int x1, int y1) {
-    unsigned x, y, len = 0, bpp = pgl_shadow_bpp;
-    unsigned w = (unsigned)(x1 - x0 + 1), h = (unsigned)(y1 - y0 + 1);
+    unsigned len = 0, bpp = pgl_shadow_bpp;
+    unsigned w = (unsigned)(x1 - x0 + 1);
     const unsigned char *raw = NULL;
     if (have_raw && host->rt_raw && !host->rt_raw(host->user, &raw, &len))
         raw = NULL;
     if (raw && (!pgl_shadow || len != pgl_shadow_len)) raw = NULL;
-    {
-        unsigned long long nwrite = 0, nskip = 0;
-        int sx0 = 1 << 30, sy0 = 1 << 30, sx1 = -1, sy1 = -1;
-        for (y = 0; y < h; ++y) {
-            for (x = 0; x < w; ++x) {
-                const unsigned char *px = pixels + ((size_t)y * w + x) * 4u;
-                int gx = x0 + (int)x, gy = y0 + (int)y;
-                if (raw && bpp) {
-                    unsigned off = host->rt_px_off(host->user, gx, gy);
-                    if ((size_t)off + bpp <= len &&
-                        memcmp(raw + off, pgl_shadow + off, bpp) != 0) {
-                        ++nskip; /* guest wrote this pixel later: guest value wins */
-                        if (gx < sx0) sx0 = gx;
-                        if (gy < sy0) sy0 = gy;
-                        if (gx > sx1) sx1 = gx;
-                        if (gy > sy1) sy1 = gy;
-                        continue;
-                    }
-                }
-                ++nwrite;
-                host->rt_put(host->user, gx, gy, px);
+    if (pgl_wb_fast_on < 0) {
+        /* t_2d934e23: ON by default; DQ8_WB_FAST=0 selects the reference
+           per-pixel loop (A/B).  DQ8_WB_VERIFY=1 runs BOTH in-process and
+           byte-compares (see below). */
+        const char *e = getenv("DQ8_WB_FAST");
+        pgl_wb_fast_on = (e && e[0] == '0') ? 0 : 1;
+        e = getenv("DQ8_WB_VERIFY");
+        pgl_wb_verify = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    /* t_2d934e23: the scan-out case — DQ8_XFER_FAST=0 forces the generic loop
+       (A/B reference for the byte-identity check).  DQ8_WB_VERIFY=1 runs BOTH
+       paths inside one process and compares the resulting guest bytes, which
+       is the only valid identity test: the scene is not deterministic across
+       runs (two runs of the SAME binary diverge by the 3rd write-back). */
+    if (raw && bpp == 4u && pgl_wb_fast_on && !pgl_rect_trace) {
+        unsigned char *pre = NULL, *gen = NULL;
+        unsigned long long t_gen = 0, t_fast = 0;
+        int did;
+        if (pgl_wb_verify) {
+            /* Snapshot BEFORE any write-back, run the reference loop, keep its
+               result, restore the pre state, then let the fast path produce
+               its own result from the identical input.  (Snapshotting after
+               the fast path — the first version of this probe — compares the
+               fast result against a generic run over already-written bytes.) */
+            pre = (unsigned char *)malloc(len ? len : 1u);
+            gen = (unsigned char *)malloc(len ? len : 1u);
+            if (!pre || !gen) { free(pre); free(gen); pre = gen = NULL; }
+            else {
+                memcpy(pre, raw, len);
+                t_gen = pica_pqt_now_ns();
+                pgl_wb_color_generic(host, raw, len, bpp, pixels, x0, y0, x1, y1);
+                t_gen = pica_pqt_now_ns() - t_gen;
+                memcpy(gen, raw, len);
+                memcpy((unsigned char *)raw, pre, len);
             }
         }
-        if (pgl_rect_trace && (nskip || nwrite < (unsigned long long)w * h))
-            fprintf(stderr, "GLRECT flush#%llu wrote=%llu skipped=%llu "
-                    "skipbox=%d,%d..%d,%d box=%d,%d..%d,%d\n",
-                    (unsigned long long)pgl_flushes, nwrite, nskip,
-                    sx0, sy0, sx1, sy1, x0, y0, x1, y1);
+        t_fast = pica_pqt_now_ns();
+        did = pgl_wb_color_blocks(host, raw, pixels, x0, y0, x1, y1, w, len);
+        t_fast = pica_pqt_now_ns() - t_fast;
+        if (gen) {
+            unsigned i, diffs = 0, first = 0;
+            if (did) {
+                for (i = 0; i < len; ++i)
+                    if (raw[i] != gen[i]) { if (!diffs) first = i; ++diffs; }
+            } else {
+                memcpy((unsigned char *)raw, gen, len); /* fast path declined */
+                diffs = 0xFFFFFFFFu;
+            }
+            fprintf(stderr, "WBVERIFY n=%llu len=%u box=%d,%d..%d,%d "
+                    "diff_bytes=%u first=%u generic_ms=%.3f fast_ms=%.3f %s\n",
+                    (unsigned long long)pgl_rthash_n, len, x0, y0, x1, y1,
+                    diffs, first, (double)t_gen / 1e6, (double)t_fast / 1e6,
+                    diffs ? "MISMATCH" : "IDENTICAL");
+            free(pre); free(gen);
+        }
+        if (did) {
+            ++pgl_wb_fast;
+            memcpy(pgl_shadow, raw, len);
+            pgl_dump_snap("color_guest_last.raw", raw, len);
+            pgl_rthash(raw, len);
+            return;
+        }
     }
+    pgl_wb_color_generic(host, raw, len, bpp, pixels, x0, y0, x1, y1);
     /* rt_put wrote into guest memory through `raw`; snapshot the new state. */
     if (raw) memcpy(pgl_shadow, raw, len);
     pgl_dump_snap("color_guest_last.raw", raw, len);
+    pgl_rthash(raw, len);
+}
+
+/* t_a22413f1 run3: the operator's Radeon presented an almost fully black
+   frame while the D32F depth path was active.  That state must never be the
+   lasting one: if a run in HARDWARE mode has not yet produced a single lit
+   full frame and three of them come back near-black, drop to the in-shader
+   path.  A run that has already drawn something is never overridden (a game
+   fade to black must not be mistaken for a driver failure). */
+/* t_8510204b: dump the last full-frame flush's depth state for cross-mode
+   A/B.  In HARDWARE mode the rasterizer tests the D32F attachment while the
+   guest mirror ATT1 keeps the integer z; in IN-SHADER mode ATT1 *is* the test
+   surface.  Comparing the two ATT1 images across modes therefore separates
+   "the depth VALUES written differ" from "the TEST decision differs".
+   Raw w*h float files are overwritten, so the files on disk describe the last
+   (largest) flush.  DQ8_GL_DEPTH_DUMP=<dir>.  Diagnostic only. */
+static int pgl_depth_dump_on = -1;
+static unsigned pgl_depth_dumps;
+static void pgl_depth_dump(int x0, int y0, int x1, int y1) {
+    const char *dir;
+    unsigned w, h, x, y, nmask = 0;
+    float *zbuf;
+    char path[512];
+    FILE *f;
+    if (pgl_depth_dump_on < 0) {
+        const char *e = getenv("DQ8_GL_DEPTH_DUMP");
+        pgl_depth_dump_on = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    if (!pgl_depth_dump_on || pgl_fbo == 0 || pgl_rt_w < 8 || pgl_rt_h < 8) return;
+    dir = getenv("DQ8_GL_DEPTH_DUMP");
+    if (!dir || !dir[0]) return;
+    w = (unsigned)pgl_rt_w;
+    h = (unsigned)pgl_rt_h;
+    /* only the full-frame flush describes the presented frame */
+    if ((unsigned)(x1 - x0 + 1) * (unsigned)(y1 - y0 + 1) < w * h * 4u / 5u) return;
+    zbuf = (float *)malloc((size_t)w * h * sizeof(float));
+    if (!zbuf) return;
+    pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_fbo);
+    pgl_obj_used |= 8u;
+    pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT1);
+    pgl_glReadPixels(0, 0, (PGsizei)w, (PGsizei)h, PGGL_RED, PGGL_FLOAT, zbuf);
+    ++pgl_depth_dumps;
+    snprintf(path, sizeof path, "%s/att1.f32", dir);
+    f = fopen(path, "wb");
+    if (f) { fwrite(zbuf, sizeof(float), (size_t)w * h, f); fclose(f); }
+    for (y = 0; y < h; ++y)
+        for (x = 0; x < w; ++x) {
+            unsigned xi = y * w + x;
+            if (!(zbuf[xi] > 0.0f)) ++nmask;
+        }
+    if (pgl_depth_hw) {
+        memset(zbuf, 0, (size_t)w * h * sizeof(float));
+        pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
+        pgl_glReadPixels(0, 0, (PGsizei)w, (PGsizei)h, PGGL_DEPTH_COMPONENT,
+                         PGGL_FLOAT, zbuf);
+        snprintf(path, sizeof path, "%s/depth.f32", dir);
+        f = fopen(path, "wb");
+        if (f) { fwrite(zbuf, sizeof(float), (size_t)w * h, f); fclose(f); }
+    }
+    pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
+    free(zbuf);
+    fprintf(stderr, "GL DEPTHDUMP #%u %ux%d hw=%d box=%d,%d..%d,%d z<=0=%.2f%%\n",
+            pgl_depth_dumps, w, h, pgl_depth_hw, x0, y0, x1, y1,
+            100.0 * (double)nmask / ((double)w * (double)h));
+    pgl_drain_errors("depth-dump", NULL);
+}
+
+/* t_599a43f7: does the D32F attachment show ANY structure over this box?
+   Returns 1 = uniformly far (>=0.99), -1 = uniformly near (<=0.01),
+   0 = structured (some fragment wrote a depth), -2 = unavailable/error.
+   Only called on a dark frame with depth-tested draws in HARDWARE mode, at
+   most a few times per run, so the read-back cost is irrelevant. */
+static int pgl_depth_box_flat(int x0, int y0, int x1, int y1) {
+    unsigned w, h, i, n, mn_i, mx_i;
+    float *zb;
+    int res;
+    if (!pgl_depth_hw || !pgl_dtex) return -2;
+    w = (unsigned)(x1 - x0 + 1);
+    h = (unsigned)(y1 - y0 + 1);
+    if (!w || !h || w * h > 4u * 1024u * 1024u) return -2;
+    zb = (float *)malloc((size_t)w * h * sizeof(float));
+    if (!zb) return -2;
+    pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_fbo);
+    pgl_obj_used |= 8u;
+    pgl_glPixelStorei(PGGL_PACK_ALIGNMENT, 1);
+    pgl_glReadPixels(x0, y0, (PGsizei)w, (PGsizei)h, PGGL_DEPTH_COMPONENT,
+                     PGGL_FLOAT, zb);
+    if (pgl_drain_errors("depth-guard", NULL) != 0) {
+        free(zb);
+        return -2;
+    }
+    ++pgl_frame_guard_probes;
+    n = w * h;
+    /* NaN-safe scan: min and max of the surface. */
+    mn_i = 0; mx_i = 0;
+    for (i = 1; i < n; ++i) {
+        if (zb[i] < zb[mn_i]) mn_i = i;
+        if (zb[i] > zb[mx_i]) mx_i = i;
+    }
+    if (zb[mx_i] - zb[mn_i] < 1e-4f) {
+        res = (zb[mn_i] > 0.99f) ? 1 : ((zb[mx_i] < 0.01f) ? -1 : 0);
+    } else {
+        res = 0;
+    }
+    if (pgl_depth_probe_left || dq8_env_on("DQ8_GL_DIAG", &pgl_diag_gate))
+        fprintf(stderr, "GL DEPTHGUARD box=%d,%d..%d,%d min=%.6f max=%.6f -> %s\n",
+                x0, y0, x1, y1, (double)zb[mn_i], (double)zb[mx_i],
+                res == 1 ? "flat far" : res == -1 ? "flat near"
+                : res == 0 ? "structured" : "unknown");
+    free(zb);
+    return res;
+}
+
+/* t_a22413f1 run3 (rewritten in t_599a43f7): the operator's Radeon presented
+   an almost fully black frame while the D32F depth path was active.  That state
+   must never be the lasting one.  Verdicts, in order:
+     - a plausible scene (>5% of the sampled pixels lit) arms the guard for the
+       rest of the run: a game fade to black after that is never overridden;
+     - a dark frame whose DEPTH SURFACE is flat while depth-tested draws were
+       issued in hardware mode means the hardware depth path is not doing its
+       job on this driver (all-far: no fragment passed; all-near: the clear left
+       0.0 and every fragment failed GL_LESS).  Two in a row -> fall back;
+     - a dark frame with a structured depth surface is the game's own fade (the
+       geometry did write depth) -> keep the path, keep watching;
+     - nothing plausible after 180 full frames at all -> fall back anyway: an
+       unusable depth path costs holes, a black screen costs the run.
+   DQ8_GL_DEPTH_AUTOFALLBACK=0 disables the automatic switch (A/B of the pre-fix
+   behaviour); the 180-frame floor still applies so a black screen cannot
+   survive an unattended run. */
+static void pgl_frame_guard(const unsigned char *px, unsigned w, unsigned h) {
+    unsigned i, n, sampled, nonblack = 0, pmille, lit;
+    int flat;
+    if (pgl_frame_guard_off < 0) {
+        const char *g = getenv("DQ8_GL_FRAME_GUARD");
+        pgl_frame_guard_off = (g && g[0] == '0' && !g[1]);
+    }
+    if (pgl_frame_guard_off) return;
+    if (!pgl_depth_hw || !px || !w || !h) return;
+    if (!pgl_depth_syncs) return;   /* depth attachment has no defined content */
+    if ((unsigned long long)w * h * 2ull < (unsigned long long)pgl_rt_w * pgl_rt_h)
+        return;                        /* partial box: not a whole frame */
+    if (pgl_frame_guard_lit < 0) {
+        const char *e = getenv("DQ8_GL_FRAME_GUARD_LIT");
+        pgl_frame_guard_lit = (e && e[0]) ? atoi(e) : 5;
+        if (pgl_frame_guard_lit < 1) pgl_frame_guard_lit = 1;
+        if (pgl_frame_guard_lit > 100) pgl_frame_guard_lit = 100;
+    }
+    n = w * h;
+    for (i = 0; i < n; i += 7) {
+        const unsigned char *p = px + (size_t)i * 4u;
+        if (p[0] | p[1] | p[2]) ++nonblack;
+    }
+    sampled = (n + 6u) / 7u;
+    if (!sampled) return;
+    ++pgl_frame_no;
+    pmille = (unsigned)((unsigned long long)nonblack * 1000ull / sampled);
+    if (pmille > pgl_lit_best_pmille) pgl_lit_best_pmille = pmille;
+    lit = (pmille >= (unsigned)pgl_frame_guard_lit * 10u) ? 1u : 0u;
+    if (lit) {
+        if (!pgl_hw_bright_frames)
+            fprintf(stderr, "GL backend: depth path HARDWARE: plausible scene at "
+                            "full frame #%u (%u.%u%% lit)\n",
+                    pgl_frame_no, pmille / 10u, pmille % 10u);
+        pgl_hw_bright_frames = 1;
+        pgl_black_frames = 0;
+        pgl_dark_frames = 0;
+        pgl_dark_draws = 0;
+        pgl_frame_guard_last = 1;
+        return;
+    }
+    /* A frame that never asked the rasterizer for depth work (a 2-D UI screen,
+       a loading screen, the movie player) says nothing about the depth path:
+       do not judge it.  This is what keeps the guard from firing during boot. */
+    if (pgl_frame_depth_draws < 8u) {
+        pgl_frame_guard_last = 3;
+        return;
+    }
+    ++pgl_black_frames;
+    pgl_dark_draws += pgl_frame_depth_draws;
+    flat = (pgl_frame_guard_probes < 24u)
+         ? pgl_depth_box_flat(0, 0, (int)pgl_rt_w - 1, (int)pgl_rt_h - 1) : -2;
+    pgl_guard_sample_flat = flat;
+    if (flat == 1 || flat == -1) ++pgl_dark_frames;
+    else if (flat == 0) pgl_dark_frames = 0;  /* something wrote depth */
+    pgl_frame_guard_last = (flat == 1 || flat == -1) ? 4 : (flat == 0 ? 5 : 6);
+    if (pgl_black_frames == 1)
+        fprintf(stderr, "GL backend: WARNING: dark frame #%u with the D32F depth "
+                        "attachment (%u.%u%% lit, %u depth-tested draws, depth "
+                        "surface %s)\n",
+                pgl_frame_no, pmille / 10u, pmille % 10u, pgl_frame_depth_draws,
+                flat == 1 ? "flat FAR" : flat == -1 ? "flat NEAR (nothing passed "
+                           "the depth test)" : flat == 0 ? "structured (the game's "
+                           "own fade)" : "unreadable");
+    /* Decision rules.  A *wrong* fallback costs the model holes; a black screen
+       costs the run, so the balance is deliberately one-sided.
+       DQ8_GL_DEPTH_AUTOFALLBACK=0 turns the automatic action off entirely (the
+       A/B mode: warnings only, the broken path stays on for measurement). */
+    if (!pgl_depth_autofallback) return;
+    if (pgl_dark_frames >= 2) {
+        pgl_depth_fallback(flat == -1
+            ? "two dark frames with an all-near D32F depth surface (every "
+              "fragment rejected by the depth test)"
+            : "two dark frames with an all-far D32F depth surface (no fragment "
+              "wrote depth)");
+        return;
+    }
+    if (pgl_dark_draws >= 1200u) {
+        /* The stale-depth class: the attachment keeps the previous frame, so the
+           surface is NOT flat — but 1200+ depth-tested draws without a single
+           lit pixel is not a fade. */
+        pgl_depth_fallback("1200+ depth-tested draws with an almost black frame "
+                           "and no flat-surface explanation (stale depth?)");
+        return;
+    }
+    if (pgl_black_frames >= 60)
+        pgl_depth_fallback("60 consecutive almost-black 3D frames");
+}
+
+
+/* ===== t_05a3190d: deterministic draw-stream replay A/B =====================
+   The guest advances on a WALL-CLOCK vblank, not on guest instructions, so two
+   runs of this binary at the same instruction budget render different frames
+   (22% of pixels differ between two runs of the SAME config).  Every cross-run
+   verdict about the hardware depth path was therefore noise.
+
+   This harness records ONE frame's draw stream — the screen-space vertices the
+   guest pipeline produced, the PICA state of each draw, and a copy of the
+   staged texture bytes — and then re-renders that exact stream twice inside
+   this process, from the same guest-memory snapshot:
+
+     pass A: pgl_depth_hw = 1   (real D32F depth attachment, GL depth test)
+     pass B: pgl_depth_hw = 0   (in-shader compare/discard against ATT1)
+
+   The draw stream is fixed, so the two renders are deterministic and their
+   difference is exactly the depth path's contribution.  Each draw's bounding
+   box is read back after the draw in both passes, so the FIRST draw whose
+   output differs is reported together with its full PICA depth state, blend
+   state and vertex extent.
+
+   Knobs (default off, no behaviour change to normal runs):
+     DQ8_GL_REPLAY=<flush#>   record the frame that ends at flush #<flush#>
+                              and replay it (needs the synchronous path)
+     DQ8_GL_REPLAY_DIR=<dir>  write a.ppm / b.ppm / diff.ppm there
+   ======================================================================== */
+#define PGL_REP_MAX_DRAWS   20000u
+#define PGL_REP_MAX_TEXBYTE (192u * 1024u * 1024u)
+typedef struct {
+    unsigned nverts;
+    PicaGlVertex *verts;
+    PicaGlState st;
+    int tex_idx;
+    int bx0, by0, bx1, by1;
+} PglRepDraw;
+static struct {
+    int on;                      /* DQ8_GL_REPLAY=<flush#> parsed */
+    int state;                   /* 0 idle, 1 recording, 2 replayed */
+    unsigned long long flush;
+    PglRepDraw *d;
+    unsigned long long n, cap;
+    unsigned char **tex;         /* unique staged texture images */
+    const unsigned char **tex_src;
+    unsigned *tex_len;
+    unsigned ntex, tcap;
+    unsigned long long tex_bytes;
+    unsigned char *rt_snap, *z_snap;  /* frame-start guest bytes (const) */
+    unsigned char *rt_out, *z_out;    /* replay-private copies (mutable) */
+    unsigned rt_len, z_len, rt_w, rt_h, depth_bpp;
+    PicaGlHost host;             /* copy of the first recorded draw's host */
+    int have_host;
+    unsigned long long nmixed;   /* draws skipped: other render target */
+    unsigned want_w, want_h;     /* DQ8_GL_REPLAY_RT filter (0 = any) */
+    /* t_f8f2c1da: frame-selection criterion.  A battle's 3-D frame is only
+       interesting when it has depth-tested draws; the flushed 400x240
+       message-box frames have a dozen 2-D draws and reproduce nothing.
+       DQ8_GL_REPLAY_MINDT=<n> accepts the first recorded frame with at least
+       n depth-tested draws (0 = accept any frame). */
+    unsigned want_dt, ndepth_test;
+} pgl_rep;
+#define PGL_REP_TEX(i) (pgl_rep.tex[(i)])
+
+static void pgl_rep_bbox(const PicaGlVertex *verts, unsigned nverts,
+                         const PicaGlState *st, int *bx0, int *by0,
+                         int *bx1, int *by1) {
+    float minx, maxx, miny, maxy;
+    unsigned i;
+    if (!nverts) { *bx0 = *by0 = *bx1 = *by1 = -1; return; }
+    minx = maxx = verts[0].x;
+    miny = maxy = verts[0].y;
+    for (i = 1; i < nverts; ++i) {
+        if (verts[i].x < minx) minx = verts[i].x;
+        if (verts[i].x > maxx) maxx = verts[i].x;
+        if (verts[i].y < miny) miny = verts[i].y;
+        if (verts[i].y > maxy) maxy = verts[i].y;
+    }
+    *bx0 = (int)floorf(minx) - 1;
+    *by0 = (int)floorf(miny) - 1;
+    *bx1 = (int)ceilf(maxx) + 1;
+    *by1 = (int)ceilf(maxy) + 1;
+    if (*bx0 < 0) *bx0 = 0;
+    if (*by0 < 0) *by0 = 0;
+    if (*bx1 > (int)st->rt_w - 1) *bx1 = (int)st->rt_w - 1;
+    if (*by1 > (int)st->rt_h - 1) *by1 = (int)st->rt_h - 1;
+    if (*bx0 > *bx1 || *by0 > *by1) { *bx0 = *by0 = *bx1 = *by1 = -1; }
+}
+
+static void pgl_rep_record(const PicaGlVertex *verts, unsigned nverts,
+                           const PicaGlState *st, const PicaGlHost *host) {
+    PglRepDraw *r;
+    if (!host || !nverts || !st->rt_w || !st->rt_h) return;
+    if (pgl_rep.n >= PGL_REP_MAX_DRAWS) {
+        pgl_rep.state = 2;
+        fprintf(stderr, "GL REPLAY: frame exceeds %u draws, recording stopped\n",
+                (unsigned)PGL_REP_MAX_DRAWS);
+        return;
+    }
+    /* Frame-start snapshot: the guest's RT/depth bytes as they are BEFORE the
+       first draw of the frame.  Both replay passes start from exactly these. */
+    if (!pgl_rep.have_host) {
+        const unsigned char *raw = NULL;
+        unsigned len = 0;
+        pgl_rep.host = *host;
+        pgl_rep.have_host = 1;
+        pgl_rep.rt_w = st->rt_w;
+        pgl_rep.rt_h = st->rt_h;
+        pgl_rep.depth_bpp = st->depth_bpp;
+        if (host->rt_raw && host->rt_px_off &&
+            host->rt_raw(host->user, &raw, &len) && raw && len) {
+            pgl_rep.rt_snap = (unsigned char *)malloc(len);
+            pgl_rep.rt_out = (unsigned char *)malloc(len);
+            if (pgl_rep.rt_snap && pgl_rep.rt_out) {
+                memcpy(pgl_rep.rt_snap, raw, len);
+                memcpy(pgl_rep.rt_out, raw, len);
+                pgl_rep.rt_len = len;
+            } else {
+                free(pgl_rep.rt_snap); free(pgl_rep.rt_out);
+                pgl_rep.rt_snap = pgl_rep.rt_out = NULL;
+            }
+        }
+        raw = NULL; len = 0;
+        if (st->depth_on && host->depth_raw &&
+            host->depth_raw(host->user, &raw, &len) && raw && len) {
+            pgl_rep.z_snap = (unsigned char *)malloc(len);
+            pgl_rep.z_out = (unsigned char *)malloc(len);
+            if (pgl_rep.z_snap && pgl_rep.z_out) {
+                memcpy(pgl_rep.z_snap, raw, len);
+                memcpy(pgl_rep.z_out, raw, len);
+                pgl_rep.z_len = len;
+            } else {
+                free(pgl_rep.z_snap); free(pgl_rep.z_out);
+                pgl_rep.z_snap = pgl_rep.z_out = NULL;
+            }
+        }
+        fprintf(stderr, "GL REPLAY: recording flush #%llu rt=%ux%u bpp=%u "
+                        "rt_bytes=%u z_bytes=%u\n",
+                pgl_rep.flush, st->rt_w, st->rt_h, st->depth_bpp,
+                pgl_rep.rt_len, pgl_rep.z_len);
+        if (!pgl_rep.rt_len) {
+            pgl_rep.state = 2;
+            fprintf(stderr, "GL REPLAY: no raw render-target access, aborted\n");
+            return;
+        }
+    }
+    /* A frame can mix two render targets (512x400 menu + 482x400 3D view); the
+       replay drives ONE FBO from ONE snapshot, so only draws into the snapshot
+       target take part. */
+    if (st->rt_w != pgl_rep.rt_w || st->rt_h != pgl_rep.rt_h) {
+        if (!pgl_rep.nmixed)
+            fprintf(stderr, "GL REPLAY: skipping draws into other targets "
+                            "(first: %ux%u, replay target %ux%u)\n",
+                    st->rt_w, st->rt_h, pgl_rep.rt_w, pgl_rep.rt_h);
+        ++pgl_rep.nmixed;
+        return;
+    }
+    if (pgl_rep.n == pgl_rep.cap) {
+        unsigned long long nc = pgl_rep.cap ? pgl_rep.cap * 2ull : 256ull;
+        PglRepDraw *nd = (PglRepDraw *)realloc(pgl_rep.d,
+                                              (size_t)nc * sizeof *nd);
+        if (!nd) { pgl_rep.state = 2; return; }
+        pgl_rep.d = nd;
+        pgl_rep.cap = nc;
+    }
+    r = &pgl_rep.d[pgl_rep.n];
+    memset(r, 0, sizeof *r);
+    r->verts = (PicaGlVertex *)malloc((size_t)nverts * sizeof *verts);
+    if (!r->verts) { pgl_rep.state = 2; return; }
+    memcpy(r->verts, verts, (size_t)nverts * sizeof *verts);
+    r->nverts = nverts;
+    r->st = *st;
+    if (st->depth_on && st->depth_test) ++pgl_rep.ndepth_test;
+    r->tex_idx = -1;
+    if (st->tex_rgba && st->tex_w > 0 && st->tex_h > 0) {
+        unsigned k, texlen = (unsigned)st->tex_w * (unsigned)st->tex_h * 4u;
+        for (k = 0; k < pgl_rep.ntex; ++k) {
+            if (pgl_rep.tex_src[k] == st->tex_rgba &&
+                pgl_rep.tex_len[k] == texlen) { r->tex_idx = (int)k; break; }
+        }
+        if (r->tex_idx < 0 &&
+            pgl_rep.tex_bytes + texlen <= (unsigned long long)PGL_REP_MAX_TEXBYTE) {
+            if (pgl_rep.ntex == pgl_rep.tcap) {
+                unsigned nc = pgl_rep.tcap ? pgl_rep.tcap * 2u : 32u;
+                unsigned char **nt = (unsigned char **)realloc(pgl_rep.tex,
+                                        (size_t)nc * sizeof *nt);
+                const unsigned char **ns = (const unsigned char **)realloc(
+                                        pgl_rep.tex_src, (size_t)nc * sizeof *ns);
+                unsigned *nl = (unsigned *)realloc(pgl_rep.tex_len,
+                                        (size_t)nc * sizeof *nl);
+                if (nt) pgl_rep.tex = nt;
+                if (ns) pgl_rep.tex_src = ns;
+                if (nl) pgl_rep.tex_len = nl;
+                if (!nt || !ns || !nl) { pgl_rep.state = 2; return; }
+                pgl_rep.tcap = nc;
+            }
+            pgl_rep.tex[pgl_rep.ntex] = (unsigned char *)malloc(texlen);
+            if (pgl_rep.tex[pgl_rep.ntex]) {
+                memcpy(pgl_rep.tex[pgl_rep.ntex], st->tex_rgba, texlen);
+                pgl_rep.tex_src[pgl_rep.ntex] = st->tex_rgba;
+                pgl_rep.tex_len[pgl_rep.ntex] = texlen;
+                pgl_rep.tex_bytes += texlen;
+                r->tex_idx = (int)pgl_rep.ntex;
+                ++pgl_rep.ntex;
+            }
+        }
+    }
+    pgl_rep_bbox(verts, nverts, st, &r->bx0, &r->by0, &r->bx1, &r->by1);
+    ++pgl_rep.n;
+}
+
+/* ---- replay-private host: guest memory is never touched ------------------ */
+static int pgl_rep_h_rt_raw(void *u, const unsigned char **base, unsigned *len) {
+    (void)u;
+    if (!pgl_rep.rt_out) return 0;
+    *base = pgl_rep.rt_out;
+    *len = pgl_rep.rt_len;
+    return 1;
+}
+static int pgl_rep_h_z_raw(void *u, const unsigned char **base, unsigned *len) {
+    (void)u;
+    if (!pgl_rep.z_out) return 0;
+    *base = pgl_rep.z_out;
+    *len = pgl_rep.z_len;
+    return 1;
+}
+static int pgl_rep_h_rt_get(void *u, int x, int y, unsigned char rgba[4]) {
+    (void)u;
+    if (!pgl_rep.rt_out || x < 0 || y < 0 ||
+        (unsigned)x >= pgl_rep.rt_w || (unsigned)y >= pgl_rep.rt_h) return 0;
+    memcpy(rgba, pgl_rep.rt_out +
+           ((size_t)y * pgl_rep.rt_w + (size_t)x) * 4u, 4);
+    return 1;
+}
+static void pgl_rep_h_rt_put(void *u, int x, int y, const unsigned char rgba[4]) {
+    (void)u;
+    if (!pgl_rep.rt_out || x < 0 || y < 0 ||
+        (unsigned)x >= pgl_rep.rt_w || (unsigned)y >= pgl_rep.rt_h) return;
+    memcpy(pgl_rep.rt_out + ((size_t)y * pgl_rep.rt_w + (size_t)x) * 4u, rgba, 4);
+}
+static int pgl_rep_h_z_get(void *u, int x, int y, unsigned *z) {
+    (void)u;
+    if (!pgl_rep.z_out || x < 0 || y < 0 ||
+        (unsigned)x >= pgl_rep.rt_w || (unsigned)y >= pgl_rep.rt_h) return 0;
+    *z = ((unsigned *)pgl_rep.z_out)[(size_t)y * pgl_rep.rt_w + (size_t)x];
+    return 1;
+}
+static void pgl_rep_h_z_put(void *u, int x, int y, unsigned z) {
+    (void)u;
+    if (!pgl_rep.z_out || x < 0 || y < 0 ||
+        (unsigned)x >= pgl_rep.rt_w || (unsigned)y >= pgl_rep.rt_h) return;
+    ((unsigned *)pgl_rep.z_out)[(size_t)y * pgl_rep.rt_w + (size_t)x] = z;
+}
+static void pgl_rep_make_host(PicaGlHost *h) {
+    memset(h, 0, sizeof *h);
+    *h = pgl_rep.host;                /* rt_px_off/depth_px_off + user kept */
+    h->rt_raw = pgl_rep_h_rt_raw;
+    h->rt_get = pgl_rep_h_rt_get;
+    h->rt_put = pgl_rep_h_rt_put;
+    h->depth_raw = pgl_rep_h_z_raw;
+    h->depth_get = pgl_rep_h_z_get;
+    h->depth_put = pgl_rep_h_z_put;
+}
+static unsigned char *pgl_rep_rb(int x0, int y0, int x1, int y1) {
+    unsigned w = (unsigned)(x1 - x0 + 1), h = (unsigned)(y1 - y0 + 1);
+    unsigned char *buf;
+    if (x0 > x1 || y0 > y1) return NULL;
+    buf = (unsigned char *)malloc((size_t)w * h * 4u);
+    if (!buf) return NULL;
+    pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_fbo);
+    pgl_obj_used |= 8u;
+    pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
+    pgl_glReadPixels(x0, y0, (PGsizei)w, (PGsizei)h, PGGL_RGBA,
+                     PGGL_UNSIGNED_BYTE, buf);
+    return buf;
+}
+
+/* Re-render the recorded stream once under one depth path.  `boxes[i]` (when
+   non-NULL on entry) receives the colour read-back of draw i's bounding box. */
+static void pgl_rep_pass(int hw, unsigned char **boxes, unsigned char *full) {
+    PicaGlHost h;
+    unsigned long long i;
+    int s_depth_hw, s_test, s_mask, s_hwapplied, s_blend_app, s_blend_en,
+        s_guard, s_force, s_zforce, s_pending, s_zdirty, s_zwrote, s_dlog;
+    unsigned s_fapplied, s_shlen, s_zshlen, s_shw, s_shh, s_shbpp, s_zshw,
+             s_zshh, s_zshbpp;
+    unsigned long long s_draws, s_dlogn, s_dlogdraws;
+    int s_dx0, s_dy0, s_dx1, s_dy1;
+
+    s_depth_hw = pgl_depth_hw;
+    s_test = pgl_depth_test_applied;
+    s_fapplied = pgl_depth_func_applied;
+    s_mask = pgl_depth_mask_applied;
+    s_hwapplied = pgl_depth_hw_applied;
+    s_blend_app = pgl_blend_applied;
+    s_blend_en = pgl_blend_enabled;
+    s_guard = pgl_blend_guard_armed;
+    s_force = pgl_force_full;
+    s_zforce = pgl_zforce_full;
+    s_pending = pgl_pending;
+    s_zdirty = pgl_zdirty;
+    s_zwrote = pgl_zwrote;
+    s_dlog = pgl_dlog_n;
+    s_shlen = pgl_shadow_len; s_shw = pgl_shadow_w; s_shh = pgl_shadow_h;
+    s_shbpp = pgl_shadow_bpp;
+    s_zshlen = pgl_zshadow_len; s_zshw = pgl_zshadow_w; s_zshh = pgl_zshadow_h;
+    s_zshbpp = pgl_zshadow_bpp;
+    s_draws = pgl_draws;
+    s_dlogn = pgl_dlog_n; s_dlogdraws = pgl_dlog_draws;
+    s_dx0 = pgl_drawn_x0; s_dy0 = pgl_drawn_y0;
+    s_dx1 = pgl_drawn_x1; s_dy1 = pgl_drawn_y1;
+
+    /* The mode switch goes through the setter BELOW (after the shadow state is
+       re-pointed at the replay target): it drops the specialised cache, which
+       is mandatory because the generated source bakes the path. */
+    pgl_depth_test_applied = -1;
+    pgl_depth_func_applied = 0;
+    pgl_depth_mask_applied = -1;
+    pgl_depth_hw_applied = -1;
+    pgl_blend_applied = 0;
+    pgl_blend_enabled = 0;
+    pgl_blend_guard_armed = 0;
+    pgl_dlog_on = 0;                  /* keep the live timeline clean */
+    pgl_rect_trace = 0;
+    pgl_pending = 0;
+    pgl_zdirty = 0;
+    pgl_zwrote = 0;
+    pgl_force_full = 1;
+    pgl_zforce_full = 1;
+    pgl_shadow_len = 0;
+    pgl_zshadow_len = 0;
+    /* The shadow DIMENSIONS must already describe the replay target, otherwise
+       draw_locked sees a "render target changed" and closes an episode with an
+       internal flush in the middle of the replay. */
+    pgl_shadow_w = pgl_rep.rt_w;
+    pgl_shadow_h = pgl_rep.rt_h;
+    pgl_shadow_bpp = (pgl_rep.n && pgl_rep.d[0].st.rt_bpp)
+                     ? pgl_rep.d[0].st.rt_bpp : 4u;
+    pgl_zshadow_w = pgl_rep.rt_w;
+    pgl_zshadow_h = pgl_rep.rt_h;
+    pgl_zshadow_bpp = pgl_rep.depth_bpp ? pgl_rep.depth_bpp : 2u;
+    /* The specialised fragment shaders BAKE pgl_depth_hw into their source
+       (pgl_spec_src); pgl_depth_hw_set() drops the cache in the same step, so
+       the other mode's programs can never be reused for the A/B pass. */
+    pgl_depth_hw_set(hw, "replay: depth path changed for the A/B pass");
+    pgl_reset_drawn();
+    if (pgl_rep.rt_out && pgl_rep.rt_snap)
+        memcpy(pgl_rep.rt_out, pgl_rep.rt_snap, pgl_rep.rt_len);
+    if (pgl_rep.z_out && pgl_rep.z_snap)
+        memcpy(pgl_rep.z_out, pgl_rep.z_snap, pgl_rep.z_len);
+    pgl_rep_make_host(&h);
+    pgl_ensure_rt((int)pgl_rep.rt_w, (int)pgl_rep.rt_h);
+
+    for (i = 0; i < pgl_rep.n; ++i) {
+        const PglRepDraw *r = &pgl_rep.d[i];
+        PicaGlState st = r->st;
+        st.tex_rgba = (r->tex_idx >= 0) ? PGL_REP_TEX(r->tex_idx) : NULL;
+        pica_gl_draw_locked(r->verts, r->nverts, &st, &h);
+        if (boxes && r->bx0 >= 0)
+            boxes[i] = pgl_rep_rb(r->bx0, r->by0, r->bx1, r->by1);
+    }
+    if (full) {
+        unsigned char *f = pgl_rep_rb(0, 0, (int)pgl_rep.rt_w - 1,
+                                      (int)pgl_rep.rt_h - 1);
+        if (f) memcpy(full, f, (size_t)pgl_rep.rt_w * pgl_rep.rt_h * 4u);
+        free(f);
+    }
+
+    pgl_depth_hw_set(s_depth_hw, "replay: restore the live depth path");
+    pgl_depth_test_applied = s_test;
+    pgl_depth_func_applied = s_fapplied;
+    pgl_depth_mask_applied = s_mask;
+    pgl_depth_hw_applied = s_hwapplied;
+    pgl_blend_applied = s_blend_app;
+    pgl_blend_enabled = s_blend_en;
+    pgl_blend_guard_armed = s_guard;
+    pgl_force_full = s_force;
+    pgl_zforce_full = s_zforce;
+    pgl_pending = s_pending;
+    pgl_zdirty = s_zdirty;
+    pgl_zwrote = s_zwrote;
+    pgl_shadow_len = s_shlen; pgl_shadow_w = s_shw; pgl_shadow_h = s_shh;
+    pgl_shadow_bpp = s_shbpp;
+    pgl_zshadow_len = s_zshlen; pgl_zshadow_w = s_zshw; pgl_zshadow_h = s_zshh;
+    pgl_zshadow_bpp = s_zshbpp;
+    pgl_draws = s_draws;
+    pgl_dlog_n = s_dlogn; pgl_dlog_draws = s_dlogdraws;
+    pgl_dlog_on = s_dlog;
+    pgl_drawn_x0 = s_dx0; pgl_drawn_y0 = s_dy0;
+    pgl_drawn_x1 = s_dx1; pgl_drawn_y1 = s_dy1;
+    if (s_force) pgl_force_full = 1;   /* the live frame's next refresh must
+                                          not trust a shadow the replay
+                                          re-pointed at its own snapshot */
+    if (s_zforce) pgl_zforce_full = 1;
+    /* ...and the live path's specialised programs must be rebuilt for the
+       restored depth mode — pgl_depth_hw_set() did that above. */
+}
+
+static void pgl_rep_reset_stream(void) {
+    unsigned i;
+    for (i = 0; i < pgl_rep.ntex; ++i) free(pgl_rep.tex[i]);
+    pgl_rep.ntex = 0;
+    pgl_rep.tex_bytes = 0;
+    for (i = 0; i < pgl_rep.n; ++i) free(pgl_rep.d[i].verts);
+    pgl_rep.n = 0;
+    pgl_rep.have_host = 0;
+    pgl_rep.nmixed = 0;
+    pgl_rep.ndepth_test = 0;
+    free(pgl_rep.rt_snap); free(pgl_rep.z_snap);
+    free(pgl_rep.rt_out); free(pgl_rep.z_out);
+    pgl_rep.rt_snap = pgl_rep.z_snap = pgl_rep.rt_out = pgl_rep.z_out = NULL;
+    pgl_rep.rt_len = pgl_rep.z_len = 0;
+}
+
+static int pgl_rep_env = -1;   /* -1 = DQ8_GL_REPLAY not parsed yet */
+static void pgl_rep_setup(void) {
+    const char *e;
+    const char *dir;
+    const char *rt;
+    if (pgl_rep_env >= 0) return;
+    pgl_rep_env = 0;
+    e = getenv("DQ8_GL_REPLAY");
+    if (!e || !e[0] || e[0] == '0') return;
+    pgl_rep.flush = strtoull(e, NULL, 10);
+    if (!pgl_rep.flush) return;
+    dir = getenv("DQ8_GL_REPLAY_DIR");
+    rt = getenv("DQ8_GL_REPLAY_RT");   /* "482x400": flush box to replay */
+    if (rt && rt[0]) {
+        unsigned ww = 0, hh = 0;
+        if (sscanf(rt, "%ux%u", &ww, &hh) == 2) {
+            pgl_rep.want_w = ww;
+            pgl_rep.want_h = hh;
+        }
+    }
+    {
+        const char *md = getenv("DQ8_GL_REPLAY_MINDT");
+        if (md && md[0]) pgl_rep.want_dt = (unsigned)atoi(md);
+    }
+    pgl_rep.on = 1;
+    pgl_rep.state = 0;
+    pgl_rep_env = 1;
+    fprintf(stderr, "GL REPLAY: armed from flush #%llu rt=%ux%u dir=%s\n",
+            pgl_rep.flush, pgl_rep.want_w, pgl_rep.want_h,
+            (dir && dir[0]) ? dir : "(none)");
+}
+
+static void pgl_rep_write_ppm(const char *path, const unsigned char *px,
+                              unsigned w, unsigned h) {
+    FILE *f = fopen(path, "wb");
+    unsigned y, x;
+    if (!f) return;
+    fprintf(f, "P6\n%u %u\n255\n", w, h);
+    for (y = h; y-- > 0;)                 /* GL rows are bottom-up */
+        for (x = 0; x < w; ++x)
+            fwrite(px + ((size_t)y * w + x) * 4u, 1, 3, f);
+    fclose(f);
+}
+
+/* Compare the two passes and report the first divergent draw. */
+static void pgl_rep_run(void) {
+    unsigned n = (unsigned)pgl_rep.n;
+    unsigned w = (unsigned)pgl_rep.rt_w, h = (unsigned)pgl_rep.rt_h;
+    unsigned char **boxa = NULL, **boxb = NULL;
+    unsigned char *fa = NULL, *fb = NULL, *diff = NULL;
+    unsigned i, x, y;
+    unsigned long long ndiff = 0, first = 0xFFFFFFFFFFFFFFFFull;
+    unsigned ndiv = 0;
+    const char *dir = getenv("DQ8_GL_REPLAY_DIR");
+    if (!pgl_fbo || !w || !h) return;
+    boxa = (unsigned char **)calloc(n ? n : 1u, sizeof *boxa);
+    boxb = (unsigned char **)calloc(n ? n : 1u, sizeof *boxb);
+    fa = (unsigned char *)malloc((size_t)w * h * 4u);
+    fb = (unsigned char *)malloc((size_t)w * h * 4u);
+    diff = (unsigned char *)malloc((size_t)w * h * 4u);
+    if (!boxa || !boxb || !fa || !fb || !diff) goto done;
+    /* Recording MUST be off from here on: the replay calls the draw path,
+       whose record hook would otherwise append the replayed draws to the
+       stream being replayed (and outrun the box arrays). */
+    pgl_rep.state = 2;
+    fprintf(stderr, "GL REPLAY: replaying %u draws, rt=%ux%u, "
+                    "textures=%u (%llu bytes)\n", n, w, h, pgl_rep.ntex,
+            pgl_rep.tex_bytes);
+    pgl_rep_pass(1, boxa, fa);            /* hardware D32F depth */
+    pgl_rep_pass(0, boxb, fb);            /* in-shader ATT1 depth */
+    /* full-frame difference */
+    for (i = 0; i < w * h; ++i) {
+        const unsigned char *a = fa + (size_t)i * 4u;
+        const unsigned char *b = fb + (size_t)i * 4u;
+        int d = 0;
+        if (a[0] != b[0] || a[1] != b[1] || a[2] != b[2] || a[3] != b[3]) d = 1;
+        if (d) ++ndiff;
+        diff[(size_t)i * 4u + 0] = d ? 255 : (unsigned char)(a[0] / 3);
+        diff[(size_t)i * 4u + 1] = d ? 0 : (unsigned char)(a[1] / 3);
+        diff[(size_t)i * 4u + 2] = d ? 0 : (unsigned char)(a[2] / 3);
+        diff[(size_t)i * 4u + 3] = 255;
+    }
+    fprintf(stderr, "GL REPLAY: full-frame hw-vs-shader differing pixels: "
+                    "%llu of %u (%.2f%%)\n", ndiff, w * h,
+            100.0 * (double)ndiff / (double)(w * h));
+    /* per-draw: the first draw whose own bounding box already differs */
+    for (i = 0; i < n; ++i) {
+        const PglRepDraw *r = &pgl_rep.d[i];
+        unsigned bw, k;
+        unsigned long long npx = 0;
+        if (!boxa[i] || !boxb[i] || r->bx0 < 0) continue;
+        bw = (unsigned)(r->bx1 - r->bx0 + 1);
+        for (k = 0; k < (unsigned)(r->bx1 - r->bx0 + 1) *
+                        (unsigned)(r->by1 - r->by0 + 1); ++k) {
+            const unsigned char *a = boxa[i] + (size_t)k * 4u;
+            const unsigned char *b = boxb[i] + (size_t)k * 4u;
+            if (a[0] != b[0] || a[1] != b[1] || a[2] != b[2] || a[3] != b[3])
+                ++npx;
+        }
+        (void)bw;
+        if (npx) {
+            if (first == 0xFFFFFFFFFFFFFFFFull) first = i;
+            if (ndiv < 24u) {
+                fprintf(stderr, "GL REPLAY DIV draw=%u nverts=%u box=%d,%d..%d,%d "
+                        "diffpx=%llu depth(on=%d test=%d write=%d func=%u zbuf=%d "
+                        "scale=%.9g off=%.9g zmax=%.0f bpp=%u) mode=%d blend=%d "
+                        "tex=%d alpha_test=%d cmask=%X\n",
+                        i, r->nverts, r->bx0, r->by0, r->bx1, r->by1, npx,
+                        r->st.depth_on, r->st.depth_test, r->st.depth_write,
+                        r->st.depth_func, r->st.depth_zbuf,
+                        (double)r->st.depth_scale, (double)r->st.depth_offset,
+                        (double)r->st.depth_zmax, r->st.depth_bpp,
+                        r->st.mode, r->st.blend, r->st.tev.tex_en,
+                        r->st.alpha_test, r->st.color_mask);
+            }
+            ++ndiv;
+        }
+    }
+    if (first != 0xFFFFFFFFFFFFFFFFull && first < n) {
+        const PglRepDraw *r = &pgl_rep.d[first];
+        fprintf(stderr, "GL REPLAY: FIRST DIVERGENT DRAW = %llu (of %u); "
+                        "divergent draws=%u; v0=(%.2f,%.2f,iw=%.4g,zw=%.4g) "
+                        "col0=(%.3f,%.3f,%.3f,%.3f)\n",
+                (unsigned long long)first, n, ndiv, r->verts[0].x, r->verts[0].y,
+                (double)r->verts[0].iw, (double)r->verts[0].zw,
+                (double)r->verts[0].color[0], (double)r->verts[0].color[1],
+                (double)r->verts[0].color[2], (double)r->verts[0].color[3]);
+    } else {
+        fprintf(stderr, "GL REPLAY: NO per-draw divergence found (hw and "
+                        "in-shader paths agree pixel-for-pixel on every draw "
+                        "box)%s\n", ndiff ? " — but the FULL FRAME differs: the "
+                        "difference is outside the draw boxes (refresh/clear/"
+                        "write-back path)" : "");
+    }
+    if (dir && dir[0]) {
+        char path[768];
+        snprintf(path, sizeof path, "%s/a.ppm", dir);
+        pgl_rep_write_ppm(path, fa, w, h);
+        snprintf(path, sizeof path, "%s/b.ppm", dir);
+        pgl_rep_write_ppm(path, fb, w, h);
+        snprintf(path, sizeof path, "%s/diff.ppm", dir);
+        pgl_rep_write_ppm(path, diff, w, h);
+    }
+    /* the live frame's next refresh must re-sync from guest memory */
+    pgl_force_full = 1;
+    pgl_zforce_full = 1;
+done:
+    if (boxa) for (i = 0; i < n; ++i) free(boxa[i]);
+    if (boxb) for (i = 0; i < n; ++i) free(boxb[i]);
+    free(boxa); free(boxb);
+    free(fa); free(fb); free(diff);
+    pgl_rep_reset_stream();
+    pgl_rep.state = 3;   /* replay done: stop recording */
 }
 
 static void pica_gl_flush_locked(const PicaGlHost *host, int have_raw) {
     unsigned char *pixels;
+    float *zbuf = NULL;
+    int need_z = 0;
     unsigned w, h;
     int x0 = pgl_drawn_x0, y0 = pgl_drawn_y0, x1 = pgl_drawn_x1, y1 = pgl_drawn_y1;
     if (!pgl_pending) return;
     pgl_pending = 0;
+    if (pgl_tprof_on)
+        fprintf(stderr, "PGLLK enter box=%d,%d..%d,%d rt=%dx%d\n",
+                pgl_drawn_x0, pgl_drawn_y0, pgl_drawn_x1, pgl_drawn_y1,
+                pgl_rt_w, pgl_rt_h);
     if (x0 > x1 || y0 > y1) return;
     if (x0 < 0) x0 = 0;
     if (y0 < 0) y0 = 0;
@@ -2286,8 +6620,15 @@ static void pica_gl_flush_locked(const PicaGlHost *host, int have_raw) {
     if (x0 > x1 || y0 > y1) return;
     w = (unsigned)(x1 - x0 + 1);
     h = (unsigned)(y1 - y0 + 1);
+    if (pgl_wb_trace())
+        fprintf(stderr, "WBTRACE #%llu why=%d box=%d,%d..%d,%d px=%u "
+                "zdirty=%d rt=%ux%u\n",
+                (unsigned long long)(pgl_flushes + 1u), pgl_fl_reason,
+                x0, y0, x1, y1, w * h, pgl_zdirty, pgl_rt_w, pgl_rt_h);
     pixels = (unsigned char *)malloc((size_t)w * h * 4u);
     if (!pixels) return;
+    {   /* t_2d934e23: read-back vs write-back split, ~2 s window */
+        unsigned long long fl_t = pica_pqt_now_ns();
     pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_fbo);
     pgl_obj_used |= 8u;
     pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
@@ -2305,20 +6646,144 @@ static void pica_gl_flush_locked(const PicaGlHost *host, int have_raw) {
             return;
         }
     }
-    pgl_dump_snap("color_fbo_last.raw", pixels, (size_t)w * h * 4u);
-    pgl_dump_box("color_fbo_last.box", x0, y0, x1, y1);
-    pgl_wb_color(host, have_raw, pixels, x0, y0, x1, y1);
-    free(pixels);
-    if (pgl_zdirty) {
-        float *zbuf;
-        pgl_zdirty = 0;
-        zbuf = pgl_rb_depth(x0, y0, x1, y1);
-        if (zbuf) {
-            pgl_wb_depth(host, have_raw, zbuf, w, h, x0, y0, x1, y1);
-            free(zbuf);
+    /* t_7d18d1b6 diagnostic (DQ8_WB_TRACE=1, first 8 flushes): how much of the
+       colour read-back is the GPU draining the frame vs. the transfer itself?
+       A second identical glReadPixels right after the first measures the
+       quiesced cost. */
+    if (pgl_wb_trace() && pgl_fl_n < 8u) {
+        static unsigned char *rb2;
+        static size_t rb2_cap;
+        size_t need = (size_t)w * h * 4u;
+        if (rb2_cap < need) {
+            unsigned char *n = (unsigned char *)realloc(rb2, need);
+            if (n) { rb2 = n; rb2_cap = need; }
+        }
+        if (rb2) {
+            unsigned long long t2 = pica_pqt_now_ns();
+            pgl_glReadPixels(x0, y0, (PGsizei)w, (PGsizei)h, PGGL_RGBA,
+                             PGGL_UNSIGNED_BYTE, rb2);
+            pgl_drain_errors("readback-2", NULL);
+            fprintf(stderr, "PGLRBTEST #%llu px=%u first_ms=%.3f second_ms=%.3f\n",
+                    (unsigned long long)pgl_fl_n, w * h,
+                    (double)(t2 - fl_t) / 1e6,
+                    (double)(pica_pqt_now_ns() - t2) / 1e6);
         }
     }
+    /* t_7d18d1b6: decide ONCE whether this flush has depth work.  A flush
+       whose depth attachment only ran depth TESTS still equals guest memory
+       (the refresh uploaded it), so the depth resolve is skipped; only a
+       depth-WRITING draw or a depth clear invalidates those bytes. */
+    need_z = pgl_zdirty && (pgl_zwrote || !pgl_zskip_on());
+    pgl_zdirty = 0;
+    pgl_zwrote = 0;
+    if (need_z) ++pgl_fl_nz;
+    pgl_frame_guard(pixels, w, h);
+    pgl_frame_depth_draws = 0;
+    /* t_05a3190d: optional per-frame PPM dump, used to locate the flush number
+       of a battle frame for DQ8_GL_REPLAY (find a corrupted frame, replay it).
+       DQ8_GL_REPLAY_FRAMES=<dir>; only whole-target flushes from an origin of
+       0,0 (the presented frames) are written. */
+    if (pgl_rep_env < 0) pgl_rep_setup();
+    if (pgl_rep.on && pgl_rep.state == 0 && x0 == 0 && y0 == 0 &&
+        (pgl_flushes % 5u) == 0u &&
+        (unsigned long long)w * (unsigned long long)h * 4ull >=
+        (unsigned long long)pgl_rt_w * (unsigned long long)pgl_rt_h) {
+        const char *dd = getenv("DQ8_GL_REPLAY_FRAMES");
+        if (dd && dd[0] && dd[0] != '0') {
+            char path[768];
+            snprintf(path, sizeof path, "%s/f%05llu.ppm", dd,
+                     (unsigned long long)(pgl_flushes + 1u));
+            pgl_rep_write_ppm(path, pixels, w, h);
+        }
+    }
+    pgl_depth_probe("flush", x0, y0, x1, y1);
+    pgl_depth_dump(x0, y0, x1, y1);
+    /* t_8510204b: dump the depth timeline of the frame that just finished. */
+    if (pgl_dlog_on && pgl_dlog_n) {
+        unsigned k, n = pgl_dlog_n < PGL_DLOG_MAX ? pgl_dlog_n : PGL_DLOG_MAX;
+        unsigned first = (pgl_dlog_n > PGL_DLOG_MAX) ? (pgl_dlog_n - PGL_DLOG_MAX) : 0u;
+        fprintf(stderr, "DFRAME flush=%llu rt=%ux%u box=%d,%d..%d,%d draws=%llu "
+                "keeping=%u of %u\n",
+                (unsigned long long)(pgl_flushes + 1u), pgl_rt_w, pgl_rt_h,
+                x0, y0, x1, y1, pgl_dlog_draws, n, pgl_dlog_n);
+        for (k = 0; k < n; ++k) {
+            const PglDLogEntry *e = &pgl_dlog[(first + k) % PGL_DLOG_MAX];
+            fprintf(stderr, "DDRAW draw=%llu rt=%ux%u zaddr=%08X bpp=%u "
+                    "on=%d t=%d w=%d f=%u zb=%d scale=%.9g off=%.9g zmax=%.0f "
+                    "sync=%d box=%d,%d..%d,%d\n",
+                    e->draw, e->rt_w, e->rt_h, e->depth_addr, e->bpp,
+                    e->on, e->test, e->write, (unsigned)e->func, e->zbuf,
+                    (double)e->scale, (double)e->off, (double)e->zmax,
+                    e->syncs_since, e->box[0], e->box[1], e->box[2], e->box[3]);
+        }
+        pgl_dlog_n = 0;
+        pgl_dlog_draws = 0;
+    }
+    pgl_dump_snap("color_fbo_last.raw", pixels, (size_t)w * h * 4u);
+    pgl_dump_box("color_fbo_last.box", x0, y0, x1, y1);
+    {
+        unsigned long long fl_t1 = pica_pqt_now_ns();
+        pgl_fl_read_ns += fl_t1 - fl_t;
+        pgl_fl_crb_ns += fl_t1 - fl_t;
+        pgl_wb_color(host, have_raw, pixels, x0, y0, x1, y1);
+        pgl_fl_wb_ns += pica_pqt_now_ns() - fl_t1;
+        pgl_fl_cwb_ns += pica_pqt_now_ns() - fl_t1;
+        ++pgl_fl_n; pgl_fl_px += (unsigned long long)w * h;
+    }
+    }   /* end t_2d934e23 flush timing block */
+    free(pixels);
+    ++pgl_fl_nc;
+    if (need_z && pgl_zwb()) {
+        unsigned long long zt0 = pica_pqt_now_ns();
+        ++pgl_fl_zn;
+        zbuf = pgl_rb_depth(x0, y0, x1, y1);
+        pgl_fl_zrb_ns += pica_pqt_now_ns() - zt0;
+    } else if (need_z) {
+        /* DQ8_GL_ZWB=0: the depth resolve is skipped on purpose so its cost
+           can be A/B'd; the ATT1/D32F attachment keeps the frame's depth and
+           the shadow snapshot is untouched, so the next refresh does not
+           re-upload (correct as long as nothing outside this backend reads
+           the guest depth buffer). */
+        ++pgl_fl_zn; ++pgl_fl_zskip;
+    }
+    if (zbuf) {
+        unsigned long long zt0 = pica_pqt_now_ns();
+        pgl_wb_depth(host, have_raw, zbuf, w, h, x0, y0, x1, y1);
+        pgl_fl_zwb_ns += pica_pqt_now_ns() - zt0;
+        free(zbuf);
+    }
     ++pgl_flushes;
+    /* t_05a3190d: deterministic draw-stream replay A/B orchestration.  The
+       frame that ENDS at flush #N is the one recorded: recording is enabled
+       when flush #N-1 completes, and the replay runs at the end of flush #N. */
+    if (pgl_rep_env < 0) pgl_rep_setup();
+    if (pgl_rep.on && !pgl_split_on) {
+        if (pgl_rep.state == 1) {
+            /* The frame that just ended is a candidate: replay it when its
+               render target / draw shape matches what we asked for, otherwise
+               drop it and keep recording the next frame. */
+            int ok_rt = !pgl_rep.want_w ||
+                        (w == pgl_rep.want_w && h == pgl_rep.want_h);
+            int ok_dt = !pgl_rep.want_dt ||
+                        pgl_rep.ndepth_test >= pgl_rep.want_dt;
+            if (ok_rt && ok_dt && pgl_rep.n) {
+                pgl_rep_run();
+            } else {
+                if (pgl_rep.n)
+                    fprintf(stderr, "GL REPLAY: flush #%llu rejected "
+                                    "(box=%dx%d depth-tested draws=%u, want "
+                                    "%ux%u and >=%u) — recording the next "
+                                    "frame\n",
+                            (unsigned long long)(pgl_flushes + 1ull), w, h,
+                            pgl_rep.ndepth_test, pgl_rep.want_w,
+                            pgl_rep.want_h, pgl_rep.want_dt);
+                pgl_rep_reset_stream();
+            }
+        } else if (pgl_rep.state == 0 && pgl_flushes + 1ull >= pgl_rep.flush) {
+            pgl_rep.state = 1;      /* start recording the next frame */
+            pgl_rep_reset_stream();
+        }
+    }
     if (pgl_debug && (pgl_flushes <= 8u || (pgl_flushes % 200u) == 0u))
         fprintf(stderr, "GL debug: flush #%llu box=%d,%d..%d,%d rt=%ux%u\n",
                 (unsigned long long)pgl_flushes, x0, y0, x1, y1, pgl_rt_w, pgl_rt_h);
@@ -2335,16 +6800,94 @@ static int pica_gl_pending(void) { return pgl_ready && pgl_pending; }
    transfer, capture, scan-out) or before a software-path draw. */
 static void pica_gl_flush(const PicaGlHost *host) {
     PglSavedCtx prev;
+    /* t_2d934e23: where does the deferred write-back's wall time go?  The
+       EGL context is dropped at the start of every flush and re-taken below
+       (pgl_context_take -> eglMakeCurrent), so measure release / take /
+       read-back separately.  Gated by DQ8_XFERPROF=1. */
+    if (pgl_tprof_on < 0) {
+        const char *e = getenv("DQ8_XFERPROF");
+        pgl_tprof_on = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    {
+    unsigned long long tp0 = pica_pqt_now_ns(), tp1, tp2;
     /* Flush is the guest-visible-pixel boundary: any consumer past this point
        (GSP transfer/capture/scan-out/DMA, software draws, SDL present) may
        run foreign GL calls, so drop the context hold here. */
     pica_gl_context_release();
-    if (!pgl_ready || !pgl_pending || !host) return;
+    tp1 = pica_pqt_now_ns();
+    if (!pgl_ready || !pgl_pending || !host) { pgl_tp_pend0 += pgl_tprof_on; return; }
     if (pgl_split_on) { pgl_split_flush(host); return; }
     memset(&prev, 0, sizeof prev);
-    if (!pgl_context_take(&prev)) return;
+    if (!pgl_context_take(&prev)) { ++pgl_tp_takefail; return; }
+    tp2 = pica_pqt_now_ns();
     pica_gl_flush_locked(host, host->rt_raw && host->rt_px_off);
-    pgl_context_put(&prev);
+    {
+        unsigned long long tp3 = pica_pqt_now_ns();
+        pgl_context_put(&prev);
+        if (pgl_tprof_on) {
+            ++pgl_tp_n;
+            pgl_tp_rel_ns += tp1 - tp0;
+            pgl_tp_take_ns += tp2 - tp1;
+            pgl_tp_lock_ns += tp3 - tp2;
+            if ((pgl_tp_n % 16u) == 0u) {
+                /* t_8df70ad4: ONE PGLFLUSH line, every field accumulated by
+                   the run that prints it.  t_2d934e23's release/take/lock
+                   window is unchanged; the write-back half (color read-back /
+                   color store / depth ATT1 read-back / depth store, plus how
+                   many depth write-backs DQ8_GL_ZWB=0 skipped) is the same
+                   window, so DQ8_GL_ZWB=0 vs =1 differ on the same line.  The
+                   old second printer printed a counter it zeroed every flush
+                   (so it never fired) and a box area labelled `px`. */
+                double fn = (double)(pgl_fl_n ? pgl_fl_n : 1u);
+                double zn = (double)(pgl_fl_zn ? pgl_fl_zn : 1u);
+                fprintf(stderr, "PGLFLUSH n=%llu pend0=%llu takefail=%llu "
+                        "release_ms=%.2f take_ms=%.2f locked_ms=%.2f "
+                        "mean[rel/take/lock]=%.2f/%.2f/%.2f ms "
+                        "wb_n=%llu z_n=%llu zskip=%llu zwb=%d "
+                        "mean[read/col/zrb/zwb]=%.2f/%.2f/%.2f/%.2f ms\n",
+                        (unsigned long long)pgl_tp_n,
+                        (unsigned long long)pgl_tp_pend0,
+                        (unsigned long long)pgl_tp_takefail,
+                        (double)pgl_tp_rel_ns / 1e6, (double)pgl_tp_take_ns / 1e6,
+                        (double)pgl_tp_lock_ns / 1e6,
+                        (double)pgl_tp_rel_ns / (double)pgl_tp_n / 1e6,
+                        (double)pgl_tp_take_ns / (double)pgl_tp_n / 1e6,
+                        (double)pgl_tp_lock_ns / (double)pgl_tp_n / 1e6,
+                        (unsigned long long)pgl_fl_n,
+                        (unsigned long long)pgl_fl_zn,
+                        (unsigned long long)pgl_fl_zskip,
+                        pgl_zwb(),
+                        (double)pgl_fl_read_ns / fn / 1e6,
+                        (double)pgl_fl_wb_ns / fn / 1e6,
+                        (double)pgl_fl_zrb_ns / zn / 1e6,
+                        (double)pgl_fl_zwb_ns / zn / 1e6);
+                /* t_7d18d1b6: colour vs depth split of the same window
+                   (mean ms/flush; nz/nc = flushes that carried depth/colour
+                   work; zfast/zgen = depth write-backs on the block path vs
+                   the reference loop). */
+                fprintf(stderr, "PGLWBSPLIT n=%llu mean_ms[c_rb/c_wb/z_rb/z_wb]="
+                        "%.3f/%.3f/%.3f/%.3f nz=%llu nc=%llu zfast=%llu "
+                        "zgen=%llu\n",
+                        (unsigned long long)pgl_tp_n,
+                        (double)pgl_fl_crb_ns / (double)pgl_tp_n / 1e6,
+                        (double)pgl_fl_cwb_ns / (double)pgl_tp_n / 1e6,
+                        (double)pgl_fl_zrb_ns / (double)pgl_tp_n / 1e6,
+                        (double)pgl_fl_zwb_ns / (double)pgl_tp_n / 1e6,
+                        (unsigned long long)pgl_fl_nz,
+                        (unsigned long long)pgl_fl_nc,
+                        (unsigned long long)pgl_wbz_fast,
+                        (unsigned long long)pgl_wbz_gen);
+                pgl_tp_n = pgl_tp_rel_ns = pgl_tp_take_ns = pgl_tp_lock_ns = 0;
+                pgl_tp_pend0 = pgl_tp_takefail = 0;
+                pgl_fl_n = pgl_fl_read_ns = pgl_fl_wb_ns = pgl_fl_px = 0;
+                pgl_fl_zn = pgl_fl_zskip = pgl_fl_zrb_ns = pgl_fl_zwb_ns = 0;
+                pgl_fl_crb_ns = pgl_fl_cwb_ns = 0;
+                pgl_fl_nz = pgl_fl_nc = 0;
+                pgl_wbz_fast = pgl_wbz_gen = 0;
+            }
+        }
+    }
+    }
 }
 
 /* t_bc6b4eb7: pack triangles into the instanced payload layout — one
@@ -2382,11 +6925,23 @@ static unsigned pica_gl_draw_locked(const PicaGlVertex *verts, unsigned nverts,
                        ph_t3 = 0, ph_t4 = 0;
     PGenum bl_f[4], bl_eq[2];
     int gl_blend;
+    int dh_ok = 0;
+    unsigned long long dh_pre = 0, dh_post = 0;
+    unsigned long long dh_pre_sum = 0, dh_post_sum = 0;
+    int dh_zok = 0;
+    unsigned long long dh_zpre = 0, dh_zpost = 0, dh_zpre_sum = 0, dh_zpost_sum = 0;
     unsigned long long ph;
     if (!pgl_ready || !ntri || !host || !host->rt_get || !host->rt_put) return 0;
     if (!st->rt_w || !st->rt_h) return 0;
+    if (pgl_dlog_on < 0) {
+        const char *e = getenv("DQ8_GL_DEPTHLOG");
+        pgl_dlog_on = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
     if (st->mode == PICA_GL_TEV && st->tev.tex_en &&
         (!st->tex_rgba || st->tex_w <= 0 || st->tex_h <= 0)) return 0;
+    /* t_05a3190d: deterministic draw-stream replay A/B — record this draw. */
+    if (pgl_rep_env < 0) pgl_rep_setup();
+    if (pgl_rep.state == 1) pgl_rep_record(verts, nverts, st, host);
     batch = pgl_batch_on && host->rt_raw && host->rt_px_off;
     /* The wrapper (pica_gl_draw) made OUR context current and saved SDL's;
        everything below runs only on our context, and pica_gl_draw restores
@@ -2439,18 +6994,24 @@ static unsigned pica_gl_draw_locked(const PicaGlVertex *verts, unsigned nverts,
     /* Drain errors left by earlier calls (other subsystems, prior stages) so
        the readback check below can only ever attribute readback's own errors. */
     pgl_drain_errors("stale@entry", NULL);
-    /* A foreign GL user sharing this thread may have deleted our objects
-       between draws; rebuild before using them (no-op in the normal case). */
-    if (!pgl_ensure_objects()) return 0;
-    /* A pending episode must be written back before the FBO is re-sized to a
-       different render target (its content would be lost).  Under the split
-       the GUEST thread owns pgl_pending/shadow dims and closes the episode
-       at enqueue (blocking flush) before the size can change, so the worker
-       never evaluates this condition. */
-    if (!pgl_split_cur && pgl_pending &&
-        (pgl_shadow_w != st->rt_w || pgl_shadow_h != st->rt_h))
-        pica_gl_flush_locked(host, 1);
-    if (!pgl_ensure_rt((int)st->rt_w, (int)st->rt_h)) return 0;
+    {   /* t_2d934e23: ens/ref split of the per-draw CPU setup */
+        unsigned long long ph_ens0 = pica_pqt_now_ns();
+        unsigned long long ph_e;
+        /* A foreign GL user sharing this thread may have deleted our objects
+           between draws; rebuild before using them (no-op in the normal case). */
+        if (!pgl_ensure_objects()) return 0;
+        /* A pending episode must be written back before the FBO is re-sized to
+           a different render target (its content would be lost).  Under the
+           split the GUEST thread owns pgl_pending/shadow dims and closes the
+           episode at enqueue (blocking flush) before the size can change, so
+           the worker never evaluates this condition. */
+        if (!pgl_split_cur && pgl_pending &&
+            (pgl_shadow_w != st->rt_w || pgl_shadow_h != st->rt_h))
+            pica_gl_flush_locked(host, 1);
+        if (!pgl_ensure_rt((int)st->rt_w, (int)st->rt_h)) return 0;
+        ph_e = pica_pqt_now_ns();
+        pgl_ph_ens_ns += ph_e - ph_ens0; pgl_ph_ref_from = ph_e;
+    }
     /* t_8c05fac8: keep the read-only image units pointed at the current RT
        textures (first use, resize re-spec, or an object rebuild that changed
        the names).  State call only — never a queue drain. */
@@ -2486,7 +7047,9 @@ static unsigned pica_gl_draw_locked(const PicaGlVertex *verts, unsigned nverts,
     } else if (batch) {
         const unsigned char *raw = NULL;
         unsigned len = 0;
-        if (!host->rt_raw(host->user, &raw, &len)) return 0;
+        int pgl_need = pgl_refr_needed(st, host, &raw, &len);
+        if (pgl_need < 0) return 0;
+        if (pgl_need) {
         if (!pgl_shadow || pgl_shadow_len != len || pgl_shadow_w != st->rt_w ||
             pgl_shadow_h != st->rt_h || pgl_shadow_bpp != (st->rt_bpp ? st->rt_bpp : 4u)) {
             unsigned char *grown =
@@ -2500,7 +7063,11 @@ static unsigned pica_gl_draw_locked(const PicaGlVertex *verts, unsigned nverts,
             memcpy(pgl_shadow, raw, len);
             pgl_force_full = 1; /* FBO content unknown for this target */
         }
-        if (!pgl_refresh(st, host, raw, len)) return 0;
+        {
+            uint64_t pf_r0 = pf_trap_armed() ? pica_pqt_now_ns() : 0;
+            if (!pgl_refresh(st, host, raw, len)) return 0;
+            if (pf_r0) pf_shim(PF_SH_REFRESH, pica_pqt_now_ns() - pf_r0);
+        }
         if (st->depth_on && host->depth_raw) {
             const unsigned char *zraw = NULL;
             unsigned zlen = 0;
@@ -2520,6 +7087,10 @@ static unsigned pica_gl_draw_locked(const PicaGlVertex *verts, unsigned nverts,
                 pgl_zforce_full = 1;
             }
             if (!pgl_refresh_depth(st, host, zraw, zlen)) return 0;
+            pgl_zshadow_src = zraw;
+        }
+        pgl_guest_dirty = 0;
+        pgl_shadow_src = raw;
         }
     } else {
         /* Host without raw access: upload the render target from guest
@@ -2544,6 +7115,7 @@ static unsigned pica_gl_draw_locked(const PicaGlVertex *verts, unsigned nverts,
         pgl_drain_errors("rt-upload", NULL);
     }
 
+    pgl_ph_ref_ns += pica_pqt_now_ns() - pgl_ph_ref_from;
     ph_t1 = pica_pqt_now_ns();
     /* Draw bounding box (raster coordinates, y=0 bottom): bounds the u_dst
        blend copy and the deferred read-back, both at least as large as the
@@ -2567,6 +7139,7 @@ static unsigned pica_gl_draw_locked(const PicaGlVertex *verts, unsigned nverts,
     if (bx0 <= bx1 && by0 <= by1) {
         bw = (unsigned)(bx1 - bx0 + 1);
         bh = (unsigned)(by1 - by0 + 1);
+        pgl_ph_box_px += (unsigned long long)bw * bh;
     }
     if (pgl_rect_trace) {
         fprintf(stderr, "GLRECT draw#%llu n=%u rt=%ux%u v0=(%.2f,%.2f) "
@@ -2580,18 +7153,88 @@ static unsigned pica_gl_draw_locked(const PicaGlVertex *verts, unsigned nverts,
     pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_fbo);
     pgl_obj_used |= 8u;
     pgl_glViewport(0, 0, (PGsizei)st->rt_w, (PGsizei)st->rt_h);
-    pgl_glColorMask((st->color_mask >> 0) & 1, (st->color_mask >> 1) & 1,
-                    (st->color_mask >> 2) & 1, (st->color_mask >> 3) & 1);
-    pgl_glDisable(PGGL_BLEND); /* blending runs in the fragment shader */
+    /* t_993e6fb6: colour mask on ATT0 only; ATT1 (depth mirror) follows
+       depth_on, never the PICA colour mask. */
+    pgl_apply_color_mask(st);
+    if (st->depth_on && st->color_mask != 0xFu) ++pgl_draws_cmask_depth;
+    /* t_a22413f1: hardware depth test/write state for this draw. */
+    pgl_apply_depth_state(st);
+    /* t_8510204b: record the draw's depth timeline entry. */
+    if (pgl_dlog_on) {
+        PglDLogEntry *e = &pgl_dlog[pgl_dlog_n % PGL_DLOG_MAX];
+        e->draw = (unsigned long long)pgl_draws;
+        e->rt_w = st->rt_w; e->rt_h = st->rt_h;
+        e->depth_addr = pica_depth_addr;
+        e->bpp = st->depth_bpp;
+        e->test = st->depth_test; e->write = st->depth_write;
+        e->func = (int)st->depth_func; e->zbuf = st->depth_zbuf;
+        e->on = st->depth_on;
+        e->scale = st->depth_scale; e->off = st->depth_offset;
+        e->zmax = st->depth_zmax;
+        e->box[0] = bx0; e->box[1] = by0; e->box[2] = bx1; e->box[3] = by1;
+        e->syncs_since = (int)pgl_dlog_syncs;
+        pgl_dlog_syncs = 0;
+        ++pgl_dlog_n;
+        ++pgl_dlog_draws;
+    }
+    if (pgl_blend_enabled != 0) {   /* shader blend: fixed-function off */
+        pgl_glDisable(PGGL_BLEND);
+        pgl_blend_enabled = 0;
+    }
     if (gl_blend) {
         /* t_77ac52ce: expressible PICA blend -> fixed-function GL blending.
            No u_dst copy, no per-fragment blend math, and no pipeline drain
-           from reading the render target back into a texture. */
-        pgl_glEnable(PGGL_BLEND);
-        pgl_glBlendFuncSeparate(bl_f[0], bl_f[1], bl_f[2], bl_f[3]);
-        pgl_glBlendEquationSeparate(bl_eq[0], bl_eq[1]);
-        pgl_glBlendColor(st->blend_const[0], st->blend_const[1],
-                         st->blend_const[2], st->blend_const[3]);
+           from reading the render target back into a texture.
+           t_d559a510: the state is PERSISTENT, so it is only (re)applied when
+           the PICA configuration changes — llvmpipe revalidates the rasteriser
+           variant on every per-buffer blend call. */
+        unsigned key[6];
+        int same, k, need;
+        key[0] = st->blend_src_rgb; key[1] = st->blend_dst_rgb;
+        key[2] = st->blend_src_a;   key[3] = st->blend_dst_a;
+        key[4] = st->blend_eq_rgb;  key[5] = st->blend_eq_a;
+        same = (pgl_blend_applied == 1);
+        for (k = 0; k < 6 && same; ++k)
+            if (pgl_blend_key[k] != key[k]) same = 0;
+        for (k = 0; k < 4 && same; ++k)
+            if (pgl_blend_key_const[k] != st->blend_const[k]) same = 0;
+        /* The depth guard only has to be re-established after a non-indexed
+           blend call (those re-arm every draw buffer) — once it is in place,
+           draws that do not change the colour blend state need no GL call. */
+        need = !same || (pgl_blend_depth_guard && !pgl_blend_guard_armed);
+        if (need) {
+            if (!same) {
+                pgl_glBlendFuncSeparate(bl_f[0], bl_f[1], bl_f[2], bl_f[3]);
+                pgl_glBlendEquationSeparate(bl_eq[0], bl_eq[1]);
+                pgl_glBlendColor(st->blend_const[0], st->blend_const[1],
+                                 st->blend_const[2], st->blend_const[3]);
+                pgl_blend_guard_armed = 0;  /* non-indexed call re-armed all */
+            }
+            if (pgl_blend_depth_guard) {
+                /* t_d559a510: COLOR_ATTACHMENT1 is the emulated depth buffer,
+                   not a colour target — it must be REPLACED with frag_z, never
+                   blended against the old depth.  Per-buffer blend state:
+                   index 1 gets (ONE, ZERO, ADD), which is exactly a replace.
+                   (GL 4.5 §17.3.3: blend state is per draw buffer, but the
+                   non-indexed glBlendFuncSeparate/glBlendEquationSeparate are
+                   defined for EVERY draw buffer, so this override has to be
+                   re-established after them.) */
+                if (pgl_glBlendFunci)
+                    pgl_glBlendFunci(1u, PGGL_ONE, PGGL_ZERO);
+                if (pgl_glBlendEquationi)
+                    pgl_glBlendEquationi(1u, PGGL_FUNC_ADD);
+                pgl_blend_guard_armed = 1;
+            }
+            for (k = 0; k < 6; ++k) pgl_blend_key[k] = key[k];
+            for (k = 0; k < 4; ++k) pgl_blend_key_const[k] = st->blend_const[k];
+            pgl_blend_applied = 1;
+            ++pgl_blend_state_sets;
+        }
+        if (pgl_blend_depth_guard) ++pgl_blend_gl_depthfix;
+        if (pgl_blend_enabled != 1) {
+            pgl_glEnable(PGGL_BLEND);
+            pgl_blend_enabled = 1;
+        }
     }
     /* Blend destination: a fragment shader cannot sample the texture it
        renders into, so the draw box's current FBO contents are copied into
@@ -2613,7 +7256,13 @@ static unsigned pica_gl_draw_locked(const PicaGlVertex *verts, unsigned nverts,
             dst_always = (e && e[0] && e[0] != '0') ? 1 : 0;
         }
         dst_read = pgl_blend_dst_read(st);
-        zdst_need = st->depth_on && (st->depth_test || !st->depth_write);
+        /* t_a22413f1 run3: in HARDWARE mode the real depth attachment does the
+           test/write, so no per-draw depth-source copy is needed.  IN-SHADER
+           mode (the default since the operator's Radeon regression) is the
+           pre-fix behaviour and needs the copy exactly when the shader reads
+           the old z: the test runs, or the depth write is off. */
+        zdst_need = pgl_depth_hw ? 0
+                                 : (st->depth_on && (st->depth_test || !st->depth_write));
         /* t_8c05fac8: under framebuffer fetch NO per-draw FBO read happens
            (the shader imageLoads live content); the copy path stays exactly
            as before (DQ8_GL_DSTALWAYS forces it via pgl_fbfetch=0). */
@@ -2688,76 +7337,27 @@ static unsigned pica_gl_draw_locked(const PicaGlVertex *verts, unsigned nverts,
         PGenum bufs[2] = { PGGL_COLOR_ATTACHMENT0, PGGL_COLOR_ATTACHMENT1 };
         pgl_glDrawBuffers(st->depth_on ? 2 : 1, bufs);
     }
-    pgl_glUseProgram(pgl_program);
-    pgl_glUniform2f(pgl_u_rt, (PGfloat)st->rt_w, (PGfloat)st->rt_h);
-    pgl_glUniform1i(pgl_u_mode, st->mode == PICA_GL_TEV ? 1 : 0);
-    pgl_glUniform1i(pgl_u_alpha_test, st->alpha_test ? 1 : 0);
-    pgl_glUniform1i(pgl_u_alpha_func, (PGint)st->alpha_func);
-    pgl_glUniform1f(pgl_u_alpha_ref, st->alpha_ref);
-    pgl_glUniform2f(pgl_u_dst_off, (PGfloat)bx0, (PGfloat)by0);
-    pgl_glUniform1i(pgl_u_dst, 1);
-    pgl_glUniform1i(pgl_u_zdst, 2);
-    /* t_8c05fac8: 1 = the draw may read the value: under framebuffer fetch
-       that is "the blend/depth math consumes it" (imageLoad is always live);
-       under the copy path "the per-draw FBO copy for this box really ran".
-       0 = neutral value (vec4(0)/oldz 0.0) instead of stale texels. */
-    if (pgl_fbfetch) {
-        pgl_glUniform1i(pgl_u_dst_used,
-                        dst_read && !(pgl_skip_mask & PGL_SK_DST) ? 1 : 0);
-        pgl_glUniform1i(pgl_u_zdst_used,
-                        zdst_need && !(pgl_skip_mask & PGL_SK_ZDST) ? 1 : 0);
-    } else {
-        pgl_glUniform1i(pgl_u_dst_used, do_dst ? 1 : 0);
-        pgl_glUniform1i(pgl_u_zdst_used, do_zdst ? 1 : 0);
-    }
-    pgl_glUniform1i(pgl_u_depth_on, st->depth_on ? 1 : 0);
-    pgl_glUniform1i(pgl_u_depth_test, st->depth_test ? 1 : 0);
-    pgl_glUniform1i(pgl_u_depth_write, st->depth_write ? 1 : 0);
-    pgl_glUniform1i(pgl_u_depth_func, (PGint)st->depth_func);
-    pgl_glUniform1i(pgl_u_depth_zbuf, st->depth_zbuf ? 1 : 0);
-    pgl_glUniform1f(pgl_u_depth_scale, st->depth_scale);
-    pgl_glUniform1f(pgl_u_depth_offset, st->depth_offset);
-    pgl_glUniform1f(pgl_u_depth_zmax, st->depth_zmax);
-    pgl_glUniform1i(pgl_u_blend_en, (!gl_blend && st->blend) ? 1 : 0);
-    pgl_glUniform1i(pgl_u_eq_rgb, (PGint)st->blend_eq_rgb);
-    pgl_glUniform1i(pgl_u_eq_a, (PGint)st->blend_eq_a);
-    pgl_glUniform1i(pgl_u_f_src_rgb, (PGint)st->blend_src_rgb);
-    pgl_glUniform1i(pgl_u_f_dst_rgb, (PGint)st->blend_dst_rgb);
-    pgl_glUniform1i(pgl_u_f_src_a, (PGint)st->blend_src_a);
-    pgl_glUniform1i(pgl_u_f_dst_a, (PGint)st->blend_dst_a);
-    pgl_glUniform4f(pgl_u_blend_const, st->blend_const[0], st->blend_const[1],
-                    st->blend_const[2], st->blend_const[3]);
-    if (st->mode == PICA_GL_TEV) {
-        PGint iv[18];
-        unsigned s, j;
-        for (j = 0; j < 18u; ++j) iv[j] = (PGint)st->tev.src_c[j];
-        pgl_glUniform1iv(pgl_u_src_c, 18, iv);
-        for (j = 0; j < 18u; ++j) iv[j] = (PGint)st->tev.mod_c[j];
-        pgl_glUniform1iv(pgl_u_mod_c, 18, iv);
-        for (j = 0; j < 18u; ++j) iv[j] = (PGint)st->tev.src_a[j];
-        pgl_glUniform1iv(pgl_u_src_a, 18, iv);
-        for (j = 0; j < 18u; ++j) iv[j] = (PGint)st->tev.mod_a[j];
-        pgl_glUniform1iv(pgl_u_mod_a, 18, iv);
-        for (j = 0; j < 6u; ++j) iv[j] = (PGint)st->tev.cop[j];
-        pgl_glUniform1iv(pgl_u_cop, 6, iv);
-        for (j = 0; j < 6u; ++j) iv[j] = (PGint)st->tev.aop[j];
-        pgl_glUniform1iv(pgl_u_aop, 6, iv);
-        for (j = 0; j < 6u; ++j) iv[j] = (PGint)st->tev.buf_upd_c[j];
-        pgl_glUniform1iv(pgl_u_buf_upd_c, 6, iv);
-        for (j = 0; j < 6u; ++j) iv[j] = (PGint)st->tev.buf_upd_a[j];
-        pgl_glUniform1iv(pgl_u_buf_upd_a, 6, iv);
-        pgl_glUniform1fv(pgl_u_scale_c, 6, st->tev.scale_c);
-        pgl_glUniform1fv(pgl_u_scale_a, 6, st->tev.scale_a);
-        for (s = 0; s < 6u; ++s)
-            pgl_glUniform4f(pgl_u_const_c + (PGint)s, st->tev.const_c[s][0],
-                            st->tev.const_c[s][1], st->tev.const_c[s][2],
-                            st->tev.const_c[s][3]);
-        pgl_glUniform4f(pgl_u_buf_init, st->tev.buf_init[0], st->tev.buf_init[1],
-                        st->tev.buf_init[2], st->tev.buf_init[3]);
-        pgl_glUniform1i(pgl_u_tex_en, st->tev.tex_en ? 1 : 0);
-    } else {
-        pgl_glUniform1i(pgl_u_tex_en, 0);
-    }
+    /* t_5ddc492f: pick the fragment-shader variant for this draw's shape and
+       upload the uniforms into it.  dst_used/zdst_used are exactly the
+       expressions the uniform block used below. */
+    {
+        int dst_used, zdst_used;
+        if (pgl_fbfetch) {
+            dst_used = (dst_read && !(pgl_skip_mask & PGL_SK_DST)) ? 1 : 0;
+            zdst_used = (zdst_need && !(pgl_skip_mask & PGL_SK_ZDST)) ? 1 : 0;
+        } else {
+            dst_used = do_dst ? 1 : 0;
+            zdst_used = do_zdst ? 1 : 0;
+        }
+        pgl_cur_prog = pgl_spec_select(st, gl_blend, dst_used, zdst_used);
+        pgl_cur_dst_used = dst_used;
+        pgl_cur_zdst_used = zdst_used;
+        /* t_f8f2c1da: second half of the tripwire — the program about to be
+           used must have been generated for the CURRENT depth path. */
+        pgl_spec_modecheck_use(pgl_cur_prog, "draw/use");
+        pgl_prog_use(pgl_cur_prog);
+        pgl_set_uniforms(st, gl_blend, dst_used, zdst_used, (PGint)bx0,
+                         (PGint)by0);    }
     pgl_drain_errors("use-program", NULL);
     if (st->mode == PICA_GL_TEV && st->tev.tex_en) {
         /* Upload cache.  Two identities are recognised:
@@ -2967,8 +7567,194 @@ static unsigned pica_gl_draw_locked(const PicaGlVertex *verts, unsigned nverts,
             pgl_glVertexAttribDivisor(3 + 3u * i, 1);
         }
         ph_t4 = pica_pqt_now_ns(); /* t_8c05fac8: before the draw submit */
-        if (!(pgl_skip_mask & PGL_SK_GEO))
+        /* t_6b81015d: make earlier draws' RT writes visible to this draw's
+           imageLoad of the destination/depth (GL 4.5 §9.3).  Only needed when
+           the shader actually consumes the live image and only once per run of
+           writing draws. */
+        if (pgl_fbfetch && (dst_read || zdst_need))
+            pgl_dst_barrier(bx0, by0, bx1, by1);
+        if (pgl_drawhash_on < 0) {
+            const char *e = getenv("DQ8_GL_DRAWHASH");
+            pgl_drawhash_on = (e && e[0] && e[0] != '0') ? 1 : 0;
+        }
+        if (pgl_drawhash_on && bw && bh) {
+            int dhbox[4];
+            dhbox[0] = bx0; dhbox[1] = by0; dhbox[2] = bx1; dhbox[3] = by1;
+            dh_ok = pgl_dh_box(dhbox, &dh_pre, &dh_pre_sum);
+            pgl_dh_pre_asum = pgl_dh_asum;
+            if (st->depth_on)
+                dh_zok = pgl_dh_zbox(dhbox, &dh_zpre, &dh_zpre_sum);
+            if (pgl_dh_dump_idx == -2) {
+                const char *e = getenv("DQ8_GL_DRAWHASH_DUMP");
+                pgl_dh_dump_idx = (e && *e) ? strtoll(e, NULL, 0) : -1;
+            }
+            if (dh_ok && pgl_dh_dump_idx >= 0 &&
+                pgl_dh_dump_idx == (long long)pgl_draws) {
+                pgl_dh_pre_len = (size_t)bw * bh * 4u;
+                pgl_dh_pre_saved = (unsigned char *)realloc(pgl_dh_pre_saved,
+                                                            pgl_dh_pre_len);
+                if (pgl_dh_pre_saved)
+                    memcpy(pgl_dh_pre_saved, pgl_dh_buf, pgl_dh_pre_len);
+            }
+        }
+        if (!(pgl_skip_mask & PGL_SK_GEO)) {
             pgl_glDrawArraysInstanced(PGGL_TRIANGLES, 0, 3, (PGsizei)ntri);
+            /* t_fa78ea1f: per-draw render-target census (DQ8_GL_DRAWDUMP).
+               Reads the whole attachment back after each draw of the window
+               and prints the dark share of the image plus a 4x4 grid, so a
+               frame that loses the UI can be attributed to the exact draw
+               (or shows that the draws all ran and something else erased
+               them).  Diagnostic only; llvmpipe/radeonsi cost ~1-3 ms/draw. */
+            {
+                static int dd_on = -1;
+                static long long dd_lo, dd_hi;
+                if (dd_on < 0) {
+                    const char *e = getenv("DQ8_GL_DRAWDUMP");
+                    dd_on = (e && e[0] && e[0] != '0') ? 1 : 0;
+                    dd_lo = 0; dd_hi = 1LL << 50;
+                    if (dd_on && e[0] >= '0' && e[0] <= '9') {
+                        dd_lo = strtoll(e, NULL, 0);
+                        dd_hi = strchr(e, '-') ? strtoll(strchr(e, '-') + 1, NULL, 0)
+                                               : dd_lo;
+                    }
+                }
+                if (dd_on && (long long)pgl_draws >= dd_lo &&
+                    (long long)pgl_draws <= dd_hi && st->rt_w && st->rt_h) {
+                    size_t dd_len = (size_t)st->rt_w * st->rt_h * 4u;
+                    unsigned char *dd_buf = (unsigned char *)malloc(dd_len);
+                    if (dd_buf) {
+                        unsigned dd_gx, dd_gy, dd_n = 0, dd_dark = 0;
+                        unsigned dd_g[16];
+                        pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
+                        pgl_glReadPixels(0, 0, (PGsizei)st->rt_w, (PGsizei)st->rt_h,
+                                         PGGL_RGBA, PGGL_UNSIGNED_BYTE, dd_buf);
+                        memset(dd_g, 0, sizeof dd_g);
+                        for (dd_gy = 0; dd_gy < st->rt_h; dd_gy += 8u)
+                            for (dd_gx = 0; dd_gx < st->rt_w; dd_gx += 8u) {
+                                const unsigned char *q =
+                                    dd_buf + ((size_t)dd_gy * st->rt_w + dd_gx) * 4u;
+                                unsigned m = q[0] > q[1] ? (q[0] > q[2] ? q[0] : q[2])
+                                                         : (q[1] > q[2] ? q[1] : q[2]);
+                                unsigned cell = ((dd_gy * 4u) / st->rt_h) * 4u +
+                                                ((dd_gx * 4u) / st->rt_w);
+                                ++dd_n;
+                                if (m <= 16u) { ++dd_dark; ++dd_g[cell]; }
+                            }
+                        fprintf(stderr, "DDUMP n=%llu dark=%.1f g=",
+                                (unsigned long long)pgl_draws,
+                                dd_n ? 100.0 * (double)dd_dark / (double)dd_n : -1.0);
+                        for (dd_gx = 0; dd_gx < 16u; ++dd_gx)
+                            fprintf(stderr, "%s%u", dd_gx ? "," : "", dd_g[dd_gx]);
+                        fputc(10, stderr);
+                        free(dd_buf);
+                    }
+                }
+            }
+            /* t_8510204b: per-draw probe pixels.  For a pixel inside a
+               disputed region this prints, for every draw that changes its
+               colour or depth, the value BEFORE/AFTER and the PICA depth state
+               the draw ran with — the attribution needed to explain why the
+               hardware path keeps geometry the in-shader path rejects.
+               DQ8_GL_PROBE_PX="x,y[;x,y]" (GL/render-target coords),
+               DQ8_GL_PROBE_DRAW="lo-hi" restricts the window. */
+            {
+                static int ppr_n = -1;
+                static int ppr_px[8][2], ppr_lo, ppr_hi;
+                static unsigned char ppr_col[8][4];
+                static float ppr_z[8];
+                static float ppr_az[8];   /* t_8510204b: previous ATT1 z */
+                static int ppr_init;
+                if (ppr_n < 0) {
+                    const char *e = getenv("DQ8_GL_PROBE_PX");
+                    const char *w2 = getenv("DQ8_GL_PROBE_DRAW");
+                    ppr_n = 0;
+                    ppr_lo = ppr_hi = -1;
+                    if (w2 && w2[0]) {
+                        ppr_lo = (int)strtol(w2, NULL, 0);
+                        ppr_hi = (strchr(w2, '-') != NULL)
+                                 ? (int)strtol(strchr(w2, '-') + 1, NULL, 0)
+                                 : ppr_lo;
+                    }
+                    while (e && *e && ppr_n < 8) {
+                        int x = (int)strtol(e, NULL, 0);
+                        char *c = strchr(e, ',');
+                        int y = c ? (int)strtol(c + 1, NULL, 0) : 0;
+                        ppr_px[ppr_n][0] = x; ppr_px[ppr_n][1] = y;
+                        ++ppr_n;
+                        c = c ? strchr(c + 1, ';') : NULL;
+                        e = c ? c + 1 : NULL;
+                    }
+                }
+                if (ppr_n > 0 &&
+                    (long long)pgl_draws >= (long long)ppr_lo &&
+                    (long long)pgl_draws <= (long long)ppr_hi) {
+                    int k;
+                    for (k = 0; k < ppr_n; ++k) {
+                        unsigned char cb[4] = {0, 0, 0, 0}, c2[4] = {0, 0, 0, 0};
+                        float z2 = 0.0f, az = 0.0f;
+                        pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
+                        pgl_glReadPixels(ppr_px[k][0], ppr_px[k][1], 1, 1,
+                                         PGGL_RGBA, PGGL_UNSIGNED_BYTE, cb);
+                        if (pgl_depth_hw) {
+                            pgl_glReadPixels(ppr_px[k][0], ppr_px[k][1], 1, 1,
+                                             PGGL_DEPTH_COMPONENT, PGGL_FLOAT, &z2);
+                            pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT1);
+                            pgl_glReadPixels(ppr_px[k][0], ppr_px[k][1], 1, 1,
+                                             PGGL_RED, PGGL_FLOAT, &az);
+                            pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
+                            /* t_8510204b: the two depth surfaces must agree.
+                               A divergence means the D32F attachment the
+                               rasterizer tests is not the depth the guest
+                               mirror holds (the shadow/resync disagreement). */
+                            if ((double)z2 * 16777216.0 - (double)az > 16.0 ||
+                                (double)az - (double)z2 * 16777216.0 > 16.0)
+                                fprintf(stderr, "GL ZDIVERGE d=%llu px=%d,%d "
+                                        "attach_z=%.1f att1_z=%.1f col=%u,%u,%u\n",
+                                        (unsigned long long)pgl_draws,
+                                        ppr_px[k][0], ppr_px[k][1],
+                                        (double)z2 * 16777216.0, (double)az,
+                                        cb[0], cb[1], cb[2]);
+                        }
+                        c2[0] = cb[0]; c2[1] = cb[1]; c2[2] = cb[2]; c2[3] = cb[3];
+                        if (!ppr_init ||
+                            memcmp(c2, ppr_col[k], 4) != 0 || z2 != ppr_z[k]) {
+                            /* t_8510204b: zprev/znew + the draw's PICA compare
+                               test whether the rasterizer's keep/reject
+                               decision is consistent with PICA's integer
+                               compare on the very same numbers.  A "passed"
+                               colour change with !(znew <cmp> zprev) is the
+                               hardware path accepting a fragment the PICA
+                               compare rejects. */
+                            fprintf(stderr,
+                                "GL PRB d=%llu px=%d,%d col=%u,%u,%u,%u "
+                                "z=%.9f zprev=%.1f znew=%.1f on=%d test=%d "
+                                "wr=%d fn=%d zb=%d sc=%g off=%g zmax=%g "
+                                "box=%d,%d..%d,%d bpp=%u\n",
+                                (unsigned long long)pgl_draws, ppr_px[k][0],
+                                ppr_px[k][1], cb[0], cb[1], cb[2], cb[3],
+                                (double)z2, (double)ppr_az[k], (double)az,
+                                st->depth_on, st->depth_test,
+                                st->depth_write, (int)st->depth_func,
+                                st->depth_zbuf, (double)st->depth_scale,
+                                (double)st->depth_offset, (double)st->depth_zmax,
+                                bx0, by0, bx1, by1, st->depth_bpp);
+                            memcpy(ppr_col[k], c2, 4);
+                            ppr_z[k] = z2;
+                        }
+                        ppr_az[k] = az;
+                    }
+                    ppr_init = 1;
+                }
+            }
+            /* t_5ddc492f: DQ8_GL_SPEC_VERIFY=n - re-render this draw with the
+               generic program and compare the box hashes. */
+            pgl_spec_verify(st, pgl_cur_prog, gl_blend, pgl_cur_dst_used,
+                            pgl_cur_zdst_used, bx0, by0, bx1, by1, ntri);
+        }
+        if (ntri) {
+            pgl_rt_wrote = 1;
+            pgl_wrect_add(bx0, by0, bx1, by1);
+        }
         {
             /* Diagnostic (t_bc6b4eb7): what does GL actually hold for the
                first draws — divisor state + the bytes on the GL side vs what
@@ -3003,6 +7789,34 @@ static unsigned pica_gl_draw_locked(const PicaGlVertex *verts, unsigned nverts,
         }
     }
     pgl_drain_errors("draw-arrays", NULL);
+    if (dh_ok) {
+        int dhbox[4];
+        dhbox[0] = bx0; dhbox[1] = by0; dhbox[2] = bx1; dhbox[3] = by1;
+        if (pgl_dh_box(dhbox, &dh_post, &dh_post_sum)) {
+            if (dh_zok)
+                dh_zok = pgl_dh_zbox(dhbox, &dh_zpost, &dh_zpost_sum);
+            fprintf(stderr, "GLHASH draw=%llu tris=%u mode=%d blend=%d glb=%d "
+                    "src=%u,%u dst=%u,%u eq=%u,%u a=%d/%u/%.0f mask=%X "
+                    "depth=%d/%d/%d box=%d,%d..%d,%d pre=%016llx post=%016llx "
+                    "pre_sum=%llu post_sum=%llu zpre=%016llx zpost=%016llx "
+                    "zpre_sum=%llu zpost_sum=%llu asum=%llu/%llu\n",
+                    (unsigned long long)pgl_draws, ntri, st->mode, st->blend,
+                    gl_blend, st->blend_src_rgb, st->blend_src_a,
+                    st->blend_dst_rgb, st->blend_dst_a, st->blend_eq_rgb,
+                    st->blend_eq_a, st->alpha_test, st->alpha_func,
+                    (double)st->alpha_ref, st->color_mask, st->depth_test,
+                    st->depth_write, st->depth_on, bx0, by0, bx1, by1,
+                    dh_pre, dh_post, dh_pre_sum, dh_post_sum,
+                    dh_zpre, dh_zpost, dh_zpre_sum, dh_zpost_sum,
+                    pgl_dh_pre_asum, pgl_dh_asum);
+            if (pgl_dh_dump_idx >= 0 &&
+                pgl_dh_dump_idx == (long long)pgl_draws && pgl_dh_pre_saved) {
+                unsigned dw = (unsigned)(bx1 - bx0 + 1), dh = (unsigned)(by1 - by0 + 1);
+                pgl_dh_write_ppm("pre", pgl_dh_pre_saved, dw, dh);
+                pgl_dh_write_ppm("post", pgl_dh_buf, dw, dh);
+            }
+        }
+    }
     ph = pica_pqt_now_ns();
     ++pgl_ph_n;
     pgl_ph_setup_ns += ph_t1 - ph_t0;
@@ -3011,8 +7825,24 @@ static unsigned pica_gl_draw_locked(const PicaGlVertex *verts, unsigned nverts,
     pgl_ph_u_ns += ph_t3 - ph_t2;
     pgl_ph_vbo_ns += ph_t4 - ph_t3;
     pgl_ph_sub_ns += ph - ph_t4;
+    /* t_5ddc492f: per-shape histogram + per-variant timing (GLPHASE) */
+    {
+        unsigned long long dns = ph - ph_t4;
+        unsigned long long px = (unsigned long long)bw * bh;
+        pgl_shape_add(pgl_shape_mask(st, gl_blend, pgl_cur_dst_used,
+                                     pgl_cur_zdst_used), px, dns);
+        if (pgl_cur_prog) {
+            ++pgl_cur_prog->draws;
+            pgl_cur_prog->px += px;
+            pgl_cur_prog->ns += dns;
+            ++pgl_spec_draws;
+        }
+    }
     pgl_ph_report();
-    if (st->depth_on && !pgl_split_cur) pgl_zdirty = 1;
+    if (st->depth_on && !pgl_split_cur) {
+        pgl_zdirty = 1;
+        if (st->depth_write) pgl_zwrote = 1;
+    }
 
     if (bw && bh && !pgl_split_cur) {
         if (bx0 < pgl_drawn_x0) pgl_drawn_x0 = bx0;
@@ -3028,6 +7858,11 @@ static unsigned pica_gl_draw_locked(const PicaGlVertex *verts, unsigned nverts,
         pica_gl_flush_locked(host, 0);
     }
     ++pgl_draws;
+    /* t_599a43f7: per-frame evidence that the hardware depth path was asked to
+       do per-fragment depth work (the frame guard needs it to tell the game's
+       own fade-to-black from a depth path that rejects every fragment). */
+    if (pgl_depth_hw && st->depth_on && st->depth_test && ntri)
+        ++pgl_frame_depth_draws;
     return ntri;
 }
 
@@ -3172,13 +8007,37 @@ static void pica_gl_split_sync(void) {
 /* ---- push-time refresh capture (GUEST thread) ---------------------------
    Mirrors pgl_refresh/pgl_refresh_depth's decision tree, but every guest
    memory read happens HERE (at draw time) and only the result crosses the
-   queue: clear colour, changed 8x8 block RGBA bytes, or a full decode. */
+   queue: clear colour, changed 8x8 block RGBA bytes, or a full decode.
+
+   t_6f9e3fed: the capture now uses the SAME guest-write gate as the
+   synchronous path (t_477973bb, pgl_refr_needed) instead of memcmp'ing the
+   whole colour surface on every enqueue.  Measured on the field scene, the
+   ungated split path paid ref_ms 134.9/s versus 33.2/s for the gated
+   synchronous path — i.e. the async path was paying for the very compare the
+   synchronous path had just removed, which is most of why DQ8_SPLIT_GL=1 did
+   not pay off.  pgl_refr_needed() also arms the guest-write watch ranges
+   (pgl_watch_lo/hi, pgl_zwatch_lo/hi), so a guest store into the render
+   target still raises pgl_guest_dirty and forces the compare next enqueue:
+   the gate removes the compare, not the detection.
+   DQ8_REFRESH_DIRTY=0 restores the per-enqueue compare for both paths. */
 static int pgl_split_capture_refresh(PglSplitOp *op, const PicaGlState *st,
                                      const PicaGlHost *host) {
     const unsigned char *raw = NULL;
     unsigned len = 0, bpp = st->rt_bpp ? st->rt_bpp : 4u;
-    int all = pgl_force_full;
-    if (!host->rt_raw(host->user, &raw, &len)) return 0;
+    int all, need;
+    need = pgl_refr_needed(st, host, &raw, &len);
+    if (need < 0) return 0;
+    op->ref_kind = PGL_REF_NONE;
+    op->zref_kind = PGL_ZREF_NONE;
+    if (!need) {              /* guest did not touch the RT: nothing to sync */
+        ++pgl_scap_skip;
+        pgl_guest_dirty = 0;
+        return 1;
+    }
+    ++pgl_scap_need;
+    if (pgl_force_full) ++pgl_scap_ff;
+    if (pgl_guest_dirty) ++pgl_scap_gd;
+    all = pgl_force_full;
     if (!pgl_shadow || pgl_shadow_len != len || pgl_shadow_w != (int)st->rt_w ||
         pgl_shadow_h != (int)st->rt_h || pgl_shadow_bpp != bpp) {
         unsigned char *grown = (unsigned char *)realloc(pgl_shadow, len ? len : 1u);
@@ -3290,6 +8149,7 @@ static int pgl_split_capture_refresh(PglSplitOp *op, const PicaGlState *st,
         memcpy(pgl_shadow, raw, len);
         pgl_force_full = 0;
     }
+    pgl_shadow_src = raw;   /* t_6f9e3fed: the gate above needs this */
     /* ---- depth region (same decision tree as pgl_refresh_depth) ---- */
     op->zref_kind = PGL_ZREF_NONE;
     if (st->depth_on && host->depth_raw) {
@@ -3340,7 +8200,9 @@ static int pgl_split_capture_refresh(PglSplitOp *op, const PicaGlState *st,
             memcpy(pgl_zshadow, zraw, zlen);
             pgl_zforce_full = 0;
         }
+        pgl_zshadow_src = zraw;   /* t_6f9e3fed: gate state for the z region */
     }
+    pgl_guest_dirty = 0;   /* the guest bytes above have been consumed */
     return 1;
 }
 
@@ -3352,10 +8214,8 @@ static int pgl_split_apply_refresh(const PicaGlState *st) {
     case PGL_REF_CLEAR:
         pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_fbo);
         pgl_obj_used |= 8u;
-        pgl_glColorMask(1, 1, 1, 1);
-        pgl_glClearColor(op->ref_col[0] / 255.0f, op->ref_col[1] / 255.0f,
-                         op->ref_col[2] / 255.0f, op->ref_col[3] / 255.0f);
-        pgl_glClear(PGGL_COLOR_BUFFER_BIT);
+        pgl_clear_color_only(op->ref_col[0] / 255.0f, op->ref_col[1] / 255.0f,
+                             op->ref_col[2] / 255.0f, op->ref_col[3] / 255.0f);
         pgl_drain_errors("rt-clear", NULL);
         break;
     case PGL_REF_BLOCKS: {
@@ -3395,6 +8255,22 @@ static int pgl_split_apply_refresh(const PicaGlState *st) {
             pgl_glColorMask(1, 1, 1, 1);
             pgl_glDrawBuffers(2, zbufs);
             pgl_glClearBufferfv(PGGL_COLOR, 1, v);
+            /* t_a22413f1: real depth attachment, same value scaled.
+               t_599a43f7 — ROOT CAUSE of the operator's black screen: this
+               worker-thread twin of the z-clear used to call glClearBufferfv
+               directly, WITHOUT forcing the depth write mask.  The previous
+               draw leaves glDepthMask(0) behind (PICA depth-write-off), and
+               glClearBufferfv on a depth attachment is gated by that mask, so
+               the frame's depth clear cleared NOTHING: the attachment kept the
+               stale depth, every fragment failed GL_LESS and the 3D frame came
+               out ~99% dark with DQ8_SPLIT_GL=1 + DQ8_GL_DEPTH_ATTACH=1, while
+               the same build with DQ8_SPLIT_GL=0 rendered fine.  Both threads
+               now go through pgl_depth_attachment_clear(). */
+            if (pgl_depth_hw) {
+                pgl_depth_attachment_clear(
+                    (float)op->zref_z * (1.0f / 16777216.0f));
+                ++pgl_depth_syncs;   /* the frame guard needs this on the worker */
+            }
             if (pgl_drain_errors("z-clear", NULL) != 0)
                 pgl_request_resync(); /* guest re-sends a full z refresh */
         }
@@ -3405,6 +8281,20 @@ static int pgl_split_apply_refresh(const PicaGlState *st) {
         pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_R32F, (PGsizei)st->rt_w,
                          (PGsizei)st->rt_h, 0, PGGL_RED, PGGL_FLOAT,
                          op->zref_full);
+        /* t_a22413f1: mirror into the real depth attachment (scaled). */
+        if (pgl_depth_hw && op->zref_full) {
+            size_t n = (size_t)st->rt_w * st->rt_h, k;
+            float *scaled = (float *)malloc(n * sizeof(float));
+            if (!scaled) { pgl_request_resync(); break; }
+            for (k = 0; k < n; ++k) scaled[k] = op->zref_full[k] * (1.0f / 16777216.0f);
+            pgl_glBindTexture(PGGL_TEXTURE_2D, pgl_dtex);
+            pgl_obj_used |= 512u;
+            pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_DEPTH_COMPONENT32F,
+                             (PGsizei)st->rt_w, (PGsizei)st->rt_h, 0,
+                             PGGL_DEPTH_COMPONENT, PGGL_FLOAT, scaled);
+            free(scaled);
+            ++pgl_depth_syncs;
+        }
         pgl_drain_errors("z-upload", NULL);
         break;
     }
@@ -3419,7 +8309,7 @@ static void pgl_split_do_draw(PglSplitOp *op) {
     if (!pica_gl_draw_locked(op->verts, op->nverts, &op->st, &pgl_split_host))
         ++pgl_split_draw_fail;
     pgl_split_cur = NULL;
-    ++pgl_draws;
+    /* pgl_draws is incremented by draw_locked itself (worker-side). */
 }
 
 /* Worker: execute one FLUSH op = read the drawn box back into owned buffers.
@@ -3450,6 +8340,12 @@ static void pgl_split_do_flush(PglSplitOp *op) {
     }
     pgl_dump_snap("color_fbo_last.raw", op->fl_px, (size_t)w * h * 4u);
     pgl_dump_box("color_fbo_last.box", x0, y0, x1, y1);
+    /* t_599a43f7: the frame guard must exist on the SPLIT path too.  It used
+       to be called only from the synchronous flush, so the operator — who runs
+       DQ8_SPLIT_GL=1 — had no black-screen defence at all.  Runs on the worker
+       (the thread that owns the rendering context). */
+    pgl_frame_guard(op->fl_px, w, h);
+    pgl_frame_depth_draws = 0;
     if (op->fl_have_depth) {
         op->fl_z = pgl_rb_depth(x0, y0, x1, y1);
         if (!op->fl_z) op->fl_rb_failed = 1;
@@ -3625,7 +8521,10 @@ static unsigned pica_gl_draw_split(const PicaGlVertex *verts, unsigned nverts,
         if (bx1 > pgl_drawn_x1) pgl_drawn_x1 = bx1;
         if (by1 > pgl_drawn_y1) pgl_drawn_y1 = by1;
     }
-    if (st->depth_on) pgl_zdirty = 1;
+    if (st->depth_on) {
+        pgl_zdirty = 1;
+        if (st->depth_write) pgl_zwrote = 1;
+    }
     pgl_pending = 1;
     pgl_split_push(op);
     t1 = pica_pqt_now_ns();
@@ -3658,8 +8557,9 @@ static void pgl_split_flush(const PicaGlHost *host) {
     op->kind = PGL_OP_FLUSH;
     op->fl_box[0] = x0; op->fl_box[1] = y0;
     op->fl_box[2] = x1; op->fl_box[3] = y1;
-    op->fl_have_depth = pgl_zdirty;
+    op->fl_have_depth = pgl_zdirty && (pgl_zwrote || !pgl_zskip_on());
     pgl_zdirty = 0; /* mirror pica_gl_flush_depth_locked's clear */
+    pgl_zwrote = 0;
     pgl_split_push(op);
     {   /* condvar barrier: block until this op's read-back is done */
         pthread_mutex_lock(&pgl_sq_mu);
@@ -3674,7 +8574,16 @@ static void pgl_split_flush(const PicaGlHost *host) {
         return;
     }
     pgl_wb_color(host, have_raw, op->fl_px, x0, y0, x1, y1);
-    if (op->fl_z) pgl_wb_depth(host, have_raw, op->fl_z, w, h, x0, y0, x1, y1);
+    if (op->fl_z) {
+        /* t_8df70ad4: DQ8_GL_ZWB=0 gates the split path too, so the knob is
+           not silently inert under DQ8_SPLIT_GL=1.  Same semantics as the
+           batched path: skip the guest store, keep the attachment. */
+        ++pgl_fl_zn;
+        if (pgl_zwb())
+            pgl_wb_depth(host, have_raw, op->fl_z, w, h, x0, y0, x1, y1);
+        else
+            ++pgl_fl_zskip;
+    }
     ++pgl_flushes;
     if (pgl_debug && (pgl_flushes <= 8u || (pgl_flushes % 200u) == 0u))
         fprintf(stderr, "GL debug: split flush #%llu box=%d,%d..%d,%d rt=%dx%d\n",

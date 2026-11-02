@@ -16,7 +16,9 @@
  * Exit code 0 = all checks passed.
  */
 #define DQ8_ENABLE_GL
-#define _POSIX_C_SOURCE 199309L
+/* _DEFAULT_SOURCE (not _POSIX_C_SOURCE): defining _POSIX_C_SOURCE narrows the
+   glibc exposure below what frame_prof.c needs (sysconf(_SC_CLK_TCK)). */
+#define _DEFAULT_SOURCE 1
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +26,8 @@
 #include <math.h>
 #include <limits.h>
 #include <time.h>
+#include <unistd.h> /* frame_prof.c: sysconf(_SC_CLK_TCK) (the runtime's prelude
+                       provides this; the test TU has to as well) */
 
 #include "../src/pica_gl.c"
 
@@ -85,7 +89,7 @@ static int pica_sample_tex0(float u, float v,
 }
 static void pica_bind_framebuffer(void) {}
 static void pica_bind_depth(void) {}
-static int setenv(const char *name, const char *value, int overwrite);
+static void pica_dump_current_cmdlist(unsigned count) { (void)count; }
 /* diagnostics / depth stubs: logging only, depth always passes and never
    writes (the differential cases keep depth off) */
 static float dq8_layer_t(void) { return 0.0f; }
@@ -108,6 +112,7 @@ static float pica_fragment_depth(float zw, float iw, float scale, float offset) 
 static float pica_draw_prim_a = 1.0f, pica_draw_tev_a = 1.0f;
 static int pica_rect_src_needed(void) { return 0; }
 
+#include "../src/frame_prof.c"
 #include "../src/pica_vs.c"
 
 /* ---- harness ---- */

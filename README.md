@@ -72,14 +72,44 @@ this repository and must never be committed to it.**
 
 ## Building
 
+There are two profiles. They produce the same generated C and differ in one flag: the
+optimisation level of the recompiled guest code.
+
 ```sh
-# Generate the translated C from the game code (the recompilation step)
-# and build the runner in one pass:
+# Development profile — recompiled guest code at -O0.
+# Incremental rebuilds take seconds, a full one about 2 minutes.
 BUILD_JOBS=$(nproc) bash tools/build_split.sh target/dq8
+
+# Release profile — recompiled guest code at -O1.
+# A full build takes about 2 hours; see the numbers below before you use it.
+BUILD_JOBS=$(nproc) bash tools/build_release.sh target/dq8-rel
 ```
 
-The build script regenerates the interpreter C from `DQ8.code`, splits it into translation units and
+The build script regenerates the C from `DQ8.code`, splits it into 36 translation units and
 compiles everything with Clang. Unchanged TUs are reused, so incremental rebuilds are fast.
+
+### Why `-O1` is a separate profile
+
+Measured on a Radeon RX 580, field scene, 25 s per run, interleaved:
+
+| | dev (`-O0`) | release (`-O1`) |
+|---|---:|---:|
+| guest time per frame | 12.12 ms | **10.70 ms** (−11.7%) |
+| p90 frame time | 43.4 ms | 37.2 ms |
+| frames above 33.4 ms | 37–40% | 27–31% |
+| binary size | 171 MB | 42 MB |
+| full rebuild | ~2 min | **~2 hours** |
+
+The win is real but the build cost is brutal, because one translation unit (`dq8_part_039`,
+the densest page of translated code) accounts for roughly 50 minutes of the `-O1` build on its
+own. Day-to-day iteration therefore stays on `-O0`; `-O1` is for releases and measurement runs.
+
+### Object cache and switching profiles
+
+Both profiles share one object directory (`target/dq8-split/obj`). Switching profiles
+invalidates all 36 guest TUs, so the first build after a switch is always a full one. If you
+need to build both profiles at the same time, use two separate checkouts (or `git worktree`),
+otherwise they will thrash each other's cache.
 
 ---
 
@@ -155,7 +185,9 @@ All runtime behaviour is controlled by `DQ8_*` environment variables. Everything
 | `DQ8_S1_CFG_END=...` | end addresses for the S1 region list |
 | `DQ8_USER_DATA_DIR=DIR` | where the game's save/ExtData lives (default: `userdata/`) |
 | `DQ8_GUEST_TIME=...` | guest clock pacing control |
-| `DQ8_IDLE_THROTTLE=...` | idle-frame throttling control |
+| `DQ8_VBLANK_WALLCLOCK=1` | drive the 60 Hz vblank cadence from the wall clock instead of the render loop (default; keeps the guest clock correct on slow GPUs) |
+| `DQ8_IDLE_THROTTLE=...` | idle-frame throttling control (only arms on a byte-static, input-calm screen; `0` disables it entirely) |
+| `DQ8_FRAMEPROF=1` | per-frame breakdown to stderr (`total/guest/gl/present/audio/idle`) — the first thing to reach for when something is slow |
 | `DQ8_STACK_NO_RELOCATE=1` | disable guest thread-stack relocation |
 | `DQ8_STRICT_NULL_CALLBACK=1` | strict NULL-callback trapping (debugging) |
 

@@ -540,9 +540,26 @@ static int savestate_read(const char *path, uint32_t *pc_out, uint32_t *r_out,
     /* Timing bases restored from the state are wall-clock values of the
        saving process: rebase the ones that gate pacing so the guest does not
        see a burst of "already due" deadlines. */
-    gsp_next_vblank_ns = host_monotonic_ns();
-    native_hid_next_update = host_monotonic_ns();
-    dsp_next_frame_ns = host_monotonic_ns();
+    if (dq8_det_mode) {
+        /* DETERMINISTIC (t_115d297c): the guest clock is virtual
+           (base + idle + retired * ns_per_step), while host_monotonic_ns()
+           is host UPTIME.  Anchoring the pacing deadlines there put the next
+           vblank hours into the virtual future, so a reloaded guest waited
+           for a frame that the virtual chain could not reach: observed as
+           "main retires 0 instructions, vblanks=0" with the GSP relay event
+           parked forever (t_115d297c).  Arm the chain one period ahead on
+           the virtual clock instead; the cadence is then a pure function of
+           the state, identical for every run that loads it. */
+        uint64_t vnow = dq8_guest_now_ns();
+        gsp_next_vblank_ns = vnow + GSP_VBLANK_NS;
+        native_hid_next_update = vnow;
+        dsp_next_frame_ns = vnow;
+        guest_next_host_poll_ns = 0;
+    } else {
+        gsp_next_vblank_ns = host_monotonic_ns();
+        native_hid_next_update = host_monotonic_ns();
+        dsp_next_frame_ns = host_monotonic_ns();
+    }
     /* A held button from the saving run must not stick in the loaded one. */
     native_hid_buttons = 0;
     native_hid_previous = 0;

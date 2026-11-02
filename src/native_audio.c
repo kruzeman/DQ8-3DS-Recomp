@@ -20,17 +20,37 @@
 #define DSP_OFF_FRAME_COUNTER 0x7FFEu
 #define DSP_NUM_SOURCES 24u
 #define DSP_MAX_DECODED 8000000u
-#define DSP_QUEUE_CAPACITY 8u
-#define DSP_COMPLETION_CAPACITY 16u
+/* Queue depths are sized so a main-loop stall never stalls the sink: they hold
+ * the frames the pacer produces while the guest loop is away (DSP_QUEUE_CAPACITY
+ * * 4.888 ms = 156 ms of input backlog per worker, DSP_COMPLETION_CAPACITY *
+ * 4.888 ms = 1.25 s of uncommitted completion results). */
+#define DSP_QUEUE_CAPACITY 32u
+#define DSP_COMPLETION_CAPACITY 256u
 #define DSP_LATENCY_SAMPLES 65536u
 #define DSP_MUSIC_SOURCE 1u
+/* DSP pacer (t_d808299b): frames are produced on their own wall-clock thread,
+ * never gated by the guest/main loop.  Prefill = sink lead after (re)start. */
+#define DSP_PREFILL_FRAMES 8u
+/* Sink lead repair (t_37438ae5): how many frames the pacer may produce in one
+ * catch-up burst to rebuild the device queue after a stall. */
+#define DSP_SINK_MAX_CATCHUP 24u
+#define DSP_PACER_CORE 5u
+#define DSP_TEMPLATE_CAPACITY 16u
+#define DSP_TRACE_FRAMES 204u        /* ~1 s of DSP frames between trace lines */
 
-static int dsp_audio_on;
-static uint64_t dsp_next_frame_ns;
+static _Atomic int dsp_audio_on;     /* written by the guest service path */
+static _Atomic uint64_t dsp_next_frame_ns; /* pacer cadence, main-loop wake hint */
 static uint64_t dsp_frames_out;
 static uint64_t dsp_sources_started, dsp_sources_finished;
+/* Guest DSP state revision.  Every dirty config word the parse consumes and
+ * every buffer it snapshots bumps the counter; the harvest only builds a new
+ * template when the revision moved, so the common tick is a single compare. */
+static uint64_t dsp_guest_progress, dsp_guest_harvested;
 static float dsp_master_volume, dsp_aux_volume[2];
 static int guest_memory_range(uint32_t, uint64_t, uint32_t *);
+/* Defined with the DSP pacer section; shutdown joins it before the worker
+ * sentinels go out so the pacer can never push into a dead queue. */
+static void dsp_pacer_stop_and_join(void);
 
 /* Source words and buffer payloads are copied only on the guest thread. */
 typedef struct {
@@ -209,6 +229,7 @@ static int dsp_enqueue(unsigned i, uint32_t region, const DspPending *input) {
     }
     if (!dsp_copy_pending(i, region, &copy)) return 0;
     s->pending[s->pending_count++] = copy;
+    ++dsp_guest_progress;
     return 1;
 }
 static int dsp_parse_source_config(unsigned i, uint32_t cfg) {
@@ -298,6 +319,7 @@ static int dsp_parse_source_config(unsigned i, uint32_t cfg) {
         dsp_w16(cfg + 74u, 0);
     }
     dsp_w32(cfg, 0);
+    ++dsp_guest_progress;
     return 1;
 snapshot_failed:
     while (s->pending_count > old_pending_count)
@@ -358,6 +380,32 @@ static char dsp_wav_path[512];
 static unsigned dsp_sdl_dev;
 #endif
 static int dsp_out_init_done;
+/* t_37438ae5 crackle instrumentation.  DQ8_TRACE_AUDIO_Q=1 emits one compact
+ * line per mixed quantum (AQ) plus an ASTARVE line whenever an enabled source
+ * runs out of guest buffers mid-quantum (guest-side starvation), so a click
+ * can be attributed to the sink (queue depth) or to the source (refill late).
+ * DQ8_TRACE_AUDIO_QLOW sets the "sink low" threshold in microseconds. */
+static int dq8_trace_audio_q;
+static uint64_t dsp_src_starve_total;      /* enabled source ran dry mid-frame */
+static uint64_t dsp_src_starve[24];        /* per source */
+static uint64_t dsp_sink_low_total;        /* quanta submitted with < QLOW lead */
+static uint64_t dsp_sink_low_thresh_us = 2000u;
+/* t_37438ae5 sink hardening.  The device queue only ever held the 8-frame
+ * (39 ms) start prefill: one 100-200 ms process stall drained it and NOTHING
+ * rebuilt the lead afterwards, so from then on every scheduler hiccup cut the
+ * device queue -> the crackle the operator hears while the game runs slowly.
+ * The sink now (a) publishes its queue depth, (b) asks the pacer for a lead
+ * refill when it dips under the target, (c) re-arms the prefill after a real
+ * underrun, and (d) clamps latency at the ceiling. */
+static _Atomic uint64_t dsp_sink_ahead_ns;     /* last published device lead */
+static _Atomic int dsp_sink_reseed;            /* underrun: rebuild the lead */
+static uint64_t dsp_sink_underruns;            /* pushes that found an empty device queue */
+static uint64_t dsp_sink_reseeds;              /* prefill re-arms after an underrun */
+static uint64_t dsp_sink_lead_refills;         /* pacer catch-up bursts */
+static uint64_t dsp_sink_lead_holds;           /* production pauses (lead overshoot) */
+static uint64_t dsp_sink_target_ns = 60000000ull;   /* 60 ms lead */
+static uint64_t dsp_sink_ceiling_ns = 250000000ull; /* 250 ms max queued */
+static uint32_t dsp_sink_target_frames = 12u;       /* target in DSP quanta */
 static void dsp_wav_update_header(void) {
     uint8_t h[44];
     uint32_t bytes = (uint32_t)(dsp_wav_frames * DSP_FRAME_SAMPLES * 4u), riff = 36u + bytes, i;
@@ -381,6 +429,26 @@ static void dsp_audio_out_init(void) {
     const char *wav;
     if (dsp_out_init_done) return;
     dsp_out_init_done = 1;
+    {
+        const char *q = getenv("DQ8_TRACE_AUDIO_Q");
+        const char *qlow = getenv("DQ8_TRACE_AUDIO_QLOW");
+        const char *tgt = getenv("DQ8_AUDIO_SINK_TARGET_MS");
+        const char *ceil = getenv("DQ8_AUDIO_SINK_CEILING_MS");
+        dq8_trace_audio_q = q && q[0] && q[0] != '0';
+        if (qlow && qlow[0]) dsp_sink_low_thresh_us = strtoull(qlow, NULL, 10);
+        if (tgt && tgt[0]) dsp_sink_target_ns = strtoull(tgt, NULL, 10) * 1000000ull;
+        if (ceil && ceil[0]) dsp_sink_ceiling_ns = strtoull(ceil, NULL, 10) * 1000000ull;
+        if (dsp_sink_target_ns / DSP_FRAME_NS > 32u) dsp_sink_target_ns = 32u * DSP_FRAME_NS;
+        dsp_sink_target_frames = (uint32_t)(dsp_sink_target_ns / DSP_FRAME_NS);
+        if (dsp_sink_target_frames < 4u) dsp_sink_target_frames = 4u;
+        if (dsp_sink_target_frames > 32u) dsp_sink_target_frames = 32u;
+        fprintf(stderr, "host audio: sink lead target %llu us (%u frames), ceiling %llu us\n",
+                (unsigned long long)(dsp_sink_target_ns / 1000u), dsp_sink_target_frames,
+                (unsigned long long)(dsp_sink_ceiling_ns / 1000u));
+        if (dq8_trace_audio_q)
+            fprintf(stderr, "host audio: per-quantum trace on (sink-low threshold %llu us)\n",
+                    (unsigned long long)dsp_sink_low_thresh_us);
+    }
     wav = getenv("DQ8_AUDIO_DUMP");
     if (wav && wav[0]) {
         snprintf(dsp_wav_path, sizeof dsp_wav_path, "%s", wav);
@@ -431,16 +499,21 @@ static uint64_t dsp_audio_out_push(const int16_t *pcm) {
     if (dsp_sdl_dev) {
         uint32_t queued = SDL_GetQueuedAudioSize(dsp_sdl_dev);
         queue_ahead_ns = ((uint64_t)queued * 1000000000ull) / (DSP_RATE * 4u);
+        atomic_store_explicit(&dsp_sink_ahead_ns, queue_ahead_ns, memory_order_relaxed);
         /* A late refill is not an underrun. Track an empty SDL queue separately;
          * count a content gap only between adjacent non-silent output frames. */
         if (dsp_audio_sdl_has_queued_audio) {
             ++dsp_audio_sink_checks;
             if (queued == 0u) {
                 ++dsp_audio_sink_empty;
+                ++dsp_sink_underruns;
+                /* The device ran dry: arm a prefill so the pacer rebuilds the
+                 * lead instead of leaving the sink permanently on the edge. */
+                atomic_store_explicit(&dsp_sink_reseed, 1, memory_order_relaxed);
                 if (dsp_audio_previous_frame_active && frame_active) ++dsp_audio_content_gaps;
             }
         }
-        if (queued <= DSP_RATE * 4u) {
+        if (queue_ahead_ns <= dsp_sink_ceiling_ns) {
             if (SDL_QueueAudio(dsp_sdl_dev, pcm, DSP_FRAME_SAMPLES * 4u) != 0) ++dsp_audio_sink_drops;
             else {
                 dsp_audio_sdl_has_queued_audio = 1;
@@ -645,6 +718,17 @@ typedef struct {
      * re-decoded with carried history instead of reusing stale PCM. */
     DspPending loop_buf;
     int loop_buf_valid;
+    /* Instrumentation (t_37438ae5): wall time of the last successful dequeue,
+     * so a starvation event can report how long the source went without a
+     * guest refill. */
+    uint64_t last_dequeue_ns;
+    /* Hold-last-good (t_37438ae5): when a source has no next buffer (guest
+     * refill late, or a clip ends mid-waveform) the mixer holds the last
+     * sample and fades it out over one quantum, then fades the next buffer in,
+     * instead of cutting to zero — the cut is the click. */
+    float fade_out, fade_in;
+    int fade_in_active, fade_init;
+    int16_t hold_l, hold_r;
 } DspWorkerSource;
 static uint64_t dsp_adpcm_hist_reloads, dsp_adpcm_hist_carries, dsp_adpcm_loop_redecodes;
 static DspWorkerSource dsp_music_state[DSP_NUM_SOURCES];
@@ -694,6 +778,8 @@ static void dsp_worker_apply_input(DspWorkerSource *s, DspWorkerInput *in, DspAu
         dsp_worker_source_free_current(s); dsp_worker_source_free_pending(s);
         s->enabled = 0; s->buffer_update = 0; s->pos = 0; s->frac = 0.0f;
         s->adpcm_yn1 = 0; s->adpcm_yn2 = 0;
+        s->fade_out = 0.0f; s->fade_in = 1.0f; s->fade_in_active = 0;
+        s->hold_l = s->hold_r = 0;
         memset(s->gain, 0, sizeof(s->gain));
     } else if (in->clear_pending) dsp_worker_source_free_pending(s);
     if (in->enabled_dirty) s->enabled = in->enabled;
@@ -750,6 +836,7 @@ static int dsp_worker_dequeue(unsigned source, DspWorkerSource *s, DspAudioJob *
     }
     s->sample_count = b.length;
     if (s->pos > s->sample_count) s->pos = 0;
+    s->last_dequeue_ns = host_monotonic_ns();
     job->sources_started++;
     if (getenv("DQ8_TRACE_AUDIO"))
         fprintf(stderr, "dsp worker dequeue: src=%u id=%u len=%u fmt=%u ch=%u loop=%u adpcm_dirty=%u yn=%d,%d\n",
@@ -766,6 +853,7 @@ static int16_t dsp_worker_fetch(const DspWorkerSource *s, uint32_t frame, unsign
 }
 static void dsp_process_source(unsigned i, DspWorkerSource *s, DspWorkerInput *in, DspAudioJob *job) {
     float gl, gr;
+    if (!s->fade_init) { s->fade_init = 1; s->fade_in = 1.0f; }
     dsp_worker_apply_input(s, in, job);
     if (s->enabled) {
         gl = job->master * (s->gain[0][0] + s->gain[0][2]) +
@@ -774,11 +862,38 @@ static void dsp_process_source(unsigned i, DspWorkerSource *s, DspWorkerInput *i
              job->aux[0] * (s->gain[1][1] + s->gain[1][3]) + job->aux[1] * (s->gain[2][1] + s->gain[2][3]);
         for (unsigned n = 0; n < DSP_FRAME_SAMPLES; ++n) {
             float p; uint32_t i0; int32_t vl, vr;
-            while (!s->sample_count && s->enabled)
+            while (s->fade_out <= 0.0f && !s->sample_count && s->enabled)
                 if (!dsp_worker_dequeue(i, s, job)) {
+                    /* Guest-side starvation: the guest did not post the next
+                     * buffer before this quantum needed it (or the clip ended
+                     * mid-waveform).  Hold the last good sample and fade it to
+                     * zero over this quantum instead of cutting to silence. */
+                    uint64_t starve_now = host_monotonic_ns();
+                    uint64_t gap_us = s->last_dequeue_ns && starve_now > s->last_dequeue_ns
+                                    ? (starve_now - s->last_dequeue_ns) / 1000u : 0u;
+                    ++dsp_src_starve_total;
+                    if (i < 24u) ++dsp_src_starve[i];
+                    if (dq8_trace_audio_q)
+                        fprintf(stderr, "ASTARVE t_us=%llu seq=%llu src=%u gap_us=%llu pos=%u rate=%.4f\n",
+                                (unsigned long long)(starve_now / 1000ull),
+                                (unsigned long long)job->sequence, i,
+                                (unsigned long long)gap_us, s->pos, (double)s->rate);
                     s->enabled = 0; s->buffer_update = 1; s->last_buffer_id = s->current_buffer_id;
                     s->current_buffer_id = 0;
+                    if (s->hold_l || s->hold_r) s->fade_out = 1.0f;
                 }
+            if (s->fade_out > 0.0f) {
+                int32_t hl = (int32_t)((float)s->hold_l * s->fade_out);
+                int32_t hr = (int32_t)((float)s->hold_r * s->fade_out);
+                job->mix_l[n] += (int32_t)((double)hl * (double)gl);
+                job->mix_r[n] += (int32_t)((double)hr * (double)gr);
+                s->fade_out -= 1.0f / (float)DSP_FRAME_SAMPLES;
+                if (s->fade_out <= 0.0f) {
+                    s->fade_out = 0.0f; s->hold_l = s->hold_r = 0;
+                    s->fade_in = 0.0f; s->fade_in_active = 1;
+                }
+                continue;
+            }
             if (!s->enabled) break;
             p = (float)s->pos + s->frac; i0 = (uint32_t)p;
             if (i0 + 1u < s->sample_count) {
@@ -791,6 +906,12 @@ static void dsp_process_source(unsigned i, DspWorkerSource *s, DspWorkerInput *i
                 } else vr = vl;
             } else {
                 vl = dsp_worker_fetch(s, i0, 0); vr = (s->channels > 1u) ? dsp_worker_fetch(s, i0, 1) : vl;
+            }
+            s->hold_l = (int16_t)vl; s->hold_r = (int16_t)vr;
+            if (s->fade_in_active) {
+                vl = (int32_t)((float)vl * s->fade_in); vr = (int32_t)((float)vr * s->fade_in);
+                s->fade_in += 1.0f / (float)DSP_FRAME_SAMPLES;
+                if (s->fade_in >= 1.0f) { s->fade_in = 1.0f; s->fade_in_active = 0; }
             }
             job->mix_l[n] += (int32_t)((double)vl * (double)gl);
             job->mix_r[n] += (int32_t)((double)vr * (double)gr);
@@ -828,6 +949,9 @@ static void dsp_process_source(unsigned i, DspWorkerSource *s, DspWorkerInput *i
                         if (!dsp_worker_dequeue(i, s, job)) {
                             s->enabled = 0; s->buffer_update = 1; s->last_buffer_id = s->current_buffer_id;
                             s->current_buffer_id = 0;
+                            /* Clip ended with no successor: fade the last
+                             * sample out over the rest of this quantum. */
+                            if (s->hold_l || s->hold_r) s->fade_out = 1.0f;
                         }
                         break;
                     }
@@ -917,6 +1041,26 @@ static void *dsp_sfx_worker_main(void *unused) {
             job->feed_to_sink_ns = now - job->submitted_ns + queued_ahead_ns;
             if ((int64_t)(now - job->deadline_ns) > 0) ++dsp_audio_deadline_misses;
             dsp_audio_record_latency(job->feed_to_sink_ns);
+            if (queued_ahead_ns / 1000u < dsp_sink_low_thresh_us) ++dsp_sink_low_total;
+            if (dq8_trace_audio_q) {
+                unsigned pend_smax = 0, act = 0, i;
+                for (i = 0; i < DSP_NUM_SOURCES; ++i) {
+                    const DspWorkerSource *s = i == DSP_MUSIC_SOURCE
+                        ? &dsp_music_state[DSP_MUSIC_SOURCE] : &dsp_sfx_state[i];
+                    if (s->enabled) ++act;
+                    if (i != DSP_MUSIC_SOURCE && s->pending_count > pend_smax)
+                        pend_smax = s->pending_count;
+                }
+                fprintf(stderr, "AQ t_us=%llu seq=%llu ahead_us=%llu act=%u pend_m=%u pend_smax=%u "
+                        "late_us=%lld starve=%llu low=%llu\n",
+                        (unsigned long long)(now / 1000ull),
+                        (unsigned long long)job->sequence,
+                        (unsigned long long)(queued_ahead_ns / 1000u), act,
+                        dsp_music_state[DSP_MUSIC_SOURCE].pending_count, pend_smax,
+                        (long long)((int64_t)(now - job->deadline_ns) / 1000),
+                        (unsigned long long)dsp_src_starve_total,
+                        (unsigned long long)dsp_sink_low_total);
+            }
         }
         dsp_push_completions((uintptr_t)job);
     }
@@ -947,7 +1091,8 @@ static int dsp_shutdown_drain_completions(int *completed) {
 }
 static void dsp_audio_workers_shutdown(void) {
     int completed = 0;
-    if (!dsp_workers_started) { dsp_free_guest_sources(); return; }
+    if (!dsp_workers_started) { dsp_pacer_stop_and_join(); dsp_free_guest_sources(); return; }
+    dsp_pacer_stop_and_join();
     if (dsp_pending_music_job) {
         while (!dsp_push_music_in_try((uintptr_t)dsp_pending_music_job)) {
             dsp_shutdown_drain_completions(&completed);
@@ -1091,28 +1236,6 @@ static void dsp_audio_transfer_shadow(int music) {
         src->enabled_dirty = src->rate_dirty = src->gain_dirty = src->sync_dirty = 0;
     }
 }
-static int dsp_audio_submit(uint64_t deadline) {
-    if (!dsp_pending_music_job && !dsp_pending_sfx_job) {
-        uint32_t read, write;
-        if (!dsp_audio_parse_frame(&read, &write)) return 0;
-        dsp_pending_music_job = dsp_audio_make_job(dsp_audio_sequence, deadline, read, write, 1);
-        dsp_pending_sfx_job = dsp_audio_make_job(dsp_audio_sequence, deadline, read, write, 0);
-        if (!dsp_pending_music_job || !dsp_pending_sfx_job) {
-            dsp_job_free(dsp_pending_music_job); dsp_job_free(dsp_pending_sfx_job);
-            dsp_pending_music_job = dsp_pending_sfx_job = NULL;
-            fputs("dsp audio: cannot allocate frame snapshot\n", stderr); return 0;
-        }
-    }
-    if (dsp_pending_music_job && dsp_push_music_in_try((uintptr_t)dsp_pending_music_job)) {
-        dsp_audio_transfer_shadow(1); dsp_pending_music_job = NULL;
-    }
-    if (dsp_pending_sfx_job && dsp_push_sfx_in_try((uintptr_t)dsp_pending_sfx_job)) {
-        dsp_audio_transfer_shadow(0); dsp_pending_sfx_job = NULL;
-    }
-    if (dsp_pending_music_job || dsp_pending_sfx_job) return 0;
-    ++dsp_audio_sequence;
-    return 1;
-}
 static void dsp_audio_commit(DspAudioJob *job) {
     /* The HLE reference chooses the double-buffer region at each DSP tick.
      * Worker latency lets the guest advance its frame counters after submit,
@@ -1144,10 +1267,6 @@ static void dsp_audio_commit(DspAudioJob *job) {
         event_signaled[dsp_pipe_interrupt_event] = 1u;
         guest_notify_handle(dsp_pipe_interrupt_event);
     }
-    if (getenv("DQ8_TRACE_AUDIO") && (dsp_frames_out % (DSP_RATE / 4u)) == 0u)
-        fprintf(stderr, "dsp audio: frames=%llu started=%llu finished=%llu on=%d\n",
-                (unsigned long long)dsp_frames_out, (unsigned long long)dsp_sources_started,
-                (unsigned long long)dsp_sources_finished, dsp_audio_on);
     dsp_job_free(job);
 }
 /* Do not overwrite a one-frame SourceStatus.current_buffer_id_dirty update
@@ -1167,33 +1286,524 @@ static unsigned dsp_audio_commit_ready(void) {
     }
     return committed;
 }
-static void dsp_audio_tick(void) {
+/* ---------------------------------------------------------------------------
+ * DSP PACER (t_d808299b): frame production runs on its own wall-clock thread.
+ *
+ * The main loop spends 100-200 ms inside the 3D/GL/present shims on every
+ * spike frame.  While it was away the old tick could not submit DSP frames,
+ * the sink drained, and the voice played in fragments separated by silence
+ * (the operator's "the same line takes several times as long" report: the
+ * content timeline slipped by every stall).  Production is therefore split in
+ * two, by what each side is allowed to touch:
+ *
+ *   main thread  - harvest: parse the guest DSP regions, snapshot the delta
+ *                  into owned DspAudioJob templates, publish the template.
+ *                - commit : write finished frames back into guest RAM and
+ *                  signal the audio-pipe interrupt (scheduler state).
+ *   pacer thread - every DSP_FRAME_NS (4.888791 ms, 204.55 frames/s): clone
+ *                  the newest template (with its deltas) or the previous one
+ *                  as a *continuation* (no pending buffers, no dirty flags, so
+ *                  the worker just mixes on from its own source state) and
+ *                  push it into the worker SPSC queues.
+ *
+ * The pacer never reads or writes guest RAM: it only copies owned snapshots,
+ * so a guest rewrite can never tear a sample and no lock is needed on `ram`.
+ * The completion path back to the guest stays on the main thread, and its
+ * queue is deep enough (DSP_COMPLETION_CAPACITY = 1.25 s) that a stalled main
+ * loop never blocks the mixer.
+ * ------------------------------------------------------------------------- */
+typedef struct {
+    DspAudioJob *music, *sfx;
+} DspTemplate;
+
+static pthread_mutex_t dsp_tpl_mu = PTHREAD_MUTEX_INITIALIZER;
+static DspTemplate dsp_tpl_ring[DSP_TEMPLATE_CAPACITY];
+static unsigned dsp_tpl_head, dsp_tpl_tail;      /* guarded by dsp_tpl_mu */
+static DspAudioJob *dsp_tpl_last_music, *dsp_tpl_last_sfx; /* pacer-owned */
+static int dsp_tpl_last_valid;
+static int dsp_pacer_started, dsp_pacer_affinity_ok;
+static _Atomic int dsp_pacer_stop;
+static pthread_t dsp_pacer_thread;
+static _Atomic uint64_t dsp_pacer_next_ns;       /* published cadence/wake hint */
+static uint64_t dsp_pacer_t0_ns, dsp_pacer_t0_frames; /* pacing epoch (budget) */
+static uint64_t dsp_harvest_last_ns;             /* harvest (parse) cadence */
+static uint64_t dsp_pacer_frames;                /* frames emitted by the pacer */
+static uint64_t dsp_pacer_drops;                 /* frames discarded (queues stayed full) */
+static uint64_t dsp_pacer_prefills;
+
+static void dsp_job_free_owned(DspAudioJob *job) {
+    if (!job) return;
+    for (unsigned i = 0; i < DSP_NUM_SOURCES; ++i) {
+        DspWorkerInput *in = &job->source[i];
+        for (unsigned k = 0; k < in->pending_count; ++k) free(in->pending[k].payload);
+        free(in->pending);
+    }
+    free(job);
+}
+/* Deep-copy one template job.  deltas == 0 builds a continuation frame: the
+ * worker keeps every source register and its current position, only the
+ * frame-level envelope (volumes, regions) is carried over. */
+static DspAudioJob *dsp_job_clone(const DspAudioJob *tpl, uint64_t sequence,
+                                  uint64_t deadline, int deltas) {
+    DspAudioJob *job;
+    if (!tpl) return NULL;
+    job = (DspAudioJob *)calloc(1, sizeof(*job));
+    if (!job) return NULL;
+    job->sequence = sequence;
+    job->submitted_ns = host_monotonic_ns();
+    job->deadline_ns = deadline + DSP_FRAME_NS;
+    job->read_region = tpl->read_region;
+    job->write_region = tpl->write_region;
+    job->notify_guest = 1;
+    job->master = tpl->master;
+    job->aux[0] = tpl->aux[0]; job->aux[1] = tpl->aux[1];
+    if (!deltas) return job;
+    for (unsigned i = 0; i < DSP_NUM_SOURCES; ++i) {
+        const DspWorkerInput *src = &tpl->source[i];
+        DspWorkerInput *dst = &job->source[i];
+        dst->enabled = src->enabled; dst->reset = src->reset;
+        dst->clear_pending = src->clear_pending;
+        dst->enabled_dirty = src->enabled_dirty; dst->rate_dirty = src->rate_dirty;
+        dst->gain_dirty = src->gain_dirty; dst->sync_dirty = src->sync_dirty;
+        dst->rate = src->rate; dst->sync_count = src->sync_count;
+        memcpy(dst->gain, src->gain, sizeof(dst->gain));
+        dst->pending_count = src->pending_count;
+        if (!src->pending_count) continue;
+        dst->pending = (DspPending *)calloc(src->pending_count, sizeof(DspPending));
+        if (!dst->pending) { dsp_job_free_owned(job); return NULL; }
+        for (unsigned k = 0; k < src->pending_count; ++k) {
+            dst->pending[k] = src->pending[k];
+            dst->pending[k].payload = NULL;
+            if (!src->pending[k].payload || !src->pending[k].payload_bytes) continue;
+            dst->pending[k].payload = (uint8_t *)malloc(src->pending[k].payload_bytes);
+            if (!dst->pending[k].payload) { dsp_job_free_owned(job); return NULL; }
+            memcpy(dst->pending[k].payload, src->pending[k].payload,
+                   src->pending[k].payload_bytes);
+        }
+    }
+    return job;
+}
+
+/* Push one frame (music + SFX job at the same sequence).  Returns 1 when the
+ * frame left the producer, 0 when a queue was full and the frame must be
+ * retried on the next tick (the prepared jobs stay in dsp_pending_*_job). */
+static int dsp_pacer_submit(const DspAudioJob *music_tpl, const DspAudioJob *sfx_tpl,
+                            uint64_t deadline, int deltas) {
+    if (!dsp_pending_music_job && !dsp_pending_sfx_job) {
+        dsp_pending_music_job = dsp_job_clone(music_tpl, dsp_audio_sequence, deadline, deltas);
+        dsp_pending_sfx_job = dsp_job_clone(sfx_tpl, dsp_audio_sequence, deadline, deltas);
+        if (!dsp_pending_music_job || !dsp_pending_sfx_job) {
+            dsp_job_free_owned(dsp_pending_music_job);
+            dsp_job_free_owned(dsp_pending_sfx_job);
+            dsp_pending_music_job = dsp_pending_sfx_job = NULL;
+            return 1;   /* cannot snapshot a frame: skip it, keep pacing */
+        }
+    }
+    if (dsp_pending_music_job && dsp_push_music_in_try((uintptr_t)dsp_pending_music_job))
+        dsp_pending_music_job = NULL;
+    if (dsp_pending_sfx_job && dsp_push_sfx_in_try((uintptr_t)dsp_pending_sfx_job))
+        dsp_pending_sfx_job = NULL;
+    if (dsp_pending_music_job || dsp_pending_sfx_job) return 0;
+    ++dsp_audio_sequence;
+    return 1;
+}
+
+/* Bootstrap template: the very first frames must still be produced and
+ * committed, because committing them is what signals the audio-pipe interrupt
+ * that makes the guest's audio worker post its first buffers. */
+static int dsp_tpl_ensure_default(void) {
+    if (dsp_tpl_last_valid) return 1;
+    dsp_tpl_last_music = (DspAudioJob *)calloc(1, sizeof(DspAudioJob));
+    dsp_tpl_last_sfx = (DspAudioJob *)calloc(1, sizeof(DspAudioJob));
+    if (!dsp_tpl_last_music || !dsp_tpl_last_sfx) {
+        free(dsp_tpl_last_music); free(dsp_tpl_last_sfx);
+        dsp_tpl_last_music = dsp_tpl_last_sfx = NULL;
+        return 0;
+    }
+    dsp_tpl_last_valid = 1;
+    return 1;
+}
+
+/* One pacer frame: a new harvest replaces the continuation template, otherwise
+ * the previous template is replayed without deltas. */
+static int dsp_pacer_emit(uint64_t deadline) {
+    DspAudioJob *music = NULL, *sfx = NULL;
+    int have_new = 0, started = 0;
+    pthread_mutex_lock(&dsp_tpl_mu);
+    if (dsp_tpl_tail != dsp_tpl_head) {
+        unsigned slot = dsp_tpl_tail % DSP_TEMPLATE_CAPACITY;
+        music = dsp_tpl_ring[slot].music; sfx = dsp_tpl_ring[slot].sfx;
+        dsp_tpl_ring[slot].music = dsp_tpl_ring[slot].sfx = NULL;
+        dsp_tpl_tail++;
+        have_new = 1;
+    }
+    pthread_mutex_unlock(&dsp_tpl_mu);
+
+    if (have_new) {
+        /* New guest state: this frame carries the deltas.  The template stays
+         * alive as the continuation source once the frame is accepted. */
+        started = dsp_pacer_submit(music, sfx, deadline, 1);
+        if (started) {
+            dsp_job_free_owned(dsp_tpl_last_music);
+            dsp_job_free_owned(dsp_tpl_last_sfx);
+            dsp_tpl_last_music = music; dsp_tpl_last_sfx = sfx;
+            dsp_tpl_last_valid = 1;
+            return 1;
+        }
+        /* Queue full: keep the deltas for the next tick by putting the
+         * template back at the tail (it is still the newest harvest). */
+        pthread_mutex_lock(&dsp_tpl_mu);
+        dsp_tpl_tail--;
+        {
+            unsigned slot = dsp_tpl_tail % DSP_TEMPLATE_CAPACITY;
+            dsp_tpl_ring[slot].music = music; dsp_tpl_ring[slot].sfx = sfx;
+        }
+        pthread_mutex_unlock(&dsp_tpl_mu);
+        return 0;
+    }
+    if (!dsp_tpl_ensure_default()) return 0;
+    return dsp_pacer_submit(dsp_tpl_last_music, dsp_tpl_last_sfx, deadline, 0);
+}
+
+static void dsp_audio_trace_line(uint64_t report_t0_ns, uint64_t sink_frames_at_t0) {
     uint64_t now = host_monotonic_ns();
+    double secs = (double)(now - report_t0_ns) / 1e9;
+    double rate = secs > 0.0 ? (double)(dsp_wav_frames - sink_frames_at_t0) / secs : 0.0;
+    fprintf(stderr,
+            "dsp audio: wall=%.3f sink_frames=%llu sink_rate=%.2f/s pacer_frames=%llu "
+            "resyncs=%llu drops=%llu deadline_misses=%llu sink_empty=%llu content_gaps=%llu "
+            "sink_drops=%llu commits=%llu prefill=%llu lag_us=%.0f src_starve=%llu sink_low=%llu "
+            "sink_underruns=%llu reseeds=%llu lead_refills=%llu lead_holds=%llu\n",
+            secs,
+            (unsigned long long)dsp_wav_frames, rate,
+            (unsigned long long)dsp_pacer_frames,
+            (unsigned long long)perf_dsp_resyncs,
+            (unsigned long long)dsp_pacer_drops,
+            (unsigned long long)dsp_audio_deadline_misses,
+            (unsigned long long)dsp_audio_sink_empty,
+            (unsigned long long)dsp_audio_content_gaps,
+            (unsigned long long)dsp_audio_sink_drops,
+            (unsigned long long)dsp_frames_out,
+            (unsigned long long)dsp_pacer_prefills,
+            ((double)now - (double)atomic_load(&dsp_pacer_next_ns)) / 1000.0,
+            (unsigned long long)dsp_src_starve_total,
+            (unsigned long long)dsp_sink_low_total,
+            (unsigned long long)dsp_sink_underruns,
+            (unsigned long long)dsp_sink_reseeds,
+            (unsigned long long)dsp_sink_lead_refills,
+            (unsigned long long)dsp_sink_lead_holds);
+}
+
+static void *dsp_pacer_main(void *unused) {
+    uint64_t next, report_t0, report_frames, report_sink;
+    uint64_t last_lead_refill = 0, stall_at = 0, stall_ms = 0, stall_every_ns = 3000000000ull;
+    int prefilled = 0;
+    (void)unused;
+    dsp_set_worker_affinity(DSP_PACER_CORE, "dsp-pacer", &dsp_pacer_affinity_ok);
+    {
+        /* Fault injection for the crackle test harness: park the pacer for
+         * N ms every M ms, which is exactly what a 100-200 ms frame spike does
+         * to the device queue when the whole process is descheduled. */
+        const char *s = getenv("DQ8_AUDIO_PACER_STALL_MS");
+        const char *e = getenv("DQ8_AUDIO_PACER_STALL_EVERY_MS");
+        if (s && s[0]) stall_ms = strtoull(s, NULL, 10);
+        if (e && e[0]) stall_every_ns = strtoull(e, NULL, 10) * 1000000ull;
+        if (stall_ms) fprintf(stderr, "dsp pacer: fault injection stall=%llums every=%llums\n",
+                              (unsigned long long)stall_ms,
+                              (unsigned long long)(stall_every_ns / 1000000ull));
+    }
+    next = host_monotonic_ns();
+    report_t0 = next; report_frames = 0; report_sink = 0;
+    for (;;) {
+        uint64_t now = host_monotonic_ns();
+        unsigned caught = 0, burst_allow = 1;
+        if (atomic_load_explicit(&dsp_pacer_stop, memory_order_relaxed)) break;
+        if (stall_ms && now - stall_at >= stall_every_ns) {
+            struct timespec ts = {(time_t)(stall_ms / 1000ull),
+                                  (long)((stall_ms % 1000ull) * 1000000ull)};
+            stall_at = now;
+            nanosleep(&ts, NULL);   /* test-only: emulate a 100-200 ms spike */
+            now = host_monotonic_ns();
+        }
+        if (!atomic_load_explicit(&dsp_audio_on, memory_order_relaxed)) {
+            prefilled = 0;
+            next = now + DSP_FRAME_NS;
+            atomic_store(&dsp_pacer_next_ns, next);
+            {
+                struct timespec ts = {0, (long)DSP_FRAME_NS};
+                nanosleep(&ts, NULL);
+            }
+            continue;
+        }
+        if (!prefilled) {
+            uint64_t pf = dsp_sink_target_frames;
+            if (pf < 4u) pf = 4u; if (pf > 32u) pf = 32u;
+            dsp_pacer_t0_ns = now;
+            dsp_pacer_t0_frames = dsp_pacer_frames;
+            /* Back-dated deadline => the budget loop fills the whole lead. */
+            next = now > (pf - 1u) * DSP_FRAME_NS ? now - (pf - 1u) * DSP_FRAME_NS : 0u;
+            burst_allow = (unsigned)pf;
+            prefilled = 1;
+            ++dsp_pacer_prefills;
+            report_t0 = now; report_frames = dsp_pacer_frames; report_sink = dsp_wav_frames;
+        }
+        if (atomic_exchange(&dsp_sink_reseed, 0)) {
+            ++dsp_sink_reseeds;
+            /* A stall longer than the current lead got through: grow the lead
+             * so the next one is absorbed instead of clicked, and re-burst it. */
+            if (dsp_sink_target_ns < 200000000ull) {
+                uint64_t grown = dsp_sink_target_ns * 3u / 2u;
+                uint32_t f;
+                if (grown > 200000000ull) grown = 200000000ull;
+                if (grown > dsp_sink_ceiling_ns) grown = dsp_sink_ceiling_ns;
+                dsp_sink_target_ns = grown;
+                f = (uint32_t)(grown / DSP_FRAME_NS);
+                if (f > 32u) f = 32u;
+                if (f > dsp_sink_target_frames) dsp_sink_target_frames = f;
+                fprintf(stderr, "dsp audio: sink underrun -> lead target raised to %llu us (%u frames)\n",
+                        (unsigned long long)(dsp_sink_target_ns / 1000u), dsp_sink_target_frames);
+            }
+            {
+                uint64_t pf = dsp_sink_target_frames;
+                uint64_t t;
+                if (pf > 32u) pf = 32u;
+                t = now > (pf - 1u) * DSP_FRAME_NS ? now - (pf - 1u) * DSP_FRAME_NS : 0u;
+                if ((int64_t)(t - next) < 0) next = t;
+                burst_allow = (unsigned)pf;
+            }
+        }
+        for (;;) {
+            /*  - budget: never more than elapsed wall-clock frames + the lead
+             *    (no runaway, no queue ratcheting into the latency clamp);
+             *  - catch-up: frames owed by a stall are only produced while the
+             *    device queue is below the lead target.  Normal wall-clock
+             *    emission is never paused: a sink left idle goes silent and
+             *    stops draining (PipeWire idle-suspend), which would deadlock
+             *    the lead. */
+            uint64_t elapsed = (now - dsp_pacer_t0_ns) / DSP_FRAME_NS;
+            uint64_t emitted = (dsp_pacer_frames + caught) - dsp_pacer_t0_frames;
+            uint64_t ahead;
+            if (emitted >= elapsed + (uint64_t)dsp_sink_target_frames) { ++dsp_sink_lead_holds; break; }
+            if ((int64_t)(now - next) < 0) break;
+            if (caught >= burst_allow) break;   /* one frame per tick, except the arm burst */
+            if (!dsp_pacer_emit(next)) { ++dsp_pacer_drops; break; }
+            next += DSP_FRAME_NS;
+            ++caught;
+            if (caught >= DSP_SINK_MAX_CATCHUP + 8u) break;
+        }
+        if (caught) {
+            dsp_pacer_frames += caught;
+            perf_dsp_ticks += caught;
+            if (getenv("DQ8_TRACE_AUDIO") &&
+                dsp_pacer_frames - report_frames >= DSP_TRACE_FRAMES) {
+                dsp_audio_trace_line(report_t0, report_sink);
+                report_t0 = host_monotonic_ns();
+                report_frames = dsp_pacer_frames;
+                report_sink = dsp_wav_frames;
+            }
+        }
+        if ((int64_t)(host_monotonic_ns() - next) >= 0) {
+            /* Fell behind the wall clock (descheduled): resync instead of
+             * spiralling, exactly like the hardware DSP's own clock. */
+            next = host_monotonic_ns() + DSP_FRAME_NS;
+            ++perf_dsp_resyncs;
+        }
+        atomic_store(&dsp_pacer_next_ns, next);
+        now = host_monotonic_ns();
+        if (next > now) {
+            uint64_t d = next - now;
+            struct timespec ts;
+            ts.tv_sec = (time_t)(d / 1000000000ull);
+            ts.tv_nsec = (long)(d % 1000000000ull);
+            nanosleep(&ts, NULL);
+        } else {
+            sched_yield();
+        }
+    }
+    return NULL;
+}
+
+static void dsp_pacer_start(void) {
+    if (dsp_pacer_started) return;
+    atomic_store(&dsp_pacer_stop, 0);
+    if (pthread_create(&dsp_pacer_thread, NULL, dsp_pacer_main, NULL) != 0) {
+        fputs("dsp audio: cannot create DSP pacer thread\n", stderr);
+        return;
+    }
+    dsp_pacer_started = 1;
+}
+static void dsp_pacer_stop_and_join(void) {
+    if (!dsp_pacer_started) return;
+    atomic_store(&dsp_pacer_stop, 1);
+    pthread_join(dsp_pacer_thread, NULL);
+    dsp_pacer_started = 0;
+    dsp_job_free_owned(dsp_pending_music_job); dsp_pending_music_job = NULL;
+    dsp_job_free_owned(dsp_pending_sfx_job); dsp_pending_sfx_job = NULL;
+    dsp_job_free_owned(dsp_tpl_last_music); dsp_job_free_owned(dsp_tpl_last_sfx);
+    dsp_tpl_last_music = dsp_tpl_last_sfx = NULL;
+    dsp_tpl_last_valid = 0;
+    pthread_mutex_lock(&dsp_tpl_mu);
+    while (dsp_tpl_tail != dsp_tpl_head) {
+        unsigned slot = dsp_tpl_tail % DSP_TEMPLATE_CAPACITY;
+        dsp_job_free_owned(dsp_tpl_ring[slot].music);
+        dsp_job_free_owned(dsp_tpl_ring[slot].sfx);
+        dsp_tpl_ring[slot].music = dsp_tpl_ring[slot].sfx = NULL;
+        dsp_tpl_tail++;
+    }
+    pthread_mutex_unlock(&dsp_tpl_mu);
+}
+
+/* Main-thread harvest: snapshot the guest's DSP deltas into a template and
+ * hand it to the pacer.  Runs on the guest thread only, so `ram` stays single
+ * threaded.  Cheap no-op when the guest has not touched the DSP state. */
+static void dsp_audio_harvest(void) {
+    uint32_t read, write;
+    DspAudioJob *music, *sfx;
+    unsigned slot;
+    uint64_t now;
+    if (dsp_source_event_pending) return;   /* keep the one-shot SourceStatus latch */
+    /* Parse at the DSP frame cadence (the old main-loop tick parsed once per
+     * produced frame).  It cannot be gated on the progress counter itself:
+     * bumping that counter is what the parse does, so gating on it would
+     * never let the first guest write be seen. */
+    now = dq8_guest_now_ns();
+    if (dsp_harvest_last_ns && now - dsp_harvest_last_ns < DSP_FRAME_NS) return;
+    dsp_harvest_last_ns = now;
+    if (getenv("DQ8_TRACE_DSP_HARVEST")) {
+        static uint64_t next_report;
+        if (now >= next_report) {
+            fprintf(stderr, "dsp harvest: progress=%llu harvested=%llu event_pending=%d "
+                    "audio_on=%d tpl_valid=%d ring=%u under_region=%08X\n",
+                    (unsigned long long)dsp_guest_progress,
+                    (unsigned long long)dsp_guest_harvested, dsp_source_event_pending,
+                    (int)dsp_audio_on, dsp_tpl_last_valid,
+                    (unsigned)(dsp_tpl_head - dsp_tpl_tail), dsp_current_region());
+            next_report = now + 1000000000ull;
+        }
+    }
+    if (!dsp_audio_parse_frame(&read, &write)) return;
+    if (dsp_guest_progress == dsp_guest_harvested) return;   /* nothing new */
+    pthread_mutex_lock(&dsp_tpl_mu);
+    if ((unsigned)(dsp_tpl_head - dsp_tpl_tail) >= DSP_TEMPLATE_CAPACITY) {
+        pthread_mutex_unlock(&dsp_tpl_mu);
+        return;                             /* pacer busy: keep deltas in the shadow */
+    }
+    pthread_mutex_unlock(&dsp_tpl_mu);
+    music = dsp_audio_make_job(dsp_audio_sequence, 0u, read, write, 1);
+    sfx = dsp_audio_make_job(dsp_audio_sequence, 0u, read, write, 0);
+    if (!music || !sfx) {
+        dsp_job_free_owned(music); dsp_job_free_owned(sfx);
+        fputs("dsp audio: cannot allocate harvest template\n", stderr);
+        return;
+    }
+    /* Ownership of the snapshotted payloads moved into the two jobs. */
+    dsp_audio_transfer_shadow(1);
+    dsp_audio_transfer_shadow(0);
+    dsp_guest_harvested = dsp_guest_progress;
+    pthread_mutex_lock(&dsp_tpl_mu);
+    slot = dsp_tpl_head % DSP_TEMPLATE_CAPACITY;
+    dsp_tpl_ring[slot].music = music;
+    dsp_tpl_ring[slot].sfx = sfx;
+    dsp_tpl_head++;
+    pthread_mutex_unlock(&dsp_tpl_mu);
+}
+
+/* ---------------------------------------------------------------------------
+ * DETERMINISTIC (t_115d297c): synchronous DSP frame production.
+ *
+ * The shipped path paces frames from a host thread (`dsp-pacer`) and mixes
+ * them on two more host threads, so the guest's audio-pipe interrupts,
+ * SourceStatus updates and refill callbacks land at wall-clock points that
+ * differ run to run -- one of the sources of the 22.83% frame divergence in
+ * t_8510204b.  With DQ8_DETERMINISTIC=1 no audio thread is started and no
+ * device is opened: the frame cadence comes from the same virtual clock the
+ * vblank chain uses (dq8_guest_now_ns), the newest harvested template is
+ * mixed in place and committed on the guest thread, and therefore the guest
+ * sees exactly the same DSP state at the same instruction count every run.
+ * No real-time wait (SDL queue pacing, nanosleep hand-off) is reached.
+ * ------------------------------------------------------------------------- */
+static uint64_t dsp_det_next_ns;
+static int dsp_det_frame(const DspAudioJob *music_tpl, const DspAudioJob *sfx_tpl, int deltas) {
+    DspAudioJob *music = dsp_job_clone(music_tpl, dsp_audio_sequence, 0u, deltas);
+    DspAudioJob *sfx = dsp_job_clone(sfx_tpl, dsp_audio_sequence, 0u, deltas);
+    if (!music || !sfx) {
+        dsp_job_free_owned(music); dsp_job_free_owned(sfx);
+        return 0;
+    }
+    dsp_process_music(music);
+    dsp_process_sfx(sfx, music);
+    dsp_audio_commit(sfx);          /* writes guest RAM, signals the pipe IRQ */
+    dsp_job_free_owned(music);
+    ++dsp_audio_sequence;
+    ++dq8_det_audio_frames;
+    return 1;
+}
+static void dsp_audio_det_tick(uint64_t now) {
     unsigned caught = 0;
-    /* IDLE THROTTLE: while armed the only audio is silence (a live source
-     * keeps the throttle disarmed), so the quantum cadence is stretched by
-     * idle_stretch_wait (~204/s -> the idle poll rate).  On idle release the
-     * deadline resyncs so music that starts with the state is serviced on
-     * the very next quantum, not after the stale stretched deadline. */
-    static int dsp_idle_armed_prev;
-    int idle_armed_now = idle_throttle_armed();
-    if (dsp_idle_armed_prev && !idle_armed_now && dsp_next_frame_ns)
-        dsp_next_frame_ns = now;
-    dsp_idle_armed_prev = idle_armed_now;
+    if (!atomic_load(&dsp_audio_on)) return;
+    if (!dsp_det_next_ns) dsp_det_next_ns = now;
+    while ((int64_t)(now - dsp_det_next_ns) >= 0 && caught < 8u) {
+        dsp_audio_harvest();
+        if (dsp_tpl_tail != dsp_tpl_head) {
+            DspAudioJob *music, *sfx;
+            unsigned slot;
+            pthread_mutex_lock(&dsp_tpl_mu);
+            slot = dsp_tpl_tail % DSP_TEMPLATE_CAPACITY;
+            music = dsp_tpl_ring[slot].music; sfx = dsp_tpl_ring[slot].sfx;
+            dsp_tpl_ring[slot].music = dsp_tpl_ring[slot].sfx = NULL;
+            dsp_tpl_tail++;
+            pthread_mutex_unlock(&dsp_tpl_mu);
+            if (dsp_det_frame(music, sfx, 1)) {
+                dsp_job_free_owned(dsp_tpl_last_music);
+                dsp_job_free_owned(dsp_tpl_last_sfx);
+                dsp_tpl_last_music = music; dsp_tpl_last_sfx = sfx;
+                dsp_tpl_last_valid = 1;
+            } else {
+                dsp_job_free_owned(music); dsp_job_free_owned(sfx);
+            }
+        } else if (dsp_tpl_ensure_default()) {
+            (void)dsp_det_frame(dsp_tpl_last_music, dsp_tpl_last_sfx, 0);
+        }
+        dsp_det_next_ns += DSP_FRAME_NS;
+        ++caught;
+    }
+    if (caught >= 8u && (int64_t)(now - dsp_det_next_ns) >= 0)
+        dsp_det_next_ns = now + DSP_FRAME_NS;
+    if (caught) ++perf_dsp_ticks;
+    atomic_store(&dsp_next_frame_ns, dsp_det_next_ns);
+}
+
+/* DETERMINISTIC (t_115d297c): a savestate restores the DSP latch/cadence
+   bookkeeping (dsp_source_event_pending is one of the saved vars), but those
+   describe a guest turn that will never happen again after a cold load: the
+   latched SourceStatus/pipe-IRQ hand-off has no pending guest turn to consume
+   it, and dsp_audio_harvest() refuses to parse while it is set.  Re-arm the
+   synchronous path so the first det tick produces a frame and signals the
+   pipe interrupt the resumed guest is waiting for. */
+static void dsp_audio_det_reset_after_load(void) {
+    if (!dq8_det_mode) return;
+    dsp_source_event_pending = 0;
+    dsp_det_next_ns = 0;
+    dsp_harvest_last_ns = 0;
+    dsp_tpl_last_valid = 0;
+    dsp_tpl_head = dsp_tpl_tail = 0;
+    atomic_store(&dsp_next_frame_ns, 0u);
+    fprintf(stderr, "DETERMINISTIC: DSP audio path re-armed after state load\n");
+}
+static void dsp_audio_tick(void) {
+    if (dq8_det_mode) { dsp_audio_det_tick(dq8_guest_now_ns()); return; }
+    /* Commit finished frames first: this is the only part that writes guest
+     * RAM and signals the audio-pipe interrupt, so it stays on this thread. */
     (void)dsp_audio_commit_ready();
-    if (dsp_source_event_pending) return;
-    if (!dsp_audio_on) return;
+    if (!atomic_load(&dsp_audio_on)) return;
     if (!dsp_workers_started) { dsp_audio_out_init(); dsp_audio_workers_start(); }
     if (!dq8_worker_scaffold_is_active(&dsp_audio_worker_gate)) return;
-    if (!dsp_next_frame_ns) dsp_next_frame_ns = now;
-    uint64_t quantum = idle_stretch_wait(DSP_FRAME_NS);
-    while ((int64_t)(now - dsp_next_frame_ns) >= 0 && caught < 8u) {
-        if (!dsp_audio_submit(dsp_next_frame_ns)) break;
-        dsp_next_frame_ns += quantum; ++caught;
-    }
-    if (caught >= 8u && (int64_t)(now - dsp_next_frame_ns) >= 0) {
-        dsp_next_frame_ns = now + quantum;
-        ++perf_dsp_resyncs;
-    }
-    if (caught) ++perf_dsp_ticks;
+    dsp_pacer_start();
+    dsp_audio_harvest();
+    /* Wake hint for the guest wait loops: while the idle throttle is armed the
+     * only audio is silence, so do not shorten their sleep for it. */
+    if (idle_throttle_armed())
+        atomic_store(&dsp_next_frame_ns, 0u);
+    else
+        atomic_store(&dsp_next_frame_ns, atomic_load(&dsp_pacer_next_ns));
 }

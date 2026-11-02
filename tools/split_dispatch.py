@@ -65,7 +65,7 @@ SHARED_SYMBOLS = [
     "fpr", "fpscr", "main_guest_pc", "main_guest_regs",
     "next_memory_block_handle", "previous_guest_pc", "thread_stopped_by_yield",
     "thread_yield_requested", "trace_guest_pc_count", "trace_guest_pcs",
-    "arm_shift", "arm_shift_carry", "arm_shift_imm", "arm_shift_imm_carry", "arm_ssat", "arm_ssat16", "arm_usat",
+    "arm_shift", "arm_shift_carry", "arm_shift_imm", "arm_shift_imm_carry", "arm_ssat", "arm_ssat16", "arm_usat", "arm_usat16",
     "branch_indirect", "dq8_pc_needs_boundary",
     "f32_from_bits", "f32_is_nan_bits", "f32_to_bits",
     "f64_from_bits", "f64_is_nan_bits", "f64_to_bits",
@@ -99,6 +99,15 @@ SHARED_SYMBOLS = [
 # step budget * 256) well under the preemption and vblank cadences.
 CHAIN_BATCH = 256
 
+# S2 (t_6edf5d17): longest straight-line block emitted by the S2 block
+# emitter.  A block's whole length is charged against `_budget` before it
+# starts (that is the point - one budget check per block), so a block must
+# always be able to fit in a fresh CHAIN_BATCH, otherwise a part call could
+# never make progress.  64 is well inside CHAIN_BATCH and leaves the cap
+# inactive for ordinary code (a straight-line run of 64 guest instructions
+# only appears in unrolled loops / memcpy-style blocks).
+S2_MAX_BLOCK = 64
+
 PART_FN_TYPE = ("typedef int (*Dq8PartFn)(uint32_t *r, uint32_t *pc_io, int *n_io, "
                 "int *z_io, int *c_io, int *v_io, int *ge_io, int *running_io, "
                 "uint64_t *steps_io, int is_main);")
@@ -106,54 +115,62 @@ PART_PROTO = ("int dq8_part_%03d(uint32_t *r, uint32_t *pc_io, int *n_io, int *z
               "int *c_io, int *v_io, int *ge_io, int *running_io, "
               "uint64_t *steps_io, int is_main);")
 
-INLINE_MEMORY_HELPERS = r'''/* Selective checked fast path: identity-mapped, single-span guest RAM only.
- * Aliased VRAM/FCRAM, faults, HID reads and traced stores stay on the exact
- * out-of-line helpers.  memcpy preserves the guest's legal unaligned accesses. */
-static inline int dq8_mem_identity_span(uint32_t a, unsigned width) {
-    if (a > DQ8_RT_RAM_SIZE || width > DQ8_RT_RAM_SIZE - a) return 0;
-    if ((a >= 0x18000000u && a < 0x18600000u) ||
-        (a >= 0x20000000u && a < 0x30000000u)) return 0;
-    return 1;
+INLINE_MEMORY_HELPERS = r'''/* Inline hot path for the guest's own memory accesses (t_221fd585).
+ *
+ * The previous version of this block was `static inline` only.  The split guest
+ * TUs are compiled at -O0, where clang does NOT inline a plain static inline:
+ * every emitted access was a real `call dq8_mem32_fast`, and that function then
+ * called dq8_mem_identity_span out of line as well.  objdump of
+ * build/allfix @ ca2786e (dq8-b24) shows 310 546 `call dq8_mem32_fast` sites,
+ * i.e. the call, the validation and the address mapping still happened on every
+ * access -- exactly the cost this fast path was supposed to remove.  The
+ * attribute below is what actually removes it; keep the body at one range
+ * compare plus one load/store so the -O0 expansion stays small.
+ *
+ * Fast case: an access wholly inside [0, 0x18000000).  That window is
+ * identity-mapped (guest_memory_address only remaps 0x18000000..0x18600000 and
+ * 0x20000000..0x30000000) and in bounds (GUEST_RAM_SIZE = 0x40000000), so it
+ * needs no translation, no bounds check and cannot fault.  Everything else --
+ * the VRAM/FCRAM aliases, the upper identity window, out-of-range faults, HID
+ * read tracing, traced stores and a live exclusive reservation -- goes out of
+ * line to the unchanged checked helper, which reports the same fault at the
+ * same PC with the same message and applies the same hooks.  Every hook that
+ * lives in those helpers therefore has to be part of the condition below.
+ * No value is ever cached: each access still reads/writes guest RAM. */
+#define DQ8_MEM_FAST __attribute__((always_inline)) static inline
+DQ8_MEM_FAST uint32_t dq8_mem8_fast(uint32_t a) {
+    if (a < 0x18000000u && !trace_hid_reads_enabled) return ram[a];
+    return mem8(a);
 }
-static inline uint32_t dq8_mem8_fast(uint32_t a) {
-    if (trace_hid_reads_enabled || !dq8_mem_identity_span(a, 1u)) return mem8(a);
-    return ram[a];
+DQ8_MEM_FAST uint32_t dq8_mem16_fast(uint32_t a) {
+    if (a < 0x17FFFFFEu && !trace_hid_reads_enabled) {
+        uint16_t x; memcpy(&x, ram + a, sizeof(x)); return x;
+    }
+    return mem16(a);
 }
-static inline uint32_t dq8_mem16_fast(uint32_t a) {
-    if (trace_hid_reads_enabled || !dq8_mem_identity_span(a, 2u)) return mem16(a);
-    uint16_t x; memcpy(&x, ram + a, sizeof(x)); return x;
+DQ8_MEM_FAST uint32_t dq8_mem32_fast(uint32_t a) {
+    if (a < 0x17FFFFFCu && !trace_hid_reads_enabled) {
+        uint32_t x; memcpy(&x, ram + a, sizeof(x)); return x;
+    }
+    return mem32(a);
 }
-static inline uint32_t dq8_mem32_fast(uint32_t a) {
-    if (trace_hid_reads_enabled || !dq8_mem_identity_span(a, 4u)) return mem32(a);
-    uint32_t x; memcpy(&x, ram + a, sizeof(x)); return x;
+DQ8_MEM_FAST void dq8_put8_fast(uint32_t a, uint32_t v) {
+    if (a < 0x18000000u && trace_write_n == 0u && exclusive_addr == 0xFFFFFFFFu) {
+        ram[a] = (uint8_t)v; return;
+    }
+    put8(a, v);
 }
-static inline void dq8_fast_exclusive_store(uint32_t a, unsigned width) {
-    if (exclusive_addr == 0xFFFFFFFFu) return;
-    uint64_t end = (uint64_t)a + width;
-    uint64_t xend = (uint64_t)exclusive_addr + exclusive_size;
-    if ((uint64_t)a < xend && end > (uint64_t)exclusive_addr)
-        exclusive_addr = 0xFFFFFFFFu;
+DQ8_MEM_FAST void dq8_put16_fast(uint32_t a, uint32_t v) {
+    if (a < 0x17FFFFFEu && trace_write_n == 0u && exclusive_addr == 0xFFFFFFFFu) {
+        uint16_t x = (uint16_t)v; memcpy(ram + a, &x, sizeof(x)); return;
+    }
+    put16(a, v);
 }
-static inline int dq8_mem_store_traced(uint32_t a) {
-    /* up to 4 va:len ranges (t_41f38df0): the scalar form survived the array
-       conversion as `a >= trace_guest_write_addr`, which compares against the
-       array ADDRESS and silently disabled guest-store tracing for every part. */
-    for (unsigned i = 0; i < trace_write_n; ++i)
-        if (a >= trace_guest_write_addr[i] && a < trace_guest_write_end[i]) return 1;
-    return 0;
-}
-static inline void dq8_put8_fast(uint32_t a, uint32_t v) {
-    if (!dq8_mem_identity_span(a, 1u) || dq8_mem_store_traced(a)) { put8(a, v); return; }
-    dq8_fast_exclusive_store(a, 1u); ram[a] = (uint8_t)v;
-}
-static inline void dq8_put16_fast(uint32_t a, uint32_t v) {
-    if (!dq8_mem_identity_span(a, 2u) || dq8_mem_store_traced(a)) { put16(a, v); return; }
-    dq8_fast_exclusive_store(a, 2u); uint16_t x = (uint16_t)v;
-    memcpy(ram + a, &x, sizeof(x));
-}
-static inline void dq8_put32_fast(uint32_t a, uint32_t v) {
-    if (!dq8_mem_identity_span(a, 4u) || dq8_mem_store_traced(a)) { put32(a, v); return; }
-    dq8_fast_exclusive_store(a, 4u); memcpy(ram + a, &v, sizeof(v));
+DQ8_MEM_FAST void dq8_put32_fast(uint32_t a, uint32_t v) {
+    if (a < 0x17FFFFFCu && trace_write_n == 0u && exclusive_addr == 0xFFFFFFFFu) {
+        memcpy(ram + a, &v, sizeof(v)); return;
+    }
+    put32(a, v);
 }
 '''
 
@@ -359,6 +376,39 @@ def main():
         guest_pc_profile_limit = max(pc & ~1 for pc in translated_pcs) + 2
         guest_pc_profile_slots = (guest_pc_profile_limit - guest_pc_profile_base) // 2
 
+    def pc_prof_slot(pc):
+        return ((((pc & ~1) - guest_pc_profile_base) >> 1) * 2) + (pc & 1)
+
+    def pc_prof_tick(pc, stmt):
+        """Wrap one emitted instruction body with the guest-PC counter tick.
+
+        Only emitted when DQ8_GUEST_PC_PROFILE_BUILD=1, so the default output
+        is untouched.  Four counters per retired instruction:
+          pages[page]           -- executed instructions in this 4 KB page
+          pcs[slot]             -- executed count of this exact address
+          page_entries[page]    -- times control ARRIVED in this page from
+                                   another page (flow switches, not fallthrough)
+          pc_entries[slot]      -- times this address was arrived at
+                                   non-sequentially (delta != 2 and != 4), i.e.
+                                   a branch/call target rather than fall-through
+        The last two are the call profile: many arrivals + few instructions
+        per arrival = hot caller / small callee, the inverse = heavy body.
+        `DQ8_GUEST_PC_PROFILE_AFTER_MOVIE=1` restores the original gate that
+        only counted after the intro player had been entered.
+        """
+        return ("{ if (dq8_guest_pc_profile_enabled && "
+                "(!dq8_guest_pc_profile_after_movie || perf_movie_entries)) { "
+                "++dq8_guest_pc_profile_pages[0x%03Xu]; "
+                "++dq8_guest_pc_profile_pcs[%du]; "
+                "{ uint32_t _d = 0x%08Xu - dq8_guest_pc_profile_last_pc; "
+                "if (_d != 2u && _d != 4u) ++dq8_guest_pc_profile_pc_entries[%du]; } "
+                "if (dq8_guest_pc_profile_last_page != 0x%03Xu) { "
+                "++dq8_guest_pc_profile_page_entries[0x%03Xu]; "
+                "dq8_guest_pc_profile_last_page = 0x%03Xu; } "
+                "dq8_guest_pc_profile_last_pc = 0x%08Xu; } %s }"
+                % (pc >> 12, pc_prof_slot(pc), pc, pc_prof_slot(pc),
+                   pc >> 12, pc >> 12, pc >> 12, pc, stmt))
+
     # ---- prelude: un-static the shared symbols (everything before the dispatch switch)
     prelude = lines[:dispatch_idx]
     if guest_pc_profile:
@@ -368,27 +418,80 @@ def main():
             die("bench_report() not found for guest-PC profile output")
         prelude[profile_at:profile_at] = [
             "int dq8_guest_pc_profile_enabled;\n",
+            "int dq8_guest_pc_profile_after_movie;\n",
+            "uint32_t dq8_guest_pc_profile_last_pc = 0xFFFFFFFFu;\n",
+            "uint32_t dq8_guest_pc_profile_last_page = 0xFFFFFFFFu;\n",
             "uint64_t dq8_guest_pc_profile_pages[4096];\n",
+            "uint64_t dq8_guest_pc_profile_page_entries[4096];\n",
             "uint64_t dq8_guest_pc_profile_pcs[%d];\n" % (guest_pc_profile_slots * 2),
+            "uint64_t dq8_guest_pc_profile_pc_entries[%d];\n" % (guest_pc_profile_slots * 2),
+            "static uint64_t dq8_guest_pc_profile_t0_ns;\n",
             "static void dq8_guest_pc_profile_report(void) {\n",
+            "    unsigned long long _tot = 0, _pent = 0, _arr = 0;\n",
+            "    double _el;\n",
             "    if (!dq8_guest_pc_profile_enabled) return;\n",
-            "    fprintf(stderr, \"GUEST_PC_PROFILE_BEGIN after_movie_entry=%llu\\n\", (unsigned long long)perf_movie_entries);\n",
+            "    for (unsigned p = 0; p < 4096u; ++p) {\n",
+            "        _tot += (unsigned long long)dq8_guest_pc_profile_pages[p];\n",
+            "        _pent += (unsigned long long)dq8_guest_pc_profile_page_entries[p];\n",
+            "    }\n",
+            "    for (unsigned s = 0; s < %du; ++s)\n" % (guest_pc_profile_slots * 2),
+            "        _arr += (unsigned long long)dq8_guest_pc_profile_pc_entries[s];\n",
+            "    {\n",
+            "        struct timespec _now;\n",
+            "        clock_gettime(CLOCK_MONOTONIC, &_now);\n",
+            "        _el = (double)(_now.tv_sec * 1000000000ull + (unsigned long long)_now.tv_nsec\n",
+            "                       - dq8_guest_pc_profile_t0_ns) / 1e9;\n",
+            "    }\n",
+            "    fprintf(stderr, \"GUEST_PC_PROFILE_BEGIN after_movie_entry=%llu elapsed=%.3f\"\n",
+            "            \" total_steps=%llu page_entries=%llu pc_arrivals=%llu base=%08X slots=%u\\n\",\n",
+            "            (unsigned long long)perf_movie_entries, _el, _tot, _pent, _arr,\n",
+            "            0x%08Xu, (unsigned)%du);\n" % (guest_pc_profile_base, guest_pc_profile_slots * 2),
             "    for (unsigned page = 0; page < 4096u; ++page)\n",
             "        if (dq8_guest_pc_profile_pages[page])\n",
-            "            fprintf(stderr, \"GUEST_PC_PROFILE_PAGE page=%03X steps=%llu\\n\", page, (unsigned long long)dq8_guest_pc_profile_pages[page]);\n",
+            "            fprintf(stderr, \"GUEST_PC_PROFILE_PAGE page=%03X steps=%llu entries=%llu\\n\","
+            " page, (unsigned long long)dq8_guest_pc_profile_pages[page],"
+            " (unsigned long long)dq8_guest_pc_profile_page_entries[page]);\n",
             "    for (unsigned slot = 0; slot < %du; ++slot)\n" % (guest_pc_profile_slots * 2),
             "        if (dq8_guest_pc_profile_pcs[slot]) {\n",
             "            uint32_t pc = 0x%08Xu + ((slot >> 1) << 1) + (slot & 1u);\n" % guest_pc_profile_base,
-            "            fprintf(stderr, \"GUEST_PC_PROFILE_PC pc=%08X steps=%llu\\n\", pc, (unsigned long long)dq8_guest_pc_profile_pcs[slot]);\n",
+            "            fprintf(stderr, \"GUEST_PC_PROFILE_PC pc=%08X steps=%llu arrivals=%llu\\n\", pc,"
+            " (unsigned long long)dq8_guest_pc_profile_pcs[slot],"
+            " (unsigned long long)dq8_guest_pc_profile_pc_entries[slot]);\n",
             "        }\n",
+            "    fflush(stderr);\n",
+            "}\n",
+            "static void *dq8_guest_pc_profile_timer_thread(void *arg) {\n",
+            "    double _secs = *(const double *)arg;\n",
+            "    struct timespec _ts;\n",
+            "    _ts.tv_sec = (time_t)_secs;\n",
+            "    _ts.tv_nsec = (long)((_secs - (double)_ts.tv_sec) * 1e9);\n",
+            "    nanosleep(&_ts, NULL);\n",
+            "    fprintf(stderr, \"GUEST_PC_PROFILE_TIMER fired_after=%.3f\\n\", _secs);\n",
+            "    dq8_guest_pc_profile_report();\n",
+            "    fflush(stdout);\n",
+            "    _exit(0);\n",
+            "    return NULL;\n",
+            "}\n",
+            "static void dq8_guest_pc_profile_arm_timer(double secs) {\n",
+            "    static double _slot;\n",
+            "    pthread_t _t;\n",
+            "    _slot = secs;\n",
+            "    if (pthread_create(&_t, NULL, dq8_guest_pc_profile_timer_thread, &_slot) != 0)\n",
+            "        fprintf(stderr, \"GUEST_PC_PROFILE_TIMER create failed\\n\");\n",
+            "    else\n",
+            "        pthread_detach(_t);\n",
             "}\n",
         ]
-        for i, line in enumerate(prelude):
-            if line.strip() == "exit(0);" and i and "fflush(stderr);" in prelude[i - 1]:
-                prelude[i] = "    dq8_guest_pc_profile_report();\n" + line
+        report_at = next((i for i in range(len(prelude))
+                          if prelude[i].startswith("static void bench_report(")), None)
+        exit_at = None
+        for i in range(report_at or 0, min(len(prelude), (report_at or 0) + 400)):
+            if prelude[i].strip() == "exit(0);":
+                exit_at = i
                 break
-        else:
+        if exit_at is None:
             die("bench_report() exit not found for guest-PC profile output")
+        prelude[exit_at] = "    dq8_guest_pc_profile_report();\n" + prelude[exit_at]
     if overrides:
         bench_at = next((i for i, line in enumerate(prelude)
                          if line.startswith("static void bench_report(")), None)
@@ -476,6 +579,23 @@ def main():
                 boundary_pcs.add(int(m.group(1), 16))
         sys.stderr.write("chain mode: %d static boundary pcs\n" % len(boundary_pcs))
 
+    # ---- S2 (t_6edf5d17): fast entry compare / cold dispatch switch / block
+    # budgets.  Generation-time gate: DQ8_S2 is a comma list of stage names
+    # (entry, cold, block) and requires chain mode.  Unset -> the accepted S1
+    # chain output is emitted byte-identically.
+    s2_flags = set(x.strip() for x in os.environ.get("DQ8_S2", "").split(",")
+                   if x.strip())
+    s2_unknown = s2_flags - {"entry", "cold", "block"}
+    if s2_unknown:
+        die("DQ8_S2: unknown stage(s) %r (allowed: entry,cold,block)"
+            % sorted(s2_unknown))
+    if s2_flags and not chain:
+        die("DQ8_S2 requires DQ8_SPLIT_CHAIN=1")
+    s2_cold = "cold" in s2_flags
+    s2_block = "block" in s2_flags
+    if s2_flags:
+        sys.stderr.write("S2 stages: %s\n" % ",".join(sorted(s2_flags)))
+
     def stmt_successors(stmt):
         """Statically known PC successors of one translated statement.
 
@@ -511,8 +631,13 @@ def main():
         fh.write("\n#define DQ8_RT_RAM_SIZE %s\n\n" % ram_size)
         if guest_pc_profile:
             fh.write("extern int dq8_guest_pc_profile_enabled;\n")
-            fh.write("extern uint64_t dq8_guest_pc_profile_pages[4096];\n\n")
-            fh.write("extern uint64_t dq8_guest_pc_profile_pcs[%d];\n\n" % (guest_pc_profile_slots * 2))
+            fh.write("extern int dq8_guest_pc_profile_after_movie;\n")
+            fh.write("extern uint32_t dq8_guest_pc_profile_last_pc;\n")
+            fh.write("extern uint32_t dq8_guest_pc_profile_last_page;\n")
+            fh.write("extern uint64_t dq8_guest_pc_profile_pages[4096];\n")
+            fh.write("extern uint64_t dq8_guest_pc_profile_page_entries[4096];\n")
+            fh.write("extern uint64_t dq8_guest_pc_profile_pcs[%d];\n" % (guest_pc_profile_slots * 2))
+            fh.write("extern uint64_t dq8_guest_pc_profile_pc_entries[%d];\n\n" % (guest_pc_profile_slots * 2))
         if inline_memory:
             fh.write(INLINE_MEMORY_HELPERS)
         fh.write("\n")
@@ -597,12 +722,7 @@ def main():
             for (pc, raw) in cases:
                 stmt = raw
                 if guest_pc_profile:
-                    stmt = ("{ if (dq8_guest_pc_profile_enabled && "
-                            "perf_movie_entries) { ++dq8_guest_pc_profile_pages"
-                            "[0x%03Xu]; ++dq8_guest_pc_profile_pcs[%du]; } %s }"
-                            % (pc >> 12,
-                               (((pc & ~1) - guest_pc_profile_base) >> 1) * 2
-                               + (pc & 1), stmt))
+                    stmt = pc_prof_tick(pc, stmt)
                 if overrides and any(it["start"] <= pc < it["end"]
                                      for it in overrides):
                     stmt = (
@@ -676,6 +796,304 @@ def main():
                      "*steps_io = steps;\n")
             fh.write("    return hit;\n}\n")
 
+    def write_s2_part(path, bi, chunk, pcset):
+        """Emit one band in S2 mode (t_6edf5d17).
+
+        Layout (hot code first, dispatch/entry furniture out of line):
+
+            for (;;) {
+                goto DISPATCH;              /* part entry: cold */
+              LB_<pc>:                     /* hot block entry */
+                if (_budget < L) break;     /* S2c: one budget check per block */
+                _budget -= L; steps += L;
+                if (_tracing && boundary(pc)) { steps -= rest; break; }
+              T_<pc>: ; <stmt>              /* per-instruction trace guard only */
+                ...                         /* next instruction directly follows */
+                <block end: PC stores, running, transfer>
+              ARRIVE: ...                   /* unproven transfer / shim return */
+              DISPATCH: switch (pc) ...     /* cold */
+              C_<pc>: hit = 1; [charge] goto T_<pc>;   /* cold entry stubs */
+              ESCAPE: break;
+            }
+
+        S2a (`entry`): the cold entry stubs exist, so the per-instruction
+        `if (_entry)` test of the S1 chain is gone and every executed guest
+        instruction is credited exactly once (S1 double-credited intra-band
+        cold arrivals and ran the post-statement budget check twice for
+        branch instructions).
+        S2b (`cold`): a single-level `switch (pc)` - the caller already picked
+        this part by page, so the S1 `switch (pc >> 12)` level only re-tests
+        known information - and the whole dispatch lives in the cold tail
+        instead of in the hot fall-through line.
+        S2c (`block`): one `_budget` charge and one `steps` credit per
+        straight-line block, per-block PC bookkeeping and running check;
+        mid-block cold entries charge only the executed remainder.
+        Statements that observe runtime state by reference (`&pc`, `&running`,
+        `&steps`) or that assign `running` are emitted as their own cold
+        terminator block with the PC stores in front, so every shim sees the
+        same state the single-TU dispatcher gives it.
+        """
+        cases = []
+        for (rng, first, past) in chunk:
+            for k in range(first + 1, past - 1):
+                m = CASE_RE.match(lines[k].rstrip("\n"))
+                if not m:
+                    die("S2: unparsable case line %d: %r" % (k + 1, lines[k][:120]))
+                cases.append((int(m.group(1), 16), m.group(2)))
+        if len({pc for pc, _ in cases}) != len(cases):
+            die("S2: duplicate pc in band %d" % bi)
+
+        def render(pc, raw):
+            stmt = raw
+            if guest_pc_profile:
+                stmt = pc_prof_tick(pc, stmt)
+            if overrides and any(it["start"] <= pc < it["end"]
+                                 for it in overrides):
+                stmt = (
+                    "{ int _dq8_override_result = DQ8_OVERRIDE_CALL_ORIGINAL; "
+                    "if (dq8_overrides_enabled) _dq8_override_result = "
+                    "dq8_override_dispatch(pc, r, &pc, &n, &z, &c, &v, &ge, "
+                    "&running, &steps, &_budget); "
+                    "if (_dq8_override_result == DQ8_OVERRIDE_HANDLED) "
+                    "goto ARRIVE; "
+                    "if (_dq8_override_result != DQ8_OVERRIDE_CALL_ORIGINAL) { "
+                    "fprintf(stderr, \"override %08X returned invalid status "
+                    "%d\\n\", pc, _dq8_override_result); exit(17); } "
+                    + stmt + " }")
+            if inline_memory:
+                for helper in ("mem8", "mem16", "mem32", "put8", "put16",
+                               "put32"):
+                    stmt = re.sub(r"\b%s\(" % helper,
+                                  "dq8_%s_fast(" % helper, stmt)
+            return stmt
+
+        pcs = [pc for pc, _ in cases]
+        stmts = {pc: render(pc, raw) for pc, raw in cases}
+        succs = {pc: stmt_successors(stmts[pc]) for pc in pcs}
+        RUNNING_ASSIGN = re.compile(r"(?<![=&!<>+\-*/])\brunning\s*=(?!=)")
+        OBSERVE = ("&pc", "&running", "&steps")
+
+        def observes(p):
+            """Statement reads/writes dispatcher state by reference."""
+            s = stmts[p]
+            return any(k in s for k in OBSERVE) or RUNNING_ASSIGN.search(s)
+
+        def cold_pc(p):
+            return succs[p] is None or observes(p)
+
+        nxt_of = {}
+        for i, p in enumerate(pcs):
+            nxt_of[p] = pcs[i + 1] if i + 1 < len(pcs) else None
+
+        def hot_targets(p):
+            if cold_pc(p):
+                return []
+            return [t for t in sorted(succs[p])
+                    if t in pcset and t not in boundary_pcs]
+
+        def fallthrough(p):
+            h = hot_targets(p)
+            return len(h) == 1 and h[0] == nxt_of[p]
+
+        # Block starts: the band entry and every pc a *jump* can land on.
+        starts = {pcs[0]}
+        for p in pcs:
+            if cold_pc(p) or fallthrough(p):
+                continue
+            starts.update(hot_targets(p))
+        blocks_seq = []
+        cur = []
+        prev_ft = False
+        for p in pcs:
+            if cur and (p in starts or not prev_ft or len(cur) >= S2_MAX_BLOCK):
+                blocks_seq.append(cur)
+                cur = []
+            cur.append(p)
+            prev_ft = fallthrough(p)
+        if cur:
+            blocks_seq.append(cur)
+        blk_of = {}
+        for k, blk in enumerate(blocks_seq):
+            for j, p in enumerate(blk):
+                blk_of[p] = (k, j)
+
+        with open(path, "w") as fh:
+            fh.write("/* generated by tools/split_dispatch.py - do not edit */\n")
+            fh.write("/* S2 mode (t_6edf5d17): stages %s -\n"
+                     "   fast entry stubs%s, cold dispatch switch%s, block"
+                     " budgets%s */\n"
+                     % (",".join(sorted(s2_flags)), "",
+                        "" if s2_cold else " (off)",
+                        "" if s2_block else " (off)"))
+            fh.write('#include "dq8_rt.h"\n\n')
+            fh.write("int dq8_part_%03d(uint32_t *r, uint32_t *pc_io, int *n_io, "
+                     "int *z_io, int *c_io, int *v_io, int *ge_io, int *running_io, "
+                     "uint64_t *steps_io, int is_main) {\n" % bi)
+            fh.write("    uint32_t pc = *pc_io;\n")
+            fh.write("    int n = *n_io, z = *z_io, c = *c_io, v = *v_io, "
+                     "ge = *ge_io, running = *running_io;\n")
+            fh.write("    uint64_t steps = *steps_io;\n")
+            fh.write("    int hit = 0;\n")
+            fh.write("    (void)n; (void)z; (void)c; (void)v; (void)ge; "
+                     "(void)running; (void)steps; (void)is_main;\n")
+            fh.write("    unsigned _budget = %d;\n" % CHAIN_BATCH)
+            fh.write("    int _tracing = trace_guest_pc_count != 0;\n")
+            if s2_block:
+                fh.write("    int _pre = 1;\n")
+            fh.write("    for (;;) {\n")
+            fh.write("        goto DISPATCH;\n")
+            for k, blk in enumerate(blocks_seq):
+                L = len(blk)
+                fh.write("    LB_%08X: ;\n" % blk[0])
+                if s2_block:
+                    fh.write("        if (_budget < %du) break;\n" % L)
+                    fh.write("        _budget -= %du;\n" % L)
+                    fh.write("        steps += %du;\n" % L)
+                for j, p in enumerate(blk):
+                    is_last = (j == L - 1)
+                    s = stmts[p]
+                    # Per-instruction trace guard: a DQ8_TRACE_PC pc must be
+                    # reported by the main loop before it executes, exactly as
+                    # the S1 chain does at its label prologue.
+                    comp = ("steps -= %du; " % (L - j)) if s2_block else ""
+                    fh.write("        if (_tracing && dq8_pc_needs_boundary(pc)) "
+                             "{ %sbreak; }\n" % comp)
+                    fh.write("    T_%08X: ;\n" % p)
+                    if not s2_block:
+                        fh.write("        ++steps;\n")
+                        fh.write("        if (is_main) main_guest_pc = pc;\n")
+                        fh.write("        previous_guest_pc = current_guest_pc;\n")
+                        fh.write("        current_guest_pc = pc;\n")
+                    elif observes(p):
+                        # Own-block terminator: the shim must see the state of
+                        # the dispatcher exactly as in the per-instruction loop.
+                        fh.write("        if (is_main) main_guest_pc = 0x%08Xu;\n" % p)
+                        if j > 0:
+                            fh.write("        previous_guest_pc = 0x%08Xu;\n"
+                                     % blk[j - 1])
+                        else:
+                            fh.write("        previous_guest_pc = current_guest_pc;\n")
+                        fh.write("        current_guest_pc = 0x%08Xu;\n" % p)
+                    fh.write("        { %s }\n" % s)
+                    if not is_last:
+                        continue
+                    if s2_block and not observes(p):
+                        fh.write("        if (is_main) main_guest_pc = 0x%08Xu;\n" % p)
+                        if j > 0:
+                            fh.write("        previous_guest_pc = 0x%08Xu;\n"
+                                     % blk[j - 1])
+                        else:
+                            fh.write("        previous_guest_pc = current_guest_pc;\n")
+                        fh.write("        current_guest_pc = 0x%08Xu;\n" % p)
+                    fh.write("        if (!running) break;\n")
+                    if not s2_block:
+                        fh.write("        if (--_budget == 0) break;\n")
+                    # Transfer.
+                    if cold_pc(p) or not hot_targets(p):
+                        fh.write("        goto ARRIVE;\n")
+                        continue
+                    h = hot_targets(p)
+                    all_hot = len(h) == len(succs[p])
+                    nxtblk = blocks_seq[k + 1][0] if k + 1 < len(blocks_seq) else None
+                    if all_hot and len(h) == 1:
+                        if h[0] == nxtblk:
+                            pass          # fall through into the next LB
+                        else:
+                            fh.write("        goto LB_%08X;\n" % h[0])
+                    elif all_hot:
+                        fh.write("        %s\n" % ("".join(
+                            "if (pc == 0x%08Xu) goto LB_%08X; else " % (t, t)
+                            for t in h[:-1]) + "goto LB_%08X;" % h[-1]))
+                    else:
+                        # Some arm is not chainable (out of band / static
+                        # boundary): test the chainable arms, everything else
+                        # takes the exact cold path.
+                        fh.write("        %s\n" % ("".join(
+                            "if (pc == 0x%08Xu) goto LB_%08X; else " % (t, t)
+                            for t in h) + "goto ARRIVE;"))
+            # ---- cold tail: arrival, dispatch, entry stubs, escape
+            fh.write("    ARRIVE: ;\n")
+            fh.write("        if (!running) break;\n")
+            fh.write("        if (dq8_pc_needs_boundary(pc)) break;\n")
+            if s2_block:
+                # The entry stub charges this pc's remaining block instructions
+                # (`rem - _pre`) - no step credit here.  The PC bookkeeping is
+                # the S1 ARRIVE state: previous = last executed pc, current =
+                # the target about to execute (the escape diagnostic and the
+                # shims read exactly this).
+                fh.write("        if (is_main) main_guest_pc = pc;\n")
+                fh.write("        previous_guest_pc = current_guest_pc;\n")
+                fh.write("        current_guest_pc = pc;\n")
+                fh.write("        _pre = 0;\n")
+            else:
+                fh.write("        ++steps;\n")
+                fh.write("        if (is_main) main_guest_pc = pc;\n")
+                fh.write("        previous_guest_pc = current_guest_pc;\n")
+                fh.write("        current_guest_pc = pc;\n")
+            fh.write("    DISPATCH: ;\n")
+            # The page-level default of the single-TU switch is an *escape*
+            # (report + exit(3)) for a pc that belongs to this band's pages but
+            # has no translation; a pc from another band is handed back to the
+            # main dispatcher.  Both are needed: the S1 chain copies that
+            # default verbatim, and the escape diagnostic's previous-PC
+            # attribution must stay identical (tools/test_split_hooks.py).
+            esc_stmt = None
+            for (rng, first, past) in chunk:
+                dl = lines[past - 1].strip()
+                if dl.startswith("default:"):
+                    body = dl[len("default:"):]
+                    cut = body.rfind("} break;")
+                    if cut >= 0:
+                        body = body[:cut]
+                    esc_stmt = body.strip()
+                    break
+            if not esc_stmt:
+                esc_stmt = 'fprintf(stderr, "translated PC escaped to %08X after %08X\\n", pc, previous_guest_pc); exit(3);'
+            if s2_cold:
+                fh.write("        switch (pc) {\n")
+                for p in pcs:
+                    fh.write("        case 0x%08Xu: goto C_%08X;\n" % (p, p))
+                fh.write("        default: goto DFLT;\n")
+                fh.write("        }\n")
+            else:
+                fh.write("        switch (pc >> 12) {\n")
+                for (rng, first, past) in chunk:
+                    fh.write("        case 0x%03X: switch (pc) {\n" % rng)
+                    for k in range(first + 1, past - 1):
+                        m = CASE_RE.match(lines[k].rstrip("\n"))
+                        fh.write("        case 0x%08Xu: goto C_%08X;\n"
+                                 % (int(m.group(1), 16), int(m.group(1), 16)))
+                    fh.write("        default: %s\n" % esc_stmt)
+                    fh.write("        }\n")
+                    fh.write("        goto ESCAPE;\n")
+                fh.write("        default: goto ESCAPE;\n        }\n")
+            for p in pcs:
+                k, j = blk_of[p]
+                rem = len(blocks_seq[k]) - j
+                fh.write("    C_%08X: ;\n" % p)
+                fh.write("        hit = 1;\n")
+                if s2_block:
+                    fh.write("        if (_budget < %du) break;\n" % rem)
+                    fh.write("        _budget -= %du;\n" % rem)
+                    fh.write("        steps += %du - _pre;\n" % rem)
+                    fh.write("        _pre = 0;\n")
+                fh.write("        goto T_%08X;\n" % p)
+            if s2_cold:
+                fh.write("    DFLT: ;\n")
+                fh.write("        switch (pc >> 12) {\n")
+                for (rng, first, past) in chunk:
+                    fh.write("        case 0x%03X:\n" % rng)
+                fh.write("            %s\n" % esc_stmt)
+                fh.write("        default: goto ESCAPE;\n")
+                fh.write("        }\n")
+            fh.write("    ESCAPE: ;\n")
+            fh.write("        break;\n")
+            fh.write("    }\n")
+            fh.write("    *pc_io = pc; *n_io = n; *z_io = z; *c_io = c; "
+                     "*v_io = v; *ge_io = ge; *running_io = running; "
+                     "*steps_io = steps;\n")
+            fh.write("    return hit;\n}\n")
+
     parts = []           # (band index, first range of the band)
     for bi in sorted(bands):
         chunk = bands[bi]
@@ -688,7 +1106,10 @@ def main():
                     if not m:
                         die("chain mode: unparsable case line %d" % (k + 1))
                     pcset.add(int(m.group(1), 16))
-            write_chain_part(path, bi, chunk, pcset)
+            if s2_flags:
+                write_s2_part(path, bi, chunk, pcset)
+            else:
+                write_chain_part(path, bi, chunk, pcset)
             parts.append((bi, [rng for (rng, _first, _past) in chunk]))
             continue
         with open(path, "w") as fh:
@@ -737,12 +1158,9 @@ def main():
                     case_match = re.match(r"^(case 0x([0-9A-Fa-f]+):) \{ (.*) break; \}\s*$", line)
                     if guest_pc_profile and case_match:
                         case_pc = int(case_match.group(2), 16)
-                        line = ("%s { if (dq8_guest_pc_profile_enabled && perf_movie_entries) "
-                                "{ ++dq8_guest_pc_profile_pages[0x%03Xu]; "
-                                "++dq8_guest_pc_profile_pcs[%du]; } %s break; }\n") % (
-                                    case_match.group(1), case_pc >> 12,
-                                    (((case_pc & ~1) - guest_pc_profile_base) >> 1) * 2 + (case_pc & 1),
-                                    case_match.group(3))
+                        line = ("%s { %s break; }\n"
+                                % (case_match.group(1),
+                                   pc_prof_tick(case_pc, case_match.group(3))))
                         case_match = re.match(r"^(case 0x([0-9A-Fa-f]+):) \{ (.*) break; \}\s*$", line)
                     if overrides and case_match:
                         case_pc = int(case_match.group(2), 16)
@@ -822,7 +1240,18 @@ def main():
             if overrides:
                 gates.append("    if (getenv(\"DQ8_DISABLE_OVERRIDES\")) dq8_overrides_enabled = 0;")
             if guest_pc_profile:
-                gates.append("    dq8_guest_pc_profile_enabled = getenv(\"DQ8_GUEST_PC_PROFILE\") != NULL;")
+                gates.append('    dq8_guest_pc_profile_enabled = getenv("DQ8_GUEST_PC_PROFILE") != NULL;')
+                gates.append("    if (dq8_guest_pc_profile_enabled) {")
+                gates.append("        struct timespec _pct;")
+                gates.append('        dq8_guest_pc_profile_after_movie = getenv("DQ8_GUEST_PC_PROFILE_AFTER_MOVIE") != NULL;')
+                gates.append("        clock_gettime(CLOCK_MONOTONIC, &_pct);")
+                gates.append("        dq8_guest_pc_profile_t0_ns = (uint64_t)_pct.tv_sec * 1000000000ull"
+                             " + (uint64_t)_pct.tv_nsec;")
+                gates.append('        { const char *_ps = getenv("DQ8_GUEST_PC_PROFILE_SECS");'
+                             ' if (_ps && *_ps) dq8_guest_pc_profile_arm_timer(atof(_ps)); }')
+                gates.append("        fprintf(stderr, \"GUEST_PC_PROFILE armed after_movie_gate=%d\\n\",")
+                gates.append("                dq8_guest_pc_profile_after_movie);")
+                gates.append("    }")
             tail_text = tail_text.replace(main_marker, main_marker + "\n" + "\n".join(gates), 1)
         elif guest_pc_profile:
             die("main() not found for guest-PC profile gate")

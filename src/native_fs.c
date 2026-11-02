@@ -117,7 +117,7 @@ static int native_fs_dispatch(uint32_t handle,uint32_t command) {
     if(handle==8u && command==0x080C00C2u) {
         uint32_t kind=mem32(tls+0x84u),type=mem32(tls+0x88u),size=mem32(tls+0x8Cu);
         uint32_t path=mem32(tls+0x94u),mapped;
-        if(kind!=4u && kind!=6u && kind!=7u && kind!=8u)return 0;
+        if(kind!=4u && kind!=6u && kind!=7u && kind!=8u && kind!=9u)return 0;
         uint32_t hash=0;
         if(type==2u) {
             if(size>1024u || !guest_memory_range(path,size,&mapped)) {
@@ -291,11 +291,11 @@ static int native_fs_dispatch(uint32_t handle,uint32_t command) {
         native_fs_reply(command,0x40u,error);
         return 1;
     }
-    if(handle==8u && (command==0x080201C2u || command==0x080801C2u || (command>>16)==0x0809u)) {
+    if(handle==8u && (command==0x080201C2u || command==0x080801C2u || command==0x08080202u || (command>>16)==0x0809u)) {
         uint32_t archive=mem32(tls+0x88u),high=mem32(tls+0x8Cu);
         if(archive>=256u || !native_archive_paths[archive][0])return 0;
         char path[2048]={0};uint32_t error=high?0xC8804465u:native_fs_path(archive,mem32(tls+0x90u),mem32(tls+0x94u),
-            mem32(tls+(command==0x080801C2u?0xA8u:command==0x080201C2u?0xA4u:0xA0u)),path,sizeof(path));
+            mem32(tls+((command==0x080801C2u||command==0x08080202u)?0xA8u:command==0x080201C2u?0xA4u:0xA0u)),path,sizeof(path));
         FILE *file=NULL;uint32_t session=0;
         if(!error && command==0x080201C2u) {
             uint32_t flags=mem32(tls+0x98u);
@@ -308,7 +308,7 @@ static int native_fs_dispatch(uint32_t handle,uint32_t command) {
                 snprintf(native_file_paths[session],sizeof native_file_paths[session],"%s",path);
                 native_file_modes[session]=(uint8_t)mode;
             }
-        } else if(!error && command==0x080801C2u) {
+        } else if(!error && (command==0x080801C2u || command==0x08080202u)) {
             uint64_t length=(uint64_t)mem32(tls+0x9Cu)|((uint64_t)mem32(tls+0xA0u)<<32);
             if(length>0x4000000u)error=0xD9004676u;
             else {
@@ -358,6 +358,10 @@ static int native_fs_dispatch(uint32_t handle,uint32_t command) {
                    power-loss durability is a separate policy decision, not promised here. */
                 else if(write && fflush(file)) { error=native_fs_error(); bytes=0; }
             }
+            if(getenv("DQ8_TRACE_FS_SAVE") && native_file_paths[handle][0] &&
+               strstr(native_file_paths[handle],"honeySave"))
+                fprintf(stderr,"FS SAVE %s off=%llu size=%u bytes=%u err=%08X h=%08X\n",
+                        write?"write":"read",(unsigned long long)offset,size,bytes,error,handle);
             native_fs_reply(command,0x82u,error);put32(tls+0x88u,bytes);put32(tls+0x8Cu,desc);put32(tls+0x90u,ptr);return 1;
         }
         if(command==0x08040000u) {

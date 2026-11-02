@@ -19,7 +19,7 @@ T1=${3:-20}
 T2=${4:-50}
 DUR=${5:-70}
 case "$BIN" in /*) ;; *) BIN="$PWD/$BIN" ;; esac
-OUT="$PWD/evidence/t_3de68379/static/$LAB"
+OUT="${S2_STATIC_DIR:-$PWD/evidence/t_3de68379/static}/$LAB"
 mkdir -p "$OUT/userdata/archive-00000004-00000000"
 rm -f "$OUT/a1.ppm" "$OUT/a2.ppm" "$OUT/dq8-screen.ppm" "$OUT/run.log"
 cp -f /home/hermes/DQ8/saves/honeySave.bin \

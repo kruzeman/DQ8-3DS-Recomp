@@ -1651,6 +1651,31 @@ int main(void) {{
     Ok(())
 }
 
+// Wrap one lowered instruction body in its ARM condition.
+//
+// The dispatcher case is `case 0x<pc>: { <stmt> break; }`.  For a conditionally
+// executed instruction the statement has to be
+//
+//     if (<cond>) { <body> } else { pc = <fallthrough>; }
+//
+// because a failed condition must continue at the next address.  For an
+// UNconditional instruction (`cond` 14/15, i.e. the literal condition "1") the
+// else arm can never be reached, yet it used to be emitted too: 88.6% of the
+// whole image carried a second `pc` constant and a duplicate fall-through store
+// that the front end and every optimiser pass still had to parse, number and
+// reason about.  clang folds `if (1)` away, so the machine code is unchanged --
+// the cost was the translation unit's size and the build time it buys.  When the
+// condition is statically true the body alone is the same program -- same
+// architectural state, same touched memory, same PC on exit -- so it is emitted
+// unwrapped.
+fn condition_wrap(condition: &str, body: &str, fallthrough: &str) -> String {
+    if condition == "1" {
+        body.to_string()
+    } else {
+        format!("if ({condition}) {{ {body} }} else {{ {fallthrough} }}")
+    }
+}
+
 fn arm_condition_c(cond: u32) -> &'static str {
     match cond {
         0 => "z",
@@ -1925,6 +1950,32 @@ fn arm_pc_relative_jump_table_targets(
         }
     }
     targets
+}
+
+// Enqueue a translation seed whose instruction-set state the decoder has
+// already established (a BL/BX/table entry inside A32 or Thumb code), as
+// opposed to a bare address from recomp-roots.txt where the mode has to be
+// inferred from the bytes.
+//
+// An explicitly ARM seed must NOT be re-classified by looks_like_thumb_entry():
+// that heuristic byte-swaps the first word, so an A32 `BL` such as EB04F213
+// reads as the Thumb pair 0xF213/0xEB04 - a valid Thumb BLX.  Classifying the
+// seed as Thumb emits the block only under the odd (Thumb) key, so the guest's
+// even ARM address has no case and the dispatch escapes.  That is exactly the
+// 0x002B007C battle escape: the conditional switch `LDRCC pc,[pc,r0,lsl#2]` at
+// 0x002B001C seeds the case-2 body 0x002B007C, whose first instruction is
+// `BL 0x003EC8D0`, and the body was translated in Thumb state instead.
+// `force_a32` is the existing mechanism that pins a seed to A32 decoding.
+fn enqueue_known_seed(
+    pending: &mut Vec<(u32, bool)>,
+    force_a32: &mut BTreeSet<u32>,
+    target: u32,
+    thumb: bool,
+) {
+    if !thumb {
+        force_a32.insert(target & !1);
+    }
+    pending.push((target & !1, thumb));
 }
 
 #[cfg(test)]
@@ -2304,7 +2355,7 @@ fn recompile_arm_function_with_noreturn(
                         format!("unsupported Thumb-2 branch at 0x{addr:08X}: {h:04X} {h2:04X}")
                     })?;
                     if target >= base && target as usize + 2 <= base as usize + bytes.len() {
-                        pending.push((target, !blx_arm));
+                        enqueue_known_seed(&mut pending, &mut force_a32, target, !blx_arm);
                     }
                     next = addr.wrapping_add(4);
                     next_key = next | 1;
@@ -2568,12 +2619,10 @@ fn recompile_arm_function_with_noreturn(
                         pending.push((addr, false));
                         if !emitted.contains_key(&probe) {
                             let back = probe | 1;
-                            emitted.insert(
-                                probe,
-                                format!(
-                                    "if (1) {{ pc = 0x{back:08X}u; }} else {{ pc = 0x{back:08X}u; }}"
-                                ),
-                            );
+                            // Unconditional redirect: the sentinel hands control
+                            // back to Thumb state at `back`, so there is no
+                            // second (unreachable) fall-through arm to emit.
+                            emitted.insert(probe, format!("pc = 0x{back:08X}u;"));
                         }
                         // This Thumb case only redirects into its A32 twin; the
                         // Thumb walk itself continues, so the case at (addr+4)|1
@@ -2603,7 +2652,11 @@ fn recompile_arm_function_with_noreturn(
                 }
                 emitted.insert(
                     pc_key,
-                    format!("if ({condition}) {{ {body} }} else {{ pc = 0x{next_key:08X}u; }}"),
+                    condition_wrap(
+                        &condition,
+                        &body,
+                        &format!("pc = 0x{next_key:08X}u;"),
+                    ),
                 );
                 total_insns += 1;
                 if ended {
@@ -3592,7 +3645,7 @@ fn recompile_arm_function_with_noreturn(
                         ));
                     } else {
                         if target >= base && target as usize + 4 <= base as usize + bytes.len() {
-                            pending.push((target, blx_thumb));
+                            enqueue_known_seed(&mut pending, &mut force_a32, target, blx_thumb);
                         }
                         body.push_str(&format!(
                             "r[14] = 0x{:08X}u; pc = 0x{:08X}u;",
@@ -3610,7 +3663,7 @@ fn recompile_arm_function_with_noreturn(
                     }
                 } else {
                     if target >= base && target as usize + 4 <= base as usize + bytes.len() {
-                        pending.push((target, false));
+                        enqueue_known_seed(&mut pending, &mut force_a32, target, false);
                     }
                     body.push_str(&format!("pc = 0x{target:08X};"));
                     changes_pc = true;
@@ -3828,6 +3881,208 @@ fn recompile_arm_function_with_noreturn(
                 body.push_str(&format!(
                     "exclusive_addr = r[{rn}]; exclusive_size = 4; r[{rd}] = mem32(exclusive_addr);"
                 ));
+            } else if (w & 0x0FF0_0090 == 0x0700_0010)
+                || (w & 0x0FF0_0090 == 0x0740_0010)
+                || (w & 0x0FF0_0010 == 0x0750_0010)
+                || (w & 0x0F90_0090 == 0x0100_0080)
+                || (w & 0x0F90_00F0 == 0x0100_0050)
+            {
+                // ARMv5TE/ARMv6 media multiply + saturating family: SMLAD/SMUAD/
+                // SMLSD/SMUSD, SMLALD/SMLSLD, SMMUL/SMMLA/SMMLS, the halfword
+                // multiplies SMLAxy/SMULxy/SMLAWy/SMULWy/SMLALxy, and
+                // QADD/QSUB/QDADD/QDSUB.  Every one of these shares the
+                // bits[27:24]=0001/0111 corner with the generic load/store and
+                // data-processing spaces, so they MUST be matched before both:
+                //   * SMLAD (0xE701CB17) at pc=0x00189B08 fell into the generic
+                //     LDR/STR arm, which flags the register-offset bit4=1 shape
+                //     as unsupported -> exit(15) in the round-18 REAL operator
+                //     run (esc35) inside the fixed-point DSP routine at
+                //     0x00189ABC right after the in-game START press;
+                //   * SMLAxy/QADD (bits[27:26]=00) fell through to the
+                //     data-processing arm and were SILENTLY misdecoded as
+                //     logical/arith ops one instruction later.
+                // References (both local): dyncom interpreter semantics
+                // (arm_dyncom_interpreter.cpp SMLAD_INST / SMLA_INST /
+                // SMULW_INST / SMLALXY_INST / SMMUL_INST / QADD_INST) and
+                // azahar fastinterp decode masks (fastinterp_decode.cpp
+                // "Halfword multiplies" / "QADD/QSUB/QDADD/QDSUB" blocks,
+                // arm_misc.inc handlers), cross-checked against llvm-mc
+                // round-trip encodings of every variant.  The Q flag (CPSR
+                // bit 27) is not modeled by this runtime, matching the
+                // existing SSAT/USAT arms, which also skip it.
+                let half = |reg: usize, top: bool| -> String {
+                    if top {
+                        format!("(int32_t)(int16_t)((r[{reg}] >> 16) & 0xFFFFu)")
+                    } else {
+                        format!("(int32_t)(int16_t)(r[{reg}] & 0xFFFFu)")
+                    }
+                };
+                let (media, rejected) = if w & 0x0FF0_0090 == 0x0700_0010 {
+                    // SMLAD/SMUAD/SMLSD/SMUSD: bits27-20=0x70, bit6 selects
+                    // sub (p1-p2) vs add (p1+p2), bit5 swaps Rm halves (X),
+                    // bit4=1.  Rd=r16-19 Ra=r12-15 Rm=r8-11 Rn=r0-3;
+                    // Ra==15 means no accumulate (the SMUAD/SMUSD forms).
+                    let rd = ((w >> 16) & 15) as usize;
+                    let ra = ((w >> 12) & 15) as usize;
+                    let rm = ((w >> 8) & 15) as usize;
+                    let rn = (w & 15) as usize;
+                    if rd == 15 || rn == 15 || rm == 15 {
+                        (String::new(), true)
+                    } else {
+                        let rmv = if (w >> 5) & 1 == 1 {
+                            format!("(((r[{rm}] & 0xFFFFu) << 16) | (r[{rm}] >> 16))")
+                        } else {
+                            format!("r[{rm}]")
+                        };
+                        let sum = if (w >> 6) & 1 == 1 {
+                            "(_p1 - _p2)"
+                        } else {
+                            "(_p1 + _p2)"
+                        };
+                        let acc = if ra != 15 {
+                            format!(" _s += r[{ra}];")
+                        } else {
+                            String::new()
+                        };
+                        (format!("{{ uint32_t _rmv = {rmv}; uint32_t _p1 = (uint32_t)((int32_t)(int16_t)(r[{rn}] & 0xFFFFu) * (int32_t)(int16_t)(_rmv & 0xFFFFu)); uint32_t _p2 = (uint32_t)((int32_t)(int16_t)(r[{rn}] >> 16) * (int32_t)(int16_t)(_rmv >> 16)); uint32_t _s = {sum};{acc} r[{rd}] = _s; }}"), false)
+                    }
+                } else if w & 0x0FF0_0090 == 0x0740_0010 {
+                    // SMLALD/SMLSLD: bits27-20=0x74, bit6 sub vs add, bit5
+                    // swaps Rm halves (X).  RdHi=r16-19 RdLo=r12-15.
+                    let rdhi = ((w >> 16) & 15) as usize;
+                    let rdlo = ((w >> 12) & 15) as usize;
+                    let rm = ((w >> 8) & 15) as usize;
+                    let rn = (w & 15) as usize;
+                    if rdhi == 15 || rdlo == 15 || rdhi == rdlo || rn == 15 || rm == 15 {
+                        (String::new(), true)
+                    } else {
+                        let rmv = if (w >> 5) & 1 == 1 {
+                            format!("(((r[{rm}] & 0xFFFFu) << 16) | (r[{rm}] >> 16))")
+                        } else {
+                            format!("r[{rm}]")
+                        };
+                        let sum = if (w >> 6) & 1 == 1 {
+                            "(int64_t)(int32_t)_p1 - (int64_t)(int32_t)_p2"
+                        } else {
+                            "(int64_t)(int32_t)_p1 + (int64_t)(int32_t)_p2"
+                        };
+                        (format!("{{ uint32_t _rmv = {rmv}; int32_t _p1 = (int32_t)(int16_t)(r[{rn}] & 0xFFFFu) * (int32_t)(int16_t)(_rmv & 0xFFFFu); int32_t _p2 = (int32_t)(int16_t)(r[{rn}] >> 16) * (int32_t)(int16_t)(_rmv >> 16); int64_t _s = {sum}; uint64_t _pair = ((uint64_t)r[{rdhi}] << 32) | (uint64_t)r[{rdlo}]; _pair += (uint64_t)_s; r[{rdlo}] = (uint32_t)_pair; r[{rdhi}] = (uint32_t)(_pair >> 32); }}"), false)
+                    }
+                } else if w & 0x0FF0_0010 == 0x0750_0010 {
+                    // SMMUL/SMMLA/SMMLS (+R round variants): bits27-20=0x75.
+                    // bits[7:6]=00 -> product [+ Ra<<32], 11 -> Ra<<32 minus
+                    // product, anything else is not an allocated encoding;
+                    // bit5 adds the rounding term 0x80000000 before taking
+                    // the high word; Ra==15 = no accumulate (SMMUL/SMMULR).
+                    let rd = ((w >> 16) & 15) as usize;
+                    let ra = ((w >> 12) & 15) as usize;
+                    let rm = ((w >> 8) & 15) as usize;
+                    let rn = (w & 15) as usize;
+                    let op_hi = (w >> 6) & 3;
+                    if rd == 15 || rn == 15 || rm == 15 || (op_hi != 0 && op_hi != 3) {
+                        (String::new(), true)
+                    } else {
+                        let acc = if ra != 15 {
+                            if op_hi == 3 {
+                                format!("uint64_t _acc = (uint64_t)r[{ra}] << 32; _res = _acc - _res;")
+                            } else {
+                                format!("uint64_t _acc = (uint64_t)r[{ra}] << 32; _res = _acc + _res;")
+                            }
+                        } else {
+                            String::new()
+                        };
+                        let rnd = if (w >> 5) & 1 == 1 {
+                            " _res += 0x80000000ull;"
+                        } else {
+                            ""
+                        };
+                        (format!("{{ int64_t _prod = (int64_t)(int32_t)r[{rn}] * (int64_t)(int32_t)r[{rm}]; uint64_t _res = (uint64_t)_prod; {acc}{rnd} r[{rd}] = (uint32_t)(_res >> 32); }}"), false)
+                    }
+                } else if w & 0x0F90_0090 == 0x0100_0080 {
+                    // Halfword multiplies (fastinterp mask 0x01000080):
+                    // bits[22:21] op: 0=SMLAxy 1=SMLAWy(bit5=0)/SMULWy(bit5=1)
+                    // 2=SMLALxy 3=SMULxy; bit5=x half of r0-3, bit6=y half of
+                    // r8-11.  Rd/r16-19; SMLAxy Ra=r12-15; SMLALxy r12-15=RdLo.
+                    let op = (w >> 21) & 3;
+                    let x = (w >> 5) & 1 == 1;
+                    let y = (w >> 6) & 1 == 1;
+                    let rd = ((w >> 16) & 15) as usize;
+                    let rl = ((w >> 12) & 15) as usize;
+                    let rs = ((w >> 8) & 15) as usize;
+                    let r0 = (w & 15) as usize;
+                    match op {
+                        0 => {
+                            // SMLAxy: Rd = Ra + r0[x] * rs[y].
+                            if rd == 15 || rl == 15 || rs == 15 || r0 == 15 {
+                                (String::new(), true)
+                            } else {
+                                (format!("r[{rd}] = (uint32_t)({} * {}) + r[{rl}];", half(r0, x), half(rs, y)), false)
+                            }
+                        }
+                        1 if x => {
+                            // SMULWy: Rd = bits[47:16] of (s32 r0 * s16 rs[y]).
+                            if rd == 15 || rs == 15 || r0 == 15 {
+                                (String::new(), true)
+                            } else {
+                                (format!("r[{rd}] = (uint32_t)((uint64_t)((int64_t)(int32_t)r[{r0}] * (int64_t)({})) >> 16);", half(rs, y)), false)
+                            }
+                        }
+                        1 => {
+                            // SMLAWy: same window with Ra<<16 accumulated first.
+                            if rd == 15 || rl == 15 || rs == 15 || r0 == 15 {
+                                (String::new(), true)
+                            } else {
+                                (format!("r[{rd}] = (uint32_t)((uint64_t)((int64_t)(int32_t)r[{r0}] * (int64_t)({}) + ((int64_t)(int32_t)r[{rl}]) * 65536LL) >> 16);", half(rs, y)), false)
+                            }
+                        }
+                        2 => {
+                            // SMLALxy: 64-bit pair += r0[x] * rs[y].
+                            let rdhi = rd;
+                            let rdlo = rl;
+                            if rdhi == 15 || rdlo == 15 || rdhi == rdlo || rs == 15 || r0 == 15 {
+                                (String::new(), true)
+                            } else {
+                                (format!("{{ int32_t _p = {} * {}; uint64_t _pair = ((uint64_t)r[{rdhi}] << 32) | (uint64_t)r[{rdlo}]; _pair += (uint64_t)(int64_t)_p; r[{rdlo}] = (uint32_t)_pair; r[{rdhi}] = (uint32_t)(_pair >> 32); }}", half(r0, x), half(rs, y)), false)
+                            }
+                        }
+                        _ => {
+                            // SMULxy: Rd = r0[x] * rs[y].
+                            if rd == 15 || rs == 15 || r0 == 15 {
+                                (String::new(), true)
+                            } else {
+                                (format!("r[{rd}] = (uint32_t)({} * {});", half(r0, x), half(rs, y)), false)
+                            }
+                        }
+                    }
+                } else {
+                    // QADD/QSUB/QDADD/QDSUB (fastinterp arm_misc.inc order):
+                    // Rd=r12-15, primary rm=r0-3, rn=r16-19 (doubled operand
+                    // for QDADD/QDSUB).  Signed saturating to int32.
+                    let rd = ((w >> 12) & 15) as usize;
+                    let rq = ((w >> 16) & 15) as usize;
+                    let rmq = (w & 15) as usize;
+                    let op = (w >> 21) & 3;
+                    if rd == 15 || rq == 15 || rmq == 15 {
+                        (String::new(), true)
+                    } else {
+                        let sat = "_s > 2147483647LL ? 0x7FFFFFFFu : (_s < -2147483648LL ? 0x80000000u : (uint32_t)_s)";
+                        match op {
+                            0 => (format!("{{ int64_t _s = (int64_t)(int32_t)r[{rmq}] + (int64_t)(int32_t)r[{rq}]; r[{rd}] = {sat}; }}"), false),
+                            1 => (format!("{{ int64_t _s = (int64_t)(int32_t)r[{rmq}] - (int64_t)(int32_t)r[{rq}]; r[{rd}] = {sat}; }}"), false),
+                            2 => (format!("{{ int64_t _d = (int64_t)(int32_t)r[{rq}] * 2; _d = _d > 2147483647LL ? 2147483647LL : (_d < -2147483648LL ? -2147483648LL : _d); int64_t _s = (int64_t)(int32_t)r[{rmq}] + _d; r[{rd}] = {sat}; }}"), false),
+                            _ => (format!("{{ int64_t _d = (int64_t)(int32_t)r[{rq}] * 2; _d = _d > 2147483647LL ? 2147483647LL : (_d < -2147483648LL ? -2147483648LL : _d); int64_t _s = (int64_t)(int32_t)r[{rmq}] - _d; r[{rd}] = {sat}; }}"), false),
+                        }
+                    }
+                };
+                if rejected {
+                    body.push_str(&format!(
+                        "guest_unsupported(0x{addr:08X}u, 0x{w:08X}u, 0u);"
+                    ));
+                    changes_pc = true;
+                    ended = unconditional;
+                } else {
+                    body.push_str(&media);
+                }
             } else if w & 0x0C00_0000 == 0x0400_0000 {
                 let load = w & (1 << 20) != 0;
                 let byte = w & (1 << 22) != 0;
@@ -3884,11 +4139,20 @@ fn recompile_arm_function_with_noreturn(
                                 if target_addr >= base
                                     && (target_addr as usize) < base as usize + bytes.len()
                                 {
-                                    pending.push((target_addr, target & 1 != 0));
+                                    enqueue_known_seed(
+                                        &mut pending,
+                                        &mut force_a32,
+                                        target,
+                                        target & 1 != 0,
+                                    );
                                 }
                             }
                         }
-                        pending.extend(arm_pc_relative_jump_table_targets(&bytes, base, addr, w));
+                        for (target, thumb) in
+                            arm_pc_relative_jump_table_targets(&bytes, base, addr, w)
+                        {
+                            enqueue_known_seed(&mut pending, &mut force_a32, target, thumb);
+                        }
                         body.push_str(&format!(
                             "pc = mem32({ea}); if (pc == 0xFFFFFFFFu) running = 0;"
                         ));
@@ -4133,16 +4397,18 @@ fn recompile_arm_function_with_noreturn(
             if !changes_pc {
                 body.push_str(&format!(" pc = 0x{next:08X};"));
             }
+            let wrap_condition = if cond == 15 {
+                "1"
+            } else {
+                arm_condition_c(cond)
+            };
             if emitted
                 .insert(
                     addr,
-                    format!(
-                        "if ({}) {{ {body} }} else {{ pc = 0x{next:08X}; }}",
-                        if cond == 15 {
-                            "1"
-                        } else {
-                            arm_condition_c(cond)
-                        }
+                    condition_wrap(
+                        wrap_condition,
+                        &body,
+                        &format!("pc = 0x{next:08X};"),
                     ),
                 )
                 .is_some()
@@ -4237,6 +4503,33 @@ fn recompile_arm_function_with_noreturn(
                 hook_c.push_str(&part.hook_c);
                 gate_c.push_str(&part.gate_c);
             }
+            // S1b prototype: one page prefilter for the whole region-hook
+            // chain.  Without it every dispatch iteration pays one
+            // `pc == entry` compare per converted region (39 regions would be
+            // 39 compares per guest instruction); with it, an iteration pays
+            // one table load and leaves the chain unless its 4 KiB page has a
+            // converted region.  Emitted only when --s1-cfg is used, so the
+            // default generated C is unchanged.
+            if !hook_c.is_empty() {
+                let mut pages: Vec<u32> = entries.iter().map(|e| e >> 12).collect();
+                pages.sort_unstable();
+                pages.dedup();
+                let mut page_table = String::from(
+                    "/* S1 prototype page prefilter for the region hook chain. */\n\
+                     static const unsigned char dq8_s1_cfg_page[4096] = {\n",
+                );
+                for page in &pages {
+                    page_table.push_str(&format!("    [0x{page:03X}] = 1,\n"));
+                }
+                page_table.push_str("};\n");
+                function_c.push_str(&page_table);
+                // A switch on pc, not a compare chain: with 30+ converted
+                // regions a linear `pc == entry` chain cost more than the
+                // dispatch it replaced (measured: 0.90 -> 0.77 M instr/s).
+                hook_c = format!(
+                    "        if (dq8_s1_cfg_page[(pc >> 12) & 0xFFFu]) switch (pc) {{\n{hook_c}        }}\n"
+                );
+            }
             Some(S1CfgRegions {
                 entries,
                 function_c,
@@ -4271,6 +4564,7 @@ fn recompile_arm_function_with_noreturn(
 #include <sys/shm.h>
 #endif
 #endif
+/* FRAME_PROF_RUNTIME */
 /* NATIVE_SPSC_RUNTIME */
 /* F4/F5 thread-split gate: DQ8_SPLIT_RENDER=1 moves framebuffer conversion,
    SDL event collection and presentation off the guest loop onto a dedicated
@@ -4383,6 +4677,10 @@ static unsigned trace_format_path_char_count;
 static int trace_format_path_active;
 static uint32_t *active_guest_regs;
 static unsigned thread_execution_depth;
+static uint64_t dq8_guest_now_ns(void);
+static int dq8_det_mode;
+static uint64_t dq8_det_steps_total, dq8_det_idle_ns, dq8_det_vblanks, dq8_det_idle_jumps;
+static uint64_t perf_main_retired;
 /* SAVESTATE (t_d50c9503): F5 save / F9 load.  Declared here because the SDL
    event collector (host_display_collect_events, shared with the split-present
    worker) and translated_from() both need them; the implementation lives in
@@ -4407,6 +4705,28 @@ static int guest_memory_range(uint32_t, uint64_t, uint32_t *);
 static void guest_periodic_dump(int sig) {
     (void)sig;
     if (getenv("DQ8_PROGRESS_SECONDS")) {
+        if (dq8_det_mode) {
+            fprintf(stderr, "DETDUMP steps=%llu idle_ms=%.3f now_ms=%.3f vblanks=%llu jumps=%llu"
+                            " main_retired=%llu depth=%u main_pc=%08X active_pc=%08X\n",
+                    (unsigned long long)dq8_det_steps_total,
+                    (double)dq8_det_idle_ns / 1e6,
+                    (double)dq8_guest_now_ns() / 1e6,
+                    (unsigned long long)dq8_det_vblanks,
+                    (unsigned long long)dq8_det_idle_jumps,
+                    (unsigned long long)perf_main_retired,
+                    thread_execution_depth, main_guest_pc, current_guest_pc);
+            if (getenv("DQ8_DUMP_STUB")) {
+                static unsigned dumped;
+                if (!dumped) {
+                    FILE *f;
+                    dumped = 1;
+                    f = fopen("/tmp/dq8-range-stub.bin", "wb");
+                    if (f) { fwrite(ram + 0x0012C200u, 1u, 0x300u, f); fclose(f); }
+                    f = fopen("/tmp/dq8-range-wave.bin", "wb");
+                    if (f) { fwrite(ram + 0x00179800u, 1u, 0x800u, f); fclose(f); }
+                }
+            }
+        }
         fprintf(stderr, "guest snapshot pc=%08X prev=%08X depth=%u main=%08X mainr0-r3=%08X/%08X/%08X/%08X active-r0-r7=%08X/%08X/%08X/%08X/%08X/%08X/%08X/%08X lr=%08X sp=%08X\n",
                 current_guest_pc, previous_guest_pc, thread_execution_depth, main_guest_pc,
                 main_guest_regs ? main_guest_regs[0] : 0u,
@@ -4542,6 +4862,425 @@ static uint64_t host_monotonic_ns(void) {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now)) return 0;
     return (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
+}
+/* DETERMINISTIC STEPPING (t_115d297c) -- OPT-IN, DEFAULT OFF.
+   Renderer A/B needs the guest to reach the same moment at the same
+   DQ8_BENCH_STEPS budget.  By default every guest-visible clock (vblank
+   chain, svcGetSystemTick, thread sleep/wake deadlines, DSP audio frame
+   cadence) is host wall time, so two runs of the same binary diverge
+   (measured 22.83% of pixels at 120M steps, t_8510204b).
+
+   With DQ8_DETERMINISTIC=1 the same sources are derived from a virtual
+   clock:
+
+     guest_now = base + idle_ns + retired_steps * ns_per_step
+
+   where retired_steps counts EVERY retired guest instruction (main context
+   folded every 4096 steps, worker slices folded when their slice ends) and
+   idle_ns is virtual time handed out while no guest code can run (a wait
+   with no runnable peer jumps the clock to the next deadline instead of
+   nanosleep'ing).  The mapping is documented in
+   docs/DETERMINISTIC_STEPPING.md: default 400 virtual ns per retired
+   instruction, i.e. ~2.5 M instructions per virtual second, which is the
+   measured headless-GL throughput of this runtime, so one virtual second
+   is about one host second and the vblank chain still runs at 60 Hz of
+   guest time.
+
+   With the flag off nothing below is called on the hot paths except the
+   `dq8_det_mode` test, and every accessor returns host_monotonic_ns()
+   exactly as before. */
+static int dq8_det_mode;
+static uint64_t dq8_det_ns_per_step = 400ull;
+static uint64_t dq8_det_steps_total;   /* retired instructions, main + worker */
+static uint64_t dq8_det_idle_ns;       /* virtual ns advanced while idle */
+static uint64_t dq8_det_base_ns = 1000000000ull;
+static uint64_t dq8_det_main_reported; /* main-context steps already folded */
+static uint64_t dq8_det_next_main_mark = 4096ull;
+static uint64_t dq8_det_vblanks;
+static uint64_t dq8_det_idle_jumps;
+static uint64_t dq8_det_audio_frames;
+static uint64_t dq8_guest_now_ns(void) {
+    if (!dq8_det_mode) return host_monotonic_ns();
+    return dq8_det_base_ns + dq8_det_idle_ns + dq8_det_steps_total * dq8_det_ns_per_step;
+}
+static void dq8_det_fold_worker(uint64_t retired) {
+    if (dq8_det_mode) dq8_det_steps_total += retired;
+}
+static void dq8_det_fold_main(uint64_t local_steps) {
+    if (!dq8_det_mode) return;
+    if (local_steps > dq8_det_main_reported) {
+        dq8_det_steps_total += local_steps - dq8_det_main_reported;
+        dq8_det_main_reported = local_steps;
+    }
+}
+static void dq8_det_advance_to(uint64_t target_ns) {
+    uint64_t now;
+    if (!dq8_det_mode) return;
+    now = dq8_guest_now_ns();
+    if (target_ns > now) {
+        dq8_det_idle_ns += target_ns - now;
+        ++dq8_det_idle_jumps;
+    }
+}
+/* ---- MD5 (RFC 1321) over the presented PPM ---------------------------------
+   Two runs must produce byte-identical /tmp/dq8-screen.ppm; the digest is
+   printed in the log at exit so an A/B can compare without trusting file
+   mtimes.  Only reached when DQ8_DETERMINISTIC=1 is set. */
+typedef struct { uint32_t h[4]; uint64_t len; uint8_t buf[64]; } Dq8Md5;
+static const uint32_t dq8_md5_k[64] = {
+    0xd76aa478u,0xe8c7b756u,0x242070dbu,0xc1bdceeeu,0xf57c0fafu,0x4787c62au,
+    0xa8304613u,0xfd469501u,0x698098d8u,0x8b44f7afu,0xffff5bb1u,0x895cd7beu,
+    0x6b901122u,0xfd987193u,0xa679438eu,0x49b40821u,0xf61e2562u,0xc040b340u,
+    0x265e5a51u,0xe9b6c7aau,0xd62f105du,0x02441453u,0xd8a1e681u,0xe7d3fbc8u,
+    0x21e1cde6u,0xc33707d6u,0xf4d50d87u,0x455a14edu,0xa9e3e905u,0xfcefa3f8u,
+    0x676f02d9u,0x8d2a4c8au,0xfffa3942u,0x8771f681u,0x6d9d6122u,0xfde5380cu,
+    0xa4beea44u,0x4bdecfa9u,0xf6bb4b60u,0xbebfbc70u,0x289b7ec6u,0xeaa127fau,
+    0xd4ef3085u,0x04881d05u,0xd9d4d039u,0xe6db99e5u,0x1fa27cf8u,0xc4ac5665u,
+    0xf4292244u,0x432aff97u,0xab9423a7u,0xfc93a039u,0x655b59c3u,0x8f0ccc92u,
+    0xffeff47du,0x85845dd1u,0x6fa87e4fu,0xfe2ce6e0u,0xa3014314u,0x4e0811a1u,
+    0xf7537e82u,0xbd3af235u,0x2ad7d2bbu,0xeb86d391u };
+static const uint8_t dq8_md5_s[64] = {
+    7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
+    5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
+    4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
+    6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21 };
+#define DQ8_MD5_ROTL(x, c) (((x) << (c)) | ((x) >> (32 - (c))))
+static void dq8_md5_block(Dq8Md5 *m, const uint8_t *p) {
+    uint32_t w[16], a = m->h[0], b = m->h[1], c = m->h[2], d = m->h[3], f, t;
+    unsigned i, g;
+    for (i = 0; i < 16; ++i)
+        w[i] = (uint32_t)p[i*4u] | ((uint32_t)p[i*4u+1u] << 8) |
+               ((uint32_t)p[i*4u+2u] << 16) | ((uint32_t)p[i*4u+3u] << 24);
+    for (i = 0; i < 64; ++i) {
+        if (i < 16) { f = (b & c) | (~b & d); g = i; }
+        else if (i < 32) { f = (d & b) | (~d & c); g = (5u * i + 1u) & 15u; }
+        else if (i < 48) { f = b ^ c ^ d; g = (3u * i + 5u) & 15u; }
+        else { f = c ^ (b | ~d); g = (7u * i) & 15u; }
+        t = d; d = c; c = b;
+        b = b + DQ8_MD5_ROTL(a + f + dq8_md5_k[i] + w[g], dq8_md5_s[i]);
+        a = t;
+    }
+    m->h[0] += a; m->h[1] += b; m->h[2] += c; m->h[3] += d;
+}
+static void dq8_md5_init(Dq8Md5 *m) {
+    m->h[0] = 0x67452301u; m->h[1] = 0xefcdab89u;
+    m->h[2] = 0x98badcfeu; m->h[3] = 0x10325476u; m->len = 0;
+}
+static void dq8_md5_update(Dq8Md5 *m, const uint8_t *p, size_t n) {
+    size_t have = (size_t)(m->len & 63u), i = 0;
+    m->len += (uint64_t)n;
+    if (have) {
+        size_t take = 64u - have < n ? 64u - have : n;
+        memcpy(m->buf + have, p, take);
+        if (have + take < 64u) return;
+        dq8_md5_block(m, m->buf); i = take;
+    }
+    for (; i + 64u <= n; i += 64u) dq8_md5_block(m, p + i);
+    memcpy(m->buf, p + i, n - i);
+}
+static void dq8_md5_final(Dq8Md5 *m, uint8_t out[16]) {
+    uint64_t bits = m->len * 8u;
+    size_t have = (size_t)(m->len & 63u);
+    uint8_t pad[72];
+    size_t pad_len = have < 56u ? 56u - have : 120u - have;
+    memset(pad, 0, sizeof pad); pad[0] = 0x80u;
+    dq8_md5_update(m, pad, pad_len);
+    for (unsigned i = 0; i < 8u; ++i) pad[i] = (uint8_t)(bits >> (8u * i));
+    dq8_md5_update(m, pad, 8u);
+    for (unsigned i = 0; i < 4u; ++i)
+        for (unsigned j = 0; j < 4u; ++j)
+            out[i*4u+j] = (uint8_t)(m->h[i] >> (8u * j));
+}
+static int dq8_det_md5_file(const char *path, char hex[33], uint64_t *bytes_out) {
+    FILE *f = fopen(path, "rb");
+    Dq8Md5 m; uint8_t buf[65536], digest[16];
+    size_t n; uint64_t total = 0;
+    static const char hx[] = "0123456789abcdef";
+    if (!f) return 0;
+    dq8_md5_init(&m);
+    while ((n = fread(buf, 1u, sizeof buf, f)) > 0u) { dq8_md5_update(&m, buf, n); total += n; }
+    fclose(f);
+    dq8_md5_final(&m, digest);
+    for (unsigned i = 0; i < 16u; ++i) { hex[i*2u] = hx[digest[i] >> 4]; hex[i*2u+1u] = hx[digest[i] & 15u]; }
+    hex[32] = 0;
+    *bytes_out = total;
+    return 1;
+}
+static const char *dq8_det_ppm_path(void) {
+    static char path[512];
+    const char *dir = getenv("DQ8_CAPTURE_PPM_DIR");
+    if (dir && dir[0]) snprintf(path, sizeof path, "%s/dq8-screen.ppm", dir);
+    else snprintf(path, sizeof path, "/tmp/dq8-screen.ppm");
+    return path;
+}
+/* DETERMINISTIC (t_115d297c): digest a guest-RAM range, so an A/B can tell
+   "the guest state is identical" from "the host presentation differed". */
+static int dq8_det_md5_mem(uint32_t addr, uint64_t len, char hex[33]) {
+    Dq8Md5 m; uint8_t digest[16];
+    static const char hx[] = "0123456789abcdef";
+    uint32_t mapped = 0;
+    if (!guest_memory_range(addr, len, &mapped)) return 0;
+    dq8_md5_init(&m);
+    dq8_md5_update(&m, ram + mapped, (size_t)len);
+    dq8_md5_final(&m, digest);
+    for (unsigned i = 0; i < 16u; ++i) { hex[i*2u] = hx[digest[i] >> 4]; hex[i*2u+1u] = hx[digest[i] & 15u]; }
+    hex[32] = 0;
+    return 1;
+}
+/* Rebase the restored thread deadlines onto the virtual clock.  A savestate
+   stores the whole GuestThread array, and `wake_ns` in it is an ABSOLUTE host
+   CLOCK_MONOTONIC value from the run that saved it (host uptime, ~10^13 ns).
+   The virtual clock starts at 1 s, so a restored deadline would sit thousands
+   of virtual seconds in the future and the thread would never wake.  Both
+   A/B runs load the same state, so replacing the unknown remaining sleep with
+   one vblank period is deterministic and cannot stall. */
+static void dq8_det_rebase_threads(void) {
+    uint64_t now;
+    if (!dq8_det_mode) return;
+    now = dq8_guest_now_ns();
+    for (unsigned i = 0; i < guest_thread_count && i < 64u; ++i) {
+        GuestThread *t = &guest_threads[i];
+        if (t->wake_ns) t->wake_ns = now + 16666667ull; /* one vblank period */
+        if (t->blocked) t->block_since_ns = now;
+        else t->block_since_ns = 0;
+    }
+    fprintf(stderr, "DETERMINISTIC: rebased %u restored thread deadlines onto the virtual clock\n",
+            guest_thread_count);
+}
+/* One machine-readable line per deterministic run: the frame digest the A/B
+   compares, the virtual clock the run ended on, and how the clock got there. */
+static void dq8_det_report(void) {
+    char hex[33]; uint64_t bytes = 0;
+    if (!dq8_det_mode) return;
+    if (dq8_det_md5_file(dq8_det_ppm_path(), hex, &bytes))
+        fprintf(stderr, "DET_FRAME md5=%s bytes=%llu path=%s\n",
+                hex, (unsigned long long)bytes, dq8_det_ppm_path());
+    else
+        fprintf(stderr, "DET_FRAME md5=missing path=%s\n", dq8_det_ppm_path());
+    fprintf(stderr,
+            "DET_CLOCK retired=%llu idle_ms=%.3f vclock_ms=%.3f vblanks=%llu "
+            "idle_jumps=%llu ns_per_step=%llu audio_frames=%llu\n",
+            (unsigned long long)dq8_det_steps_total,
+            (double)dq8_det_idle_ns / 1e6,
+            (double)(dq8_guest_now_ns() - dq8_det_base_ns) / 1e6,
+            (unsigned long long)dq8_det_vblanks,
+            (unsigned long long)dq8_det_idle_jumps,
+            (unsigned long long)dq8_det_ns_per_step,
+            (unsigned long long)dq8_det_audio_frames);
+    {   /* guest-visible output digests: same state must produce the same RAM */
+        char rh[33];
+        if (dq8_det_md5_mem(0x1F300000u, 240u * 400u * 3u, rh))
+            fprintf(stderr, "DET_RAM scanout_1F300000 md5=%s\n", rh);
+        if (dq8_det_md5_mem(0x1F346500u, 240u * 400u * 3u, rh))
+            fprintf(stderr, "DET_RAM scanout_1F346500 md5=%s\n", rh);
+        if (pica_rt_w && pica_rt_h &&
+            dq8_det_md5_mem(pica_rt_addr, (uint64_t)pica_rt_w * pica_rt_h * 4u, rh))
+            fprintf(stderr, "DET_RAM rt_%08X md5=%s\n", pica_rt_addr, rh);
+    }
+    fflush(stderr);
+}
+/* TEMPO (t_3463e625): guest-pace accounting.  DQ8_TEMPO=1 prints one line per
+   wall second, DQ8_TEMPO=2 also one line per PDC0 scan-out.  The point is to
+   attribute "the game plays N x too slow" with numbers instead of guesses, so
+   two independent notions of guest time are tracked side by side:
+     guest_s  = (last value svcGetSystemTick returned) / 268111856
+                - the guest's own clock: CLOCK_MONOTONIC here, so tick_ratio
+                  below must stay ~1.000; anything else is a broken tick shim.
+     pdc0_s   = PDC0 vblank deliveries / 60
+                - the frame clock the guest's own logic advances on; it only
+                  tracks wall time if vblanks are delivered on a wall-clock
+                  chain instead of being re-anchored at each guest wait.
+   vbl_resync counts vblank periods the F5 chain had to drop when it fell
+   behind (> GSP_VBLANK_CATCHUP_CAP), cap_per_s counts display-transfer
+   producer events (guest-rendered frames), sleep_per_s/sleep_ms_per_s show
+   whether guest threads park on fixed-length sleeps.  Env-gated, default off:
+   each hook is one cached-flag test plus increments. */
+static int tempo_mode = -1;
+static uint64_t tempo_t0_ns, tempo_last_line_ns, tempo_last_frame_ns;
+static unsigned long long tempo_pdc0_total, tempo_pdc0_win;
+static unsigned long long tempo_cap_total, tempo_cap_win;
+static unsigned long long tempo_vbl_total, tempo_vbl_win, tempo_vbl_resync;
+static unsigned long long tempo_tick_calls, tempo_tick_win, tempo_tick_last;
+static unsigned long long tempo_tick_first;
+static int tempo_tick_first_seen;
+static unsigned long long tempo_tick_pc[8], tempo_tick_hits[8];
+static unsigned long long tempo_sleep_calls, tempo_sleep_win, tempo_sleep_ns_win;
+static unsigned long long tempo_sleep_hist_ns[8], tempo_sleep_hist_hits[8];
+/* Per-handle wait accounting: which event the guest's frame/logic loop blocks
+   on, how many times per second it completes ready (a logic iteration) and how
+   long each park actually lasts.  Without this the "logic runs slower than the
+   frame rate" report cannot be attributed to a specific wait. */
+#define TEMPO_WAIT_SLOTS 8
+static uint32_t tempo_wait_handle[TEMPO_WAIT_SLOTS];
+static unsigned long long tempo_wait_calls[TEMPO_WAIT_SLOTS];
+static unsigned long long tempo_wait_win[TEMPO_WAIT_SLOTS];
+static unsigned long long tempo_wait_done[TEMPO_WAIT_SLOTS];
+static unsigned long long tempo_wait_park_ns[TEMPO_WAIT_SLOTS];
+static unsigned long long tempo_wait_last_ns[TEMPO_WAIT_SLOTS];
+static unsigned long long tempo_wait_span_ns[TEMPO_WAIT_SLOTS];
+static uint32_t tempo_wait_pc[TEMPO_WAIT_SLOTS];
+static uint32_t tempo_wait_tid[TEMPO_WAIT_SLOTS];
+static unsigned long long tempo_gsp_drops, tempo_gsp_drop_win;
+static int tempo_wait_slot(uint32_t handle) {
+    int free_slot = -1;
+    for (int i = 0; i < TEMPO_WAIT_SLOTS; ++i) {
+        if (tempo_wait_handle[i] == handle) return i;
+        if (!tempo_wait_handle[i] && free_slot < 0) free_slot = i;
+    }
+    if (free_slot >= 0) { tempo_wait_handle[free_slot] = handle; return free_slot; }
+    return -1;
+}
+static int tempo_get(void) {
+    if (tempo_mode < 0) {
+        const char *e = getenv("DQ8_TEMPO");
+        tempo_mode = (e && e[0] && e[0] != '0') ? (e[0] == '2' ? 2 : 1) : 0;
+        if (tempo_mode) {
+            tempo_t0_ns = host_monotonic_ns();
+            tempo_last_line_ns = tempo_t0_ns;
+            tempo_last_frame_ns = tempo_t0_ns;
+        }
+    }
+    return tempo_mode;
+}
+static void tempo_tick_seen(uint64_t ticks, uint32_t pc) {
+    if (!tempo_get()) return;
+    ++tempo_tick_calls; ++tempo_tick_win;
+    tempo_tick_last = ticks;
+    for (unsigned i = 0; i < 8u; ++i) {
+        if (!tempo_tick_pc[i] || tempo_tick_pc[i] == pc) {
+            if (!tempo_tick_pc[i]) tempo_tick_pc[i] = pc;
+            ++tempo_tick_hits[i];
+            return;
+        }
+    }
+}
+static void tempo_sleep_seen(uint64_t ns) {
+    if (!tempo_get()) return;
+    ++tempo_sleep_calls; ++tempo_sleep_win; tempo_sleep_ns_win += ns;
+    for (unsigned i = 0; i < 8u; ++i) {
+        if (!tempo_sleep_hist_ns[i] || tempo_sleep_hist_ns[i] == ns) {
+            if (!tempo_sleep_hist_ns[i]) tempo_sleep_hist_ns[i] = ns;
+            ++tempo_sleep_hist_hits[i];
+            return;
+        }
+    }
+}
+static void tempo_vblank_seen(unsigned fired, unsigned resync) {
+    if (!tempo_get()) return;
+    tempo_vbl_total += fired; tempo_vbl_win += fired; tempo_vbl_resync += resync;
+}
+static void tempo_capture_seen(void) {
+    if (!tempo_get()) return;
+    ++tempo_cap_total; ++tempo_cap_win;
+}
+static int tempo_wait_enter(uint32_t handle) {
+    int slot;
+    if (!tempo_get()) return -1;
+    slot = tempo_wait_slot(handle);
+    if (slot < 0) return -1;
+    tempo_wait_pc[slot] = current_guest_pc;
+    tempo_wait_tid[slot] = current_guest_thread_id;
+    ++tempo_wait_calls[slot];
+    ++tempo_wait_win[slot];
+    return slot;
+}
+static void tempo_wait_ready(int slot) {
+    uint64_t now;
+    if (slot < 0) return;
+    now = host_monotonic_ns();
+    if (tempo_wait_last_ns[slot] && now > tempo_wait_last_ns[slot])
+        tempo_wait_span_ns[slot] += now - tempo_wait_last_ns[slot];
+    tempo_wait_last_ns[slot] = now;
+    ++tempo_wait_done[slot];
+}
+static void tempo_wait_park(int slot, uint64_t ns) {
+    if (slot < 0) return;
+    tempo_wait_park_ns[slot] += ns;
+}
+static void tempo_gsp_drop_seen(void) {
+    if (!tempo_get()) return;
+    ++tempo_gsp_drops; ++tempo_gsp_drop_win;
+}
+static unsigned long long tempo_swaps, tempo_swap_win;
+static void tempo_swap_seen(void) {
+    if (!tempo_get()) return;
+    ++tempo_swaps; ++tempo_swap_win;
+}
+static void tempo_frame_seen(void) {   /* one PDC0 scan-out = one guest frame */
+    uint64_t now;
+    if (!tempo_get()) return;
+    if (!tempo_tick_first_seen) {
+        tempo_tick_first_seen = 1;
+        tempo_tick_first = tempo_tick_last;
+    }
+    ++tempo_pdc0_total; ++tempo_pdc0_win;
+    now = host_monotonic_ns();
+    if (tempo_mode == 2)
+        fprintf(stderr,
+                "TEMPO-F f=%llu wall_s=%.4f dt_ms=%.2f pdc0_s=%.4f tick_s=%.4f\n",
+                tempo_pdc0_total, (double)(now - tempo_t0_ns) / 1e9,
+                (double)(now - tempo_last_frame_ns) / 1e6,
+                (double)tempo_pdc0_total / 60.0,
+                (double)(tempo_tick_last - tempo_tick_first) / 268111856.0);
+    tempo_last_frame_ns = now;
+    if (now - tempo_last_line_ns < 1000000000ull) return;
+    {
+        double wall_s = (double)(now - tempo_last_line_ns) / 1e9;
+        double wall_total_s = (double)(now - tempo_t0_ns) / 1e9;
+        double guest_s = (double)(tempo_tick_last - tempo_tick_first) / 268111856.0;
+        double pdc0_s = (double)tempo_pdc0_total / 60.0;
+        fprintf(stderr,
+                "TEMPO wall_s=%.3f guest_s=%.3f tick_ratio=%.3f pdc0=%llu "
+                "pdc0_per_s=%.2f pdc0_s=%.3f vblank_ratio=%.3f cap_per_s=%.1f "
+                "vbl_per_s=%.2f vbl_total=%llu vbl_resync=%llu gsp_drops=%llu "
+                "swap_per_s=%.2f swap_ratio30=%.3f "
+                "tick_per_s=%.1f sleep_per_s=%.1f sleep_ms_per_s=%.1f\n",
+                wall_total_s, guest_s,
+                wall_total_s > 0.0 ? guest_s / wall_total_s : 0.0,
+                tempo_pdc0_total,
+                wall_s > 0.0 ? (double)tempo_pdc0_win / wall_s : 0.0,
+                pdc0_s,
+                wall_total_s > 0.0 ? pdc0_s / wall_total_s : 0.0,
+                wall_s > 0.0 ? (double)tempo_cap_win / wall_s : 0.0,
+                wall_s > 0.0 ? (double)tempo_vbl_win / wall_s : 0.0,
+                tempo_vbl_total, tempo_vbl_resync, tempo_gsp_drops,
+                wall_s > 0.0 ? (double)tempo_swap_win / wall_s : 0.0,
+                wall_s > 0.0 ? (double)tempo_swap_win / wall_s / 30.0 : 0.0,
+                wall_s > 0.0 ? (double)tempo_tick_win / wall_s : 0.0,
+                wall_s > 0.0 ? (double)tempo_sleep_win / wall_s : 0.0,
+                wall_s > 0.0 ? (double)tempo_sleep_ns_win / 1e6 / wall_s : 0.0);
+        for (unsigned i = 0; i < TEMPO_WAIT_SLOTS; ++i)
+            if (tempo_wait_win[i])
+                fprintf(stderr,
+                        "TEMPO-WAIT handle=%08X calls_per_s=%.2f ready_per_s=%.2f "
+                        "avg_ready_gap_ms=%.3f pc=%08X thread=%08X\n",
+                        tempo_wait_handle[i],
+                        wall_s > 0.0 ? (double)tempo_wait_win[i] / wall_s : 0.0,
+                        wall_s > 0.0 ? (double)tempo_wait_done[i] / wall_s : 0.0,
+                        tempo_wait_done[i]
+                            ? (double)tempo_wait_span_ns[i] / 1e6 /
+                              (double)tempo_wait_done[i]
+                            : 0.0,
+                        tempo_wait_pc[i], tempo_wait_tid[i]);
+        for (unsigned i = 0; i < 8u; ++i)
+            if (tempo_tick_hits[i])
+                fprintf(stderr,
+                        "TEMPO-PC tick_pc=%08X tick_hits=%llu sleep_ns=%llu "
+                        "sleep_hits=%llu\n",
+                        (unsigned)tempo_tick_pc[i], tempo_tick_hits[i],
+                        tempo_sleep_hist_ns[i], tempo_sleep_hist_hits[i]);
+    }
+    tempo_pdc0_win = tempo_cap_win = tempo_vbl_win = 0;
+    tempo_tick_win = tempo_sleep_win = tempo_sleep_ns_win = 0;
+    tempo_gsp_drop_win = 0;
+    tempo_swap_win = 0;
+    for (unsigned i = 0; i < TEMPO_WAIT_SLOTS; ++i) {
+        tempo_wait_win[i] = 0;
+        tempo_wait_done[i] = 0;
+        tempo_wait_park_ns[i] = 0;
+        tempo_wait_span_ns[i] = 0;
+    }
+    tempo_last_line_ns = now;
 }
 /* PERF-02 honest benchmark counters.  The §5.1 harness reported only the
    main context's `steps`, so worker (decoder/audio) retirement was invisible
@@ -4823,7 +5562,9 @@ static uint32_t gsp_relay_event;
 static uint32_t gsp_shared_base;
 static uint32_t gsp_thread_id;
 static uint32_t gsp_lcd_force_black = 1u;
-static uint64_t gsp_next_vblank_ns;
+/* VBLANK WALLCLOCK (t_d1be62fc): published by the pacer thread, read by the
+   guest-side delivery and the relay-thread vblank park. */
+static _Atomic uint64_t gsp_next_vblank_ns;
 static uint32_t dsp_pipe_interrupt_event;
 /* Hold source-boundary DSP output until the guest acknowledges its manual-reset
    Pipe event with ClearEvent; otherwise a later frame can erase the one-shot
@@ -5596,6 +6337,7 @@ static void gsp_write_screen_ppms(void);
 static void gsp_scanout_capture(void);
 /* Scan-out slot state (Azahar GPU::SetBufferSwap model): which buffer the LCD
    shows per screen. Defined with gsp_scanout_capture below. */
+static void dlog_note_draw(void);   /* t_fa78ea1f DARKLOG per-RT tally */
 static uint32_t gsp_fb_addr[2][2];   /* [screen][slot] */
 static uint32_t gsp_fb_fmt[2], gsp_fb_stride[2];
 static uint32_t gsp_fb_shown[2];
@@ -5673,6 +6415,35 @@ static int dq8_layer_trace(void) {
     return t >= dq8_layer_from && t <= dq8_layer_from + dq8_layer_dur;
 }
 static double dq8_layer_t(void) { return dq8_mono_s() - dq8_t0_s(); }
+
+/* t_275eb521: cached env gates for the hot paths.  getenv() is a linear walk
+   of `environ`, and these knobs were being re-read from code that runs per
+   PICA register write (the command-list walker), per draw, per indirect
+   branch, per GSP fill/transfer and inside the main-context wait spin.  None
+   of them can change while the process runs, so each is resolved once per
+   process -- the same pattern as tempo_get()/dq8_layer_trace().
+   dq8_env_on() keeps every call site's original test exactly ("is the
+   variable present at all", which also enables it for an empty or "0"
+   value).  Knobs whose VALUE matters are parsed once by their own helpers
+   instead (pvs_dec_sync, pgl_setup, ...). */
+static int dq8_env_trace_gpu = -1;      /* DQ8_TRACE_GPU */
+static int dq8_env_trace_texcfg = -1;   /* DQ8_TRACE_TEXCFG */
+static int dq8_env_trace_layer = -1;    /* DQ8_TRACE_LAYER, raw presence */
+static int dq8_env_trace_gsp_fb = -1;   /* DQ8_TRACE_GSP_FB */
+static int dq8_env_trace_branch = -1;   /* DQ8_TRACE_BRANCH */
+static int dq8_env_strict_null = -1;    /* DQ8_STRICT_NULL_CALLBACK */
+static int dq8_env_trace_wait = -1;     /* DQ8_TRACE_WAIT */
+static int dq8_env_trace_ipc = -1;      /* DQ8_TRACE_IPC */
+static int dq8_env_trace_fmtpath = -1;  /* DQ8_TRACE_FORMAT_PATH */
+static int dq8_env_trace_arbiter = -1;  /* DQ8_TRACE_ARBITER */
+static uint32_t dq8_env_arbiter_addr;    /* DQ8_TRACE_ARBITER_ADDRESS, parsed */
+static int dq8_env_arbiter_addr_init;
+static const char *dq8_env_scan_msg;    /* DQ8_SCAN_MSG */
+static int dq8_env_scan_msg_init;
+static int dq8_env_on(const char *name, int *gate) {
+    if (*gate < 0) *gate = getenv(name) != NULL;
+    return *gate;
+}
 static unsigned long long pica_list_no;
 /* Screen-space union of everything rasterized in the current command list. */
 static uint32_t pica_bb_x0 = 0xFFFFFFFFu, pica_bb_y0 = 0xFFFFFFFFu;
@@ -5708,8 +6479,11 @@ static float pica_draw_prim_a = 1.0f, pica_draw_tev_a = 1.0f;
 /* DQ8_TRACE_PX probe helpers (defined with the pica_vs runtime below). */
 static void pica_px_report(void);
 static int pica_px_find(int x, int y);
-/* t_0b95f1a7 black-3D forensics globals (defined in pica_vs.c, spliced later). */
-static unsigned pica_vs_fail_reason, pica_vs_fail_detail;
+/* t_0b95f1a7 black-3D forensics globals (defined in pica_vs.c, spliced later).
+   t_968a1fa9: these are PER-THREAD (see pica_vs.c) so the parallel vertex pool
+   cannot clobber another vertex's failure verdict; the forward declaration
+   must carry the same storage class. */
+static __thread unsigned pica_vs_fail_reason, pica_vs_fail_detail;
 static unsigned pica_draw_log_count, pica_draw_log_tris, pica_draw_log_clip;
 static unsigned pica_draw_log_nfdrop;
 static unsigned pica_draw_log_arej, pica_draw_log_drej, pica_draw_log_frw;
@@ -5835,7 +6609,7 @@ static void pica_bind_framebuffer(void) {
             la = pica_rt_addr; lw = pica_rt_w; lh = pica_rt_h; lf = pica_rt_format;
         }
     }
-    if (getenv("DQ8_TRACE_GPU") && pica_draw_count <= 2u)
+    if (dq8_env_on("DQ8_TRACE_GPU", &dq8_env_trace_gpu) && pica_draw_count <= 2u)
         fprintf(stderr, "PICA fb paddr=%08X va=%08X dim=%08X rt=%08X %ux%u fmt=%u\n",
                 paddr, va, pica_regs[0x11E], pica_rt_addr, pica_rt_w, pica_rt_h, pica_rt_format);
 }
@@ -6377,23 +7151,32 @@ static void dq8_scan_ram_text(const char *needle) {
    identically headless and windowed; the SDL present path honours
    host_shadow_dirty so a static window is not re-presented at 60 Hz.
 
-   arm   = scan-out byte-stable for DQ8_IDLE_HOLD_FRAMES vblanks (<=
-           DQ8_IDLE_MAX_CHANGED_WORDS words differing, which tolerates a
-           small cursor fade) AND no live audio source AND no held input
-           AND the guest-blocked rail: the wake-window ratio is recorded on
-           every window; ARM uses DQ8_IDLE_ARM_RATIO (default 0 = off: the
-           dialog itself measures blocked=0.50..0.78 headless but only
-           0.06..0.28 windowed because un-armed waits are 16 ms polls, so a
-           blocking arm threshold cannot pass in both modes), while RELEASE
+   arm   = scan-out BYTE-IDENTICAL for DQ8_IDLE_HOLD_FRAMES vblanks
+           (DQ8_IDLE_MAX_CHANGED_WORDS, default 0 = not one word may differ)
+           AND no HID edge for the same window AND no live audio source AND
+           no held input AND the guest-blocked rail: the wake-window ratio is
+           recorded on every window; ARM uses DQ8_IDLE_ARM_RATIO (default 0 =
+           off: the dialog itself measures blocked=0.50..0.78 headless but
+           only 0.06..0.28 windowed because un-armed waits are 16 ms polls, so
+           a blocking arm threshold cannot pass in both modes), while RELEASE
            fires on DQ8_IDLE_BUSY_RATIO (default 0.02) = the guest runnable
            in essentially every sampled wake (animating boot saturates at
            0.00).  A >= 300 ms host-wake window must exist (>=1 completed).
+           t_6ee2859c: the old arm tolerated <=256 changed words, so a screen
+           whose ONLY motion is a small blinking cursor (save dialog, name
+           entry) armed and then froze for 250 ms - a measured quarter-second
+           hitch every ~5 s.  A screen that animates at all is not idle; the
+           tolerance is now 0 and an input edge inside the hold window also
+           blocks the arm.
    hold  = GSP vblank deliveries spaced by idle_period_ns, auto-tuned by
            the in-state main-thread CPU tuner (x1.5 / x0.75 toward
            DQ8_IDLE_TARGET, from DQ8_IDLE_VBLANK_START_NS up to the
-           DQ8_IDLE_VBLANK_NS ceiling); positive guest waits shorter than
-           DQ8_IDLE_MIN_WAIT_NS are rounded up to it (the authorized
-           poll-only execution); pad-event signalling is suppressed for
+           DQ8_IDLE_VBLANK_NS ceiling); a positive guest wait is rounded up to
+           DQ8_IDLE_MIN_WAIT_NS only when it is ALREADY longer than one vblank,
+           and never past IDLE_STRETCH_MAX_NS (2 vblanks = 33.3 ms), so a
+           16.67 ms poll is delivered unchanged and no stretched wait can cost
+           more than one dropped frame (the 250 ms..5 s spacings live in the
+           scan-out cadence only); pad-event signalling is suppressed for
            unchanged HID ring entries; SDL presents are skipped while the
            shadow is unchanged.
    release = HID edge (idle_note_input: also pulls the frame deadline due
@@ -6413,6 +7196,11 @@ static int idle_throttle_enabled_env(void) {
     if (enabled < 0) {
         const char *e = getenv("DQ8_IDLE_THROTTLE");
         enabled = (e && e[0] == '0' && !e[1]) ? 0 : 1;
+        /* DETERMINISTIC (t_115d297c): the idle throttle stretches the vblank
+           period from measured host CPU time, i.e. it makes guest-visible
+           frame pacing depend on host load.  It is disabled in deterministic
+           mode so the chain always runs at the fixed 60 Hz period. */
+        if (dq8_det_mode) enabled = 0;
     }
     return enabled;
 }
@@ -6437,6 +7225,8 @@ static uint64_t idle_tuner_last_ns;
 static uint32_t idle_tuner_prev_ticks;
 static uint64_t idle_arms, idle_releases, idle_armed_total_ns, idle_present_skipped;
 static uint64_t idle_armed_since_ns;
+static uint64_t idle_last_input_ns;   /* last published HID change (arm gate) */
+static uint64_t idle_last_retired;    /* guest steps at the previous host wake */
 static int host_shadow_dirty = 1;      /* SDL present: shadow changed since last present */
 static uint8_t *idle_prev_fb[2][2];    /* [screen][slot]: the guest double-buffers
                                           the scan-out and alternates the shown
@@ -6453,14 +7243,21 @@ static int idle_trace(void) {
     if (trace < 0) trace = getenv("DQ8_IDLE_TRACE") != NULL;
     return trace;
 }
-static uint64_t idle_min_wait_ns(void) { return idle_env_ns("DQ8_IDLE_MIN_WAIT_NS", 100000000ull); }
+/* t_6ee2859c: a stretched wait must stay invisible.  One 3DS vblank is
+   16.67 ms; a round-up may add at most one more of them, so no stretched
+   positive wait can ever exceed 2 vblanks (33.3 ms) - a hitch smaller than a
+   single dropped frame.  The 250 ms..5 s spacings belong to the scan-out
+   cadence (idle_period_ns) and never to a guest wait. */
+#define IDLE_VBLANK_NS 16666667ull
+#define IDLE_STRETCH_MAX_NS (2ull * IDLE_VBLANK_NS)
+static uint64_t idle_min_wait_ns(void) { return idle_env_ns("DQ8_IDLE_MIN_WAIT_NS", IDLE_STRETCH_MAX_NS); }
 static uint64_t idle_vblank_start_ns(void) { return idle_env_ns("DQ8_IDLE_VBLANK_START_NS", 250000000ull); }
 static uint64_t idle_vblank_max_ns(void) { return idle_env_ns("DQ8_IDLE_VBLANK_NS", 5000000000ull); }
 static double idle_target(void) { return idle_env_ratio("DQ8_IDLE_TARGET", 0.03); }
 static double idle_busy_ratio(void) { return idle_env_ratio("DQ8_IDLE_BUSY_RATIO", 0.02); }
 static double idle_arm_ratio(void) { return idle_env_ratio("DQ8_IDLE_ARM_RATIO", 0.0); }
-static uint32_t idle_hold_frames(void) { return (uint32_t)idle_env_ns("DQ8_IDLE_HOLD_FRAMES", 300u); }
-static uint32_t idle_max_changed_words(void) { return (uint32_t)idle_env_ns("DQ8_IDLE_MAX_CHANGED_WORDS", 256u); }
+static uint32_t idle_hold_frames(void) { return (uint32_t)idle_env_ns("DQ8_IDLE_HOLD_FRAMES", 600u); }
+static uint32_t idle_max_changed_words(void) { return (uint32_t)idle_env_ns("DQ8_IDLE_MAX_CHANGED_WORDS", 0u); }
 
 static void idle_throttle_release(const char *reason); /* fwd: HID/audio hooks */
 
@@ -6515,16 +7312,31 @@ static int idle_audio_live(void) {
 }
 
 /* Called from native_hid_pump() on every call: the arming gate needs the
-   held state, and a real edge must release the throttle at once. */
-static void idle_note_input_state(uint32_t buttons) { idle_held_buttons = buttons; }
+   held state, and a real edge must release the throttle at once.  A change in
+   the published state is also an INPUT EDGE for the arm gate: a screen the
+   player is interacting with is not idle. */
+static void idle_note_input_state(uint32_t buttons) {
+    if (buttons != idle_held_buttons) {
+        idle_held_buttons = buttons;
+        idle_last_input_ns = host_monotonic_ns();
+    }
+}
 static void idle_note_input(void) {
+    idle_last_input_ns = host_monotonic_ns();
     if (idle_armed) idle_throttle_release("input");
 }
 
 static uint64_t idle_stretch_wait(uint64_t ns) {
     if (split_render_enabled()) return ns; /* wall-clock vblanks: never stretch */
     if (!idle_armed || !ns) return ns;
+    /* t_6ee2859c: only a wait that is ALREADY longer than one vblank may be
+       rounded up, and the round-up is capped at 2 vblanks (33.3 ms).  A
+       16.67 ms poll is therefore delivered unchanged, and a stretched wait can
+       cost at most one dropped frame instead of the old 100 ms floor (which
+       turned every poll into a visible stall). */
+    if (ns <= IDLE_VBLANK_NS) return ns;
     uint64_t floor_ns = idle_min_wait_ns();
+    if (floor_ns > IDLE_STRETCH_MAX_NS) floor_ns = IDLE_STRETCH_MAX_NS;
     return ns < floor_ns ? floor_ns : ns;
 }
 static int idle_throttle_armed(void) { return idle_armed; }
@@ -6550,9 +7362,12 @@ static void idle_throttle_arm(uint64_t now) {
     idle_armed_since_ns = now;
     ++idle_arms;
     if (idle_trace())
-        fprintf(stderr, "idle: ARM static_frames=%llu blocked_ratio=%.2f period=%.0fms\n",
-                (unsigned long long)idle_static_frames, idle_blocked_ratio,
-                (double)idle_period_ns / 1e6);
+        fprintf(stderr, "idle: ARM static_frames=%llu hold=%u changed=%u no_input_ms=%.0f "
+                "blocked_ratio=%.2f period=%.0fms\n",
+                (unsigned long long)idle_static_frames, idle_hold_frames(),
+                idle_last_changed_words,
+                idle_last_input_ns ? (double)(now - idle_last_input_ns) / 1e6 : -1.0,
+                idle_blocked_ratio, (double)idle_period_ns / 1e6);
 }
 
 static void idle_throttle_release(const char *reason) {
@@ -6566,8 +7381,10 @@ static void idle_throttle_release(const char *reason) {
     gsp_next_vblank_ns = host_monotonic_ns();
     host_shadow_dirty = 1;
     if (idle_trace())
-        fprintf(stderr, "idle: RELEASE reason=%s held=%08X static_frames=%llu armed_s=%.1f\n",
+        fprintf(stderr, "idle: RELEASE reason=%s held=%08X static_frames=%llu changed=%u "
+                "period=%.0fms armed_s=%.1f\n",
                 reason, idle_held_buttons, (unsigned long long)idle_static_frames,
+                idle_last_changed_words, (double)idle_period_ns / 1e6,
                 (double)(host_monotonic_ns() - idle_armed_since_ns) / 1e9);
 }
 
@@ -6688,9 +7505,20 @@ static void idle_tuner_tick(uint64_t now) {
 
 static void idle_service_host_wake(uint64_t now) {
     if (!idle_throttle_enabled_env()) return;
-    int runnable = guest_any_runnable_thread();
+    /* t_6ee2859c: "busy" must mean the guest DID WORK between two host wakes,
+       not "some thread is not blocked".  While armed the main context naps on
+       the throttled vblank deadline and is not blocked by construction, so the
+       old runnable test was true at every wake and released the throttle one
+       window (~0.3 s) after every arm: arm -> 250 ms freeze -> release -> 300
+       static frames -> arm again = the measured quarter-second hitch every
+       ~5 s.  MAIN-context retired instructions are the honest signal: the
+       guest threads' own wait loops (and the audio worker) keep their own
+       counters, so a parked scene cannot look busy through them. */
+    uint64_t retired = perf_main_retired;
+    int worked = retired != idle_last_retired;
+    idle_last_retired = retired;
     ++idle_wake_total;
-    if (!runnable) ++idle_wake_blocked;
+    if (!worked) ++idle_wake_blocked;
     if (idle_wake_total >= 18u) { /* >= ~300 ms of host wakes at 16.67 ms */
         idle_blocked_ratio = (double)idle_wake_blocked / (double)idle_wake_total;
         idle_wake_total = idle_wake_blocked = 0;
@@ -6698,12 +7526,14 @@ static void idle_service_host_wake(uint64_t now) {
     }
     if (idle_armed) {
         if (idle_audio_live()) { idle_throttle_release("audio"); return; }
-        /* Busy release: ONLY when the guest is runnable in essentially every
-           sampled wake (windowed dialog measures blocked=0.06..0.28, headless
-           0.50..0.78, an animating boot saturates at 0.00 - so the rail fires
-           on true saturation, never on the dialog).  Reset the hold counter so
-           a busy scene must prove itself static again before re-arming. */
-        if (runnable && idle_windows_done > 0 && idle_blocked_ratio <= idle_busy_ratio()) {
+        /* Busy release: ONLY when the guest retired instructions in
+           essentially every sampled wake (DQ8_IDLE_BUSY_RATIO, default 0.02),
+           i.e. it is really computing rather than parked on the throttled
+           deadline.  A parked guest lands near 0.0 here (one frame per host
+           250 ms window touches at most one wake in ~15).  Reset the hold
+           counter so a busy scene must prove itself static again before
+           re-arming. */
+        if (idle_windows_done > 0 && idle_blocked_ratio <= idle_busy_ratio()) {
             idle_static_frames = 0;
             idle_throttle_release("busy");
             return;
@@ -6723,15 +7553,23 @@ static void idle_service_host_wake(uint64_t now) {
                                              "%s%u:%08X", used ? "," : "", i,
                                              guest_threads[i].pc);
             idle_state_last_ns = now;
-            fprintf(stderr, "idle: state armed=%d static=%llu ok=%d changed=%u "
-                    "blocked=%.2f windows=%llu held=%08X audio=%d run=[%s]\n",
-                    idle_armed, (unsigned long long)idle_static_frames, idle_last_ok,
-                    idle_last_changed_words, idle_blocked_ratio,
+            fprintf(stderr, "idle: state armed=%d static=%llu hold=%u ok=%d changed=%u "
+                    "blocked=%.2f windows=%llu held=%08X audio=%d no_input_s=%.0f runnable=%d run=[%s]\n",
+                    idle_armed, (unsigned long long)idle_static_frames, idle_hold_frames(),
+                    idle_last_ok, idle_last_changed_words, idle_blocked_ratio,
                     (unsigned long long)idle_windows_done, idle_held_buttons,
-                    idle_audio_live(), runmask);
+                    idle_audio_live(),
+                    idle_last_input_ns ? (double)(now - idle_last_input_ns) / 1e9 : -1.0,
+                    guest_any_runnable_thread(), runmask);
         }
     }
-    if (idle_static_frames >= idle_hold_frames() && !idle_held_buttons &&
+    /* t_6ee2859c: an input edge inside the hold window blocks the arm - a
+       screen the player is interacting with is not idle, whatever the picture
+       does.  The window is the same one the scan-out must stay byte-identical
+       for (DQ8_IDLE_HOLD_FRAMES vblanks). */
+    uint64_t hold_ns = (uint64_t)idle_hold_frames() * IDLE_VBLANK_NS;
+    int input_calm = !idle_last_input_ns || now - idle_last_input_ns >= hold_ns;
+    if (idle_static_frames >= idle_hold_frames() && !idle_held_buttons && input_calm &&
         !idle_audio_live() && idle_windows_done > 0 &&
         idle_blocked_ratio >= idle_arm_ratio())
         idle_throttle_arm(now);
@@ -6746,21 +7584,209 @@ static void idle_service_host_wake(uint64_t now) {
    catch-up, then resync), so delivery is 60/s regardless of load. */
 #define GSP_VBLANK_NS 16666667ull
 #define GSP_VBLANK_CATCHUP_CAP 4u
-static void gsp_vblank_service(uint64_t now) {
-    unsigned fired = 0;
-    if (!gsp_relay_registered) return;
+/* PACE (t_3463e625): one wall-clock vblank chain, used by every delivery path.
+   The cap bounds how many elapsed vblanks one service call may enqueue, and
+   every period the chain had to skip (because the guest was away longer than
+   the cap) is counted, not silently rewritten into "now".  Resynchronising to
+   `now` is the last resort: it makes the guest's frame clock a function of our
+   own per-frame work, which is what made the game advance at 0.7x wall time. */
+static void gsp_vblank_service_period(uint64_t now, uint64_t period, unsigned cap) {
+    unsigned fired = 0, resync = 0;
+    if (!gsp_relay_registered || !period) return;
     if (!gsp_next_vblank_ns) {
-        gsp_next_vblank_ns = now + GSP_VBLANK_NS;
+        gsp_next_vblank_ns = now + period;
         return;
     }
-    while (now >= gsp_next_vblank_ns && fired < GSP_VBLANK_CATCHUP_CAP) {
-        gsp_next_vblank_ns += GSP_VBLANK_NS;
+    while (now >= gsp_next_vblank_ns && fired < cap) {
+        gsp_next_vblank_ns += period;
         gsp_enqueue_interrupt(2u); /* PDC0: top-screen VBlank */
         gsp_enqueue_interrupt(3u); /* PDC1: bottom-screen VBlank */
         ++fired;
     }
-    if (now >= gsp_next_vblank_ns)
-        gsp_next_vblank_ns = now + GSP_VBLANK_NS; /* fell far behind: resync */
+    if (dq8_det_mode) dq8_det_vblanks += fired;
+    if (now >= gsp_next_vblank_ns) {
+        /* Fell further behind than the cap allows: resync.  Every dropped
+           period is guest-visible frame time the chain gave away; TEMPO
+           counts it (vbl_resync). */
+        resync = (unsigned)((now - gsp_next_vblank_ns) / period) + 1u;
+        gsp_next_vblank_ns = now + period;
+    }
+    tempo_vblank_seen(fired, resync);
+}
+static void gsp_vblank_service(uint64_t now) {
+    gsp_vblank_service_period(now, GSP_VBLANK_NS, GSP_VBLANK_CATCHUP_CAP);
+}
+
+/* VBLANK WALLCLOCK (t_d1be62fc): the guest-visible vblank cadence is a
+   property of the emulated hardware, so it must not be a function of how long
+   OUR frame took.  The chain above is deadline-based, but it is *serviced*
+   from the guest loop (guest_service_host_deadlines / the GSP relay wait), so
+   while a guest frame runs for 50-80 ms no period is enqueued; the bounded cap
+   then fires what it can and RESYNCS the deadline to `now`, permanently giving
+   away the periods in between (TEMPO vbl_resync: 2.6 k in a 57 s slowed run,
+   measured play time 0.59x wall time).
+
+   Here a dedicated host thread owns the 60 Hz deadline chain: it advances by
+   exactly one guest period per period and accumulates the elapsed periods in
+   `gsp_vbl_owed` (clamped, never resynced).  The periods are *delivered* - the
+   PDC0/PDC1 pair is enqueued in order - only from the context that owns the
+   GSP queue (the same call sites that service vblank today), so the relay
+   queue is never touched from two contexts.  A drain fires up to
+   GSP_VBLANK_DRAIN_BURST periods per visit and leaves the rest owed, so a slow
+   frame is caught up over the next few guest iterations instead of being
+   written off.  DQ8_VBLANK_WALLCLOCK=0 restores the old in-loop chain. */
+#define GSP_VBLANK_DRAIN_BURST 8u   /* periods per service visit (card: <= 8) */
+/* The owed counter is clamped at the relay ring's depth in periods (32 entries
+   / PDC0+PDC1 pair = 16): every period that elapses between two service visits
+   is delivered on the next visit, and the guest always finds a vblank waiting
+   instead of parking for a whole period.  (Clamping the *chain* would be a
+   resync by another name; clamping the debt only sheds work when the guest
+   services vblank so rarely that the ring could not hold the backlog - that is
+   counted in gsp_vbl_owed_clamped, never rewritten into the guest's clock.) */
+#define GSP_VBLANK_OWED_MAX 16u
+static _Atomic unsigned gsp_vbl_owed;
+static _Atomic unsigned long long gsp_vbl_owed_clamped;
+static _Atomic unsigned long long gsp_vbl_pacer_periods, gsp_vbl_drained;
+static unsigned long long gsp_vbl_drain_calls, gsp_vbl_drain_busy, gsp_vbl_drain_max;
+static pthread_mutex_t gsp_vbl_drain_mu = PTHREAD_MUTEX_INITIALIZER;
+static int gsp_vbl_pacer_started;
+static int vblank_wallclock_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("DQ8_VBLANK_WALLCLOCK");
+        /* Opt-in for now: the pacer is a verified win where the guest can
+           actually render at the target rate (measured 59.9 vbl/s with fps and
+           vbl_resync=0 on an unthrottled run), but on a single throttled core
+           the *delivered* rate is bounded by the guest's own service rate, so
+           the card's "vbl 60 while fps 10-20" acceptance is not met yet (see
+           reports/VBLANK_WALLCLOCK_t_d1be62fc.md).  DQ8_VBLANK_WALLCLOCK=1
+           enables the pacer; 0/unset keeps the old in-loop chain. */
+        enabled = (e && e[0] == '1' && !e[1]) ? 1 : 0;
+        /* DETERMINISTIC (t_115d297c) keeps its instruction-counted vblank: a
+           wall-clock pacer would make the guest clock a function of host load
+           and destroy run-to-run reproducibility. */
+        if (dq8_det_mode) enabled = 0;
+    }
+    return enabled;
+}
+static int gsp_vbl_owed_pending(void) {
+    return vblank_wallclock_enabled() &&
+           atomic_load_explicit(&gsp_vbl_owed, memory_order_relaxed) != 0u;
+}
+static void gsp_vbl_sleep_ns(uint64_t ns) {
+    struct timespec ts;
+    if (!ns) return;
+    ts.tv_sec = (time_t)(ns / 1000000000ull);
+    ts.tv_nsec = (long)(ns % 1000000000ull);
+    while (nanosleep(&ts, &ts) == -1 && errno == EINTR) { }
+}
+static void gsp_vbl_owed_add(void) {
+    unsigned o = atomic_load_explicit(&gsp_vbl_owed, memory_order_relaxed);
+    for (;;) {
+        unsigned n;
+        if (o >= GSP_VBLANK_OWED_MAX) {
+            /* Only reachable when the guest itself cannot consume 60 periods a
+               second (a lost host core); counted, never resynced. */
+            atomic_fetch_add_explicit(&gsp_vbl_owed_clamped, 1ull, memory_order_relaxed);
+            return;
+        }
+        n = o + 1u;
+        if (atomic_compare_exchange_weak_explicit(&gsp_vbl_owed, &o, n,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed))
+            return;
+    }
+}
+static void *gsp_vbl_pacer_main(void *arg) {
+    uint64_t next = 0;
+    int was_idle = 0;
+    uint64_t trace_last = 0;
+    (void)arg;
+    for (;;) {
+        uint64_t now, period, sleep_ns;
+        int idle;
+        if (!gsp_relay_registered) { next = 0; was_idle = 0; gsp_vbl_sleep_ns(2000000ull); continue; }
+        now = host_monotonic_ns();
+        idle = idle_armed ? 1 : 0;
+        if (idle) {
+            /* Shipped idle-throttle semantics: one guest vblank per tuned idle
+               period, and no debt accrues while the scene is static. */
+            period = idle_period_ns ? idle_period_ns : GSP_VBLANK_NS;
+            if (!next || !was_idle) next = now + period;
+            if (now >= next) { gsp_vbl_owed_add(); next = now + period; }
+        } else {
+            period = GSP_VBLANK_NS;
+            if (was_idle) next = now;            /* leaving idle: due at once */
+            else if (!next) next = now + period;
+            if (!period) period = GSP_VBLANK_NS;
+            while (now >= next) {                /* every elapsed period, no drop */
+                gsp_vbl_owed_add();
+                atomic_fetch_add_explicit(&gsp_vbl_pacer_periods, 1ull, memory_order_relaxed);
+                next += period;
+            }
+        }
+        was_idle = idle;
+        atomic_store_explicit(&gsp_next_vblank_ns, next, memory_order_relaxed);
+        if (getenv("DQ8_TRACE_VBLANK") && (!trace_last || now - trace_last >= 5000000000ull)) {
+            trace_last = now;
+            fprintf(stderr, "VBLPACER idle=%d period_ms=%.3f owed=%u owed_max_hits=%llu "
+                    "pacer_periods=%llu drained=%llu calls=%llu busy=%llu max_burst=%llu "
+                    "next_in_ms=%.2f\n",
+                    idle, (double)period / 1e6,
+                    atomic_load_explicit(&gsp_vbl_owed, memory_order_relaxed),
+                    (unsigned long long)atomic_load_explicit(&gsp_vbl_owed_clamped, memory_order_relaxed),
+                    (unsigned long long)atomic_load_explicit(&gsp_vbl_pacer_periods, memory_order_relaxed),
+                    (unsigned long long)atomic_load_explicit(&gsp_vbl_drained, memory_order_relaxed),
+                    gsp_vbl_drain_calls, gsp_vbl_drain_busy, gsp_vbl_drain_max,
+                    next > now ? (double)(next - now) / 1e6 : -1.0);
+        }
+        now = host_monotonic_ns();
+        sleep_ns = next > now ? next - now : 0;
+        if (sleep_ns > 50000000ull) sleep_ns = 50000000ull; /* re-check idle state */
+        if (!sleep_ns) sleep_ns = 1000000ull;
+        gsp_vbl_sleep_ns(sleep_ns);
+    }
+    return NULL;
+}
+static void gsp_vbl_pacer_start(void) {
+    pthread_t t;
+    if (gsp_vbl_pacer_started || !vblank_wallclock_enabled()) return;
+    if (!gsp_relay_registered) return;
+    gsp_vbl_pacer_started = 1;
+    /* Seed the chain from "now" so the first guest vblank keeps its full
+       period (the pacer only ever advances this from wall-clock time). */
+    if (!atomic_load_explicit(&gsp_next_vblank_ns, memory_order_relaxed))
+        atomic_store_explicit(&gsp_next_vblank_ns, host_monotonic_ns() + GSP_VBLANK_NS,
+                              memory_order_relaxed);
+    if (pthread_create(&t, NULL, gsp_vbl_pacer_main, NULL) != 0) {
+        gsp_vbl_pacer_started = 0;
+        return;
+    }
+    pthread_detach(t);
+}
+/* Deliver the periods the pacer has accounted.  Called only from the GSP
+   queue owner's service points (guest_service_host_deadlines and the relay
+   wait), never from the pacer thread. */
+static void gsp_vbl_deliver_owed(void) {
+    unsigned burst = 0;
+    if (!gsp_relay_registered) return;
+    gsp_vbl_pacer_start();
+    if (pthread_mutex_trylock(&gsp_vbl_drain_mu) != 0) { ++gsp_vbl_drain_busy; return; }
+    ++gsp_vbl_drain_calls;
+    while (burst < GSP_VBLANK_DRAIN_BURST) {
+        unsigned o = atomic_load_explicit(&gsp_vbl_owed, memory_order_relaxed);
+        if (!o) break;
+        atomic_store_explicit(&gsp_vbl_owed, o - 1u, memory_order_relaxed);
+        gsp_enqueue_interrupt(2u); /* PDC0: top-screen VBlank */
+        gsp_enqueue_interrupt(3u); /* PDC1: bottom-screen VBlank */
+        ++burst;
+    }
+    pthread_mutex_unlock(&gsp_vbl_drain_mu);
+    if (burst > gsp_vbl_drain_max) gsp_vbl_drain_max = burst;
+    if (burst) {
+        atomic_fetch_add_explicit(&gsp_vbl_drained, (unsigned long long)burst, memory_order_relaxed);
+        tempo_vblank_seen(burst, 0u); /* no period is resynced away on this path */
+    }
 }
 
 /* F4: guest-side presentation job.  The guest thread copies the framebuffer
@@ -6821,14 +7847,14 @@ static uint32_t pica_tail_addr, pica_tail_size;
 static void pica_process_command_list(uint32_t address, uint32_t size);
 
 static int pica_write_register(uint32_t reg, uint32_t value, uint32_t mask) {
-    if (reg == 0x200u && getenv("DQ8_TRACE_GPU") && value) {
+    if (reg == 0x200u && dq8_env_on("DQ8_TRACE_GPU", &dq8_env_trace_gpu) && value) {
         static unsigned ab_log;
         if (ab_log++ < 16u)
             fprintf(stderr, "PICA 0x200 <= %08X (field=%08X paddr=%08X)\n",
                     value, (value >> 1) & 0x0FFFFFFFu,
                     ((value >> 1) & 0x0FFFFFFFu) * 16u);
     }
-    if ((reg >= 0x80u && reg <= 0x8Fu) && getenv("DQ8_TRACE_GPU")) {
+    if ((reg >= 0x80u && reg <= 0x8Fu) && dq8_env_on("DQ8_TRACE_GPU", &dq8_env_trace_gpu)) {
         static unsigned tex_wr;
         if (tex_wr++ < 48u)
             fprintf(stderr, "PICA texreg %03X <= %08X mask=%X\n", reg, value, mask);
@@ -6842,7 +7868,7 @@ static int pica_write_register(uint32_t reg, uint32_t value, uint32_t mask) {
     /* Diagnostic: distinct texture-unit-0 configurations actually written by
        guest command lists, so a texture that is bound but never drawn (or never
        bound at all) can be told apart from one that is drawn. */
-    if ((reg == 0x82u || reg == 0x85u || reg == 0x8Eu) && getenv("DQ8_TRACE_TEXCFG")) {
+    if ((reg == 0x82u || reg == 0x85u || reg == 0x8Eu) && dq8_env_on("DQ8_TRACE_TEXCFG", &dq8_env_trace_texcfg)) {
         static uint64_t seen[96];
         static unsigned nseen;
         static uint32_t seen_lr[24];
@@ -6919,7 +7945,7 @@ static int pica_write_register(uint32_t reg, uint32_t value, uint32_t mask) {
     }
     /* VS program code: 0x2CB offset, 0x2CC-0x2D3 words. */
     if (reg == 0x2CBu) {
-        if (getenv("DQ8_TRACE_GPU")) {
+        if (dq8_env_on("DQ8_TRACE_GPU", &dq8_env_trace_gpu)) {
             static uint32_t shader_pcs[8];
             static unsigned nshader_pcs;
             static uint32_t shader_lrs[16];
@@ -6959,16 +7985,21 @@ static int pica_write_register(uint32_t reg, uint32_t value, uint32_t mask) {
        black-3D investigation: real game draw lists can trigger that way). */
     if (reg == 0x22Eu || reg == 0x22Fu) {
         ++pica_draw_count;
-        if (getenv("DQ8_TRACE_LAYER")) {
+        dlog_note_draw();
+        if (dq8_env_on("DQ8_TRACE_LAYER", &dq8_env_trace_layer)) {
             fprintf(stderr, "DRAWTRIG t=%.2f list=%llu reg=%03X value=%08X count=%u\n",
                     dq8_layer_t(), pica_list_no, reg, value, value);
         }
         {
-            const char *scan = getenv("DQ8_SCAN_MSG");
+            if (!dq8_env_scan_msg_init) {
+                dq8_env_scan_msg_init = 1;
+                dq8_env_scan_msg = getenv("DQ8_SCAN_MSG");
+            }
+            const char *scan = dq8_env_scan_msg;
             if (scan && *scan && pica_draw_count >= 600u && (pica_draw_count % 500u) == 0u)
                 dq8_scan_ram_text(scan);
         }
-        if (getenv("DQ8_TRACE_GPU")) {
+        if (dq8_env_on("DQ8_TRACE_GPU", &dq8_env_trace_gpu)) {
             static uint32_t draw_pcs[16];
             static unsigned ndraw_pcs;
             static uint32_t draw_lrs[24];
@@ -7008,7 +8039,7 @@ static int pica_write_register(uint32_t reg, uint32_t value, uint32_t mask) {
         unsigned ch = reg - 0x23Cu;
         uint32_t cmdbuf_addr = pica_cmdbuf_addr[ch] * 8u;
         uint32_t cmdbuf_size = pica_cmdbuf_size[ch] * 8u;
-        if (getenv("DQ8_TRACE_GPU"))
+        if (dq8_env_on("DQ8_TRACE_GPU", &dq8_env_trace_gpu))
             fprintf(stderr, "PICA cmdbuf trigger ch=%u addr=%08X size=%u depth=%u\n",
                     ch, cmdbuf_addr, cmdbuf_size, pica_cmdbuf_depth);
         /* t_da76454a TERRAIN FIX: a channel trigger is a TAIL CALL, not a
@@ -7029,7 +8060,7 @@ static int pica_write_register(uint32_t reg, uint32_t value, uint32_t mask) {
        relay waits for after submitting a PICA list. */
     if (reg == 0x10u && merged) {
         ++pica_finalize_count;
-        if (getenv("DQ8_TRACE_GPU"))
+        if (dq8_env_on("DQ8_TRACE_GPU", &dq8_env_trace_gpu))
             fprintf(stderr, "PICA finalize value=%08X count=%llu -> P3D\n",
                     merged, (unsigned long long)pica_finalize_count);
         gsp_enqueue_interrupt(5u); /* P3D: command-list completion */
@@ -7145,6 +8176,12 @@ static int host_display_ignore_black;
 static void host_display_shutdown(void);
 #ifdef DQ8_ENABLE_SDL
 static SDL_Window *host_sdl_window;
+/* Tentative declaration: the real definition is next to the GSP queue counter
+   (t_2d934e23) further down; the FPS title reads it per frame. */
+static unsigned long long gsp_queue_calls;
+/* Tentative: the PICA draw counters live in pica_gl.c (spliced later);
+   the FPS title uses them to tell a real game frame from a repeat. */
+static uint64_t pica_gl_draws_ok, pica_gl_draws_sw;
 static SDL_Renderer *host_sdl_renderer;
 static SDL_Texture *host_sdl_tex_top;
 static SDL_Texture *host_sdl_tex_bot;
@@ -7481,11 +8518,70 @@ static void host_display_init_body(void) {
    inline path and the DQ8_SPLIT_RENDER worker run the SAME handling; only
    the button-state sink differs (inline: native_hid_buttons on this
    thread; split: the atomic mask consumed by the guest pump). */
+static unsigned kb_stick;   /* keyboard circle-pad bits: 1 up, 2 down, 4 left, 8 right */
 static void host_display_collect_events(uint32_t *buttons) {
     SDL_Event ev;
     uint32_t collected = *buttons;
+    /* GAMEPAD (SDL_GameController): left stick -> 3DS circle pad, buttons ->
+       the same HID bit layout as the keyboard.  DQ8_GAMEPAD=0 disables it. */
+    const char *padenv = getenv("DQ8_GAMEPAD");
+    int pad_on = !(padenv && padenv[0] == '0');
+    static SDL_GameController *host_pad_ctrl;
+    static int host_pad_init_done;
+    if (pad_on && !host_pad_init_done) {
+        host_pad_init_done = 1;
+        if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) == 0) {
+            int n = SDL_NumJoysticks();
+            for (int i = 0; i < n; ++i) {
+                if (!SDL_IsGameController(i)) continue;
+                host_pad_ctrl = SDL_GameControllerOpen(i);
+                if (host_pad_ctrl) {
+                    fprintf(stderr, "host pad: opened '%s' (stick = circle pad)\n",
+                            SDL_GameControllerName(host_pad_ctrl));
+                    break;
+                }
+            }
+            if (!host_pad_ctrl) fprintf(stderr, "host pad: none detected (keyboard only)\n");
+        } else {
+            fprintf(stderr, "host pad: SDL_INIT_GAMECONTROLLER failed: %s\n", SDL_GetError());
+        }
+    }
     while (SDL_PollEvent(&ev)) {
         if (ev.type == SDL_QUIT) host_display_quit = 1;
+        if (pad_on && ev.type == SDL_CONTROLLERDEVICEADDED && !host_pad_ctrl) {
+            if (SDL_IsGameController(ev.cdevice.which)) {
+                host_pad_ctrl = SDL_GameControllerOpen(ev.cdevice.which);
+                if (host_pad_ctrl)
+                    fprintf(stderr, "host pad: hotplug '%s' (stick = circle pad)\n",
+                            SDL_GameControllerName(host_pad_ctrl));
+            }
+        }
+        if (pad_on && ev.type == SDL_CONTROLLERDEVICEREMOVED && host_pad_ctrl) {
+            SDL_GameControllerClose(host_pad_ctrl);
+            host_pad_ctrl = NULL;
+            fprintf(stderr, "host pad: removed\n");
+        }
+        if (pad_on && (ev.type == SDL_CONTROLLERBUTTONDOWN || ev.type == SDL_CONTROLLERBUTTONUP)) {
+            uint32_t bit = 0;
+            switch (ev.cbutton.button) {
+                case SDL_CONTROLLER_BUTTON_A: bit = 1u; break;
+                case SDL_CONTROLLER_BUTTON_B: bit = 2u; break;
+                case SDL_CONTROLLER_BUTTON_BACK: bit = 4u; break;
+                case SDL_CONTROLLER_BUTTON_START: bit = 8u; break;
+                case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: bit = 16u; break;
+                case SDL_CONTROLLER_BUTTON_DPAD_LEFT: bit = 32u; break;
+                case SDL_CONTROLLER_BUTTON_DPAD_UP: bit = 64u; break;
+                case SDL_CONTROLLER_BUTTON_DPAD_DOWN: bit = 128u; break;
+                case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: bit = 256u; break;
+                case SDL_CONTROLLER_BUTTON_LEFTSHOULDER: bit = 512u; break;
+                case SDL_CONTROLLER_BUTTON_X: bit = 1024u; break;
+                case SDL_CONTROLLER_BUTTON_Y: bit = 2048u; break;
+                case SDL_CONTROLLER_BUTTON_GUIDE: bit = 8u; break;
+                default: break;
+            }
+            if (ev.type == SDL_CONTROLLERBUTTONDOWN) collected |= bit;
+            else collected &= ~bit;
+        }
 #ifdef SDL_WINDOWEVENT_EXPOSED
         /* The compositor can invalidate the window surface without any
            guest-side content change; force the next present. */
@@ -7506,6 +8602,24 @@ static void host_display_collect_events(uint32_t *buttons) {
                 case SDLK_s:bit=1024u;break;case SDLK_a:bit=2048u;break;
             }
             if(ev.type==SDL_KEYDOWN)collected|=bit;else collected&=~bit;
+            /* Keyboard stand-in for the circle pad (operator without a
+               gamepad): I/J/K/L and the numpad arrows hold a fully
+               deflected analog stick. */
+            {
+                unsigned sbit = 0;
+                switch (k) {
+                    case SDLK_i: case SDLK_KP_8: sbit = 1u; break;
+                    case SDLK_k: case SDLK_KP_2: sbit = 2u; break;
+                    case SDLK_j: case SDLK_KP_4: sbit = 4u; break;
+                    case SDLK_l: case SDLK_KP_6: sbit = 8u; break;
+                }
+                if (sbit) {
+                    if (ev.type == SDL_KEYDOWN) kb_stick |= sbit;
+                    else                        kb_stick &= ~sbit;
+                    if (getenv("DQ8_KBD_LOG"))
+                        fprintf(stderr, "kb stick: bits=%u (I/J/K/L or numpad)\n", kb_stick);
+                }
+            }
             if (ev.type==SDL_KEYDOWN && (k == SDLK_ESCAPE || k == SDLK_q)) host_display_quit = 1;
             /* SAVESTATE (t_d50c9503): F5 snapshots the whole guest state to the
                default slot, F9 restores it.  Key repeat is ignored so one press
@@ -7517,6 +8631,30 @@ static void host_display_collect_events(uint32_t *buttons) {
         }
     }
     *buttons = collected;
+    /* Left stick -> 3DS circle pad (+-156).  SDL's Y grows downward, the 3DS
+       circle pad's grows upward, so Y is negated.  A stick move publishes
+       through native_hid_pump's "changed" path. */
+    if (pad_on && host_pad_ctrl) {
+        int ax = SDL_GameControllerGetAxis(host_pad_ctrl, SDL_CONTROLLER_AXIS_LEFTX);
+        int ay = SDL_GameControllerGetAxis(host_pad_ctrl, SDL_CONTROLLER_AXIS_LEFTY);
+        const int dz = 6000;   /* ~18% deadzone */
+        if (ax > -dz && ax < dz) ax = 0;
+        if (ay > -dz && ay < dz) ay = 0;
+        native_hid_circle_x = (int16_t)(ax * 156 / 32767);
+        native_hid_circle_y = (int16_t)(-ay * 156 / 32767);
+        if (SDL_GameControllerGetAxis(host_pad_ctrl, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 12000)
+            collected |= 512u;
+        if (SDL_GameControllerGetAxis(host_pad_ctrl, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 12000)
+            collected |= 256u;
+    } else {
+        /* No gamepad: drive the circle pad from the keyboard.  Diagonals are
+           scaled to 110 so the vector stays inside the pad's radius. */
+        int kx = ((kb_stick & 8u) ? 156 : 0) - ((kb_stick & 4u) ? 156 : 0);
+        int ky = ((kb_stick & 1u) ? 156 : 0) - ((kb_stick & 2u) ? 156 : 0);
+        if (kx && ky) { kx = (kx > 0) ? 110 : -110; ky = (ky > 0) ? 110 : -110; }
+        native_hid_circle_x = (int16_t)kx;
+        native_hid_circle_y = (int16_t)ky;
+    }
 }
 static void host_display_pump_events(void) {
     /* PERF-05: collect host input FIRST, publish SECOND.  The previous order
@@ -7654,7 +8792,44 @@ static void host_display_present_impl(void) {}
    no-ops for present (the worker paces it) while HID stays on this thread. */
 static void host_display_present(void) {
     if (split_render_enabled()) return;
+    PF_ENTER(PF_PRESENT);
     host_display_present_impl();
+    PF_EXIT();
+    /* GAME fps in the window title, refreshed once a second.  A "game frame" is
+       a scan-out at which the guest actually drew something new: the total
+       draw counter moved since the previous scan-out.  That is the rate the
+       game itself advances at (30/s for this title, which is hard-locked),
+       NOT the LCD refresh (60/s) and NOT the GPU-queue tick count.
+       DQ8_FPS_TITLE=0 turns it off. */
+    {
+        static uint64_t fps_last_ns;
+        static unsigned long long fps_last_game, fps_last_draws, fps_game_frames;
+        static int fps_title_off = -1;
+        if (fps_title_off < 0) {
+            const char *e = getenv("DQ8_FPS_TITLE");
+            fps_title_off = (e && e[0] == '0');
+        }
+        if (!fps_title_off && host_sdl_window) {
+            unsigned long long draws_now = pica_gl_draws_ok + pica_gl_draws_sw;
+            uint64_t now = host_monotonic_ns();
+            if (draws_now != fps_last_draws) { ++fps_game_frames; fps_last_draws = draws_now; }
+            if (!fps_last_ns) { fps_last_ns = now; fps_last_game = fps_game_frames; }
+            double dt = (double)(now - fps_last_ns) / 1e9;
+            if (dt >= 1.0) {
+                unsigned long long dg = fps_game_frames - fps_last_game;
+                char title[192];
+                if (dg > 0)
+                    snprintf(title, sizeof title,
+                             "DQ8  |  GAME %.1f fps  |  %5.1f ms/frame",
+                             (double)dg / dt, 1000.0 * dt / (double)dg);
+                else
+                    snprintf(title, sizeof title,
+                             "DQ8  |  GAME 0.0 fps (paused/loading)");
+                SDL_SetWindowTitle(host_sdl_window, title);
+                fps_last_ns = now; fps_last_game = fps_game_frames;
+            }
+        }
+    }
 }
 static void host_display_shutdown(void) {
     if (split_render_enabled()) {
@@ -7835,6 +9010,7 @@ static void host_display_convert_span(uint8_t *src, uint64_t src_bytes,
     }
 }
 static void host_display_capture_transfer(uint32_t mapped_dest, uint32_t w, uint32_t h, uint32_t format) {
+    tempo_capture_seen(); /* TEMPO: guest display-transfer (rendered frame) count */
     pica_gl_flush_guest_rt(); /* capture reads the frame buffer from guest RAM */
     uint32_t bpp = gsp_transfer_bytes_per_pixel(format);
     if (!host_display_shadow_consumer()) {
@@ -7886,6 +9062,12 @@ static void host_display_capture_transfer(uint32_t mapped_dest, uint32_t w, uint
                               w, h, format);
 }
 static void gsp_memory_fill(uint32_t *args) {
+    /* t_fa78ea1f: a fill overwrites guest pixels, exactly like a display
+       transfer reads them --  the deferred GL episode must land in guest RAM
+       first, otherwise the fill is applied to a buffer whose GL content is
+       still pending and the next pgl_refresh() has to guess which of the two
+       is newer. */
+    pica_gl_flush_guest_rt();
     if (dq8_layer_trace())
         fprintf(stderr, "LAYER t=%.2f fill %08X..%08X value=%08X ctl=%04X | %08X..%08X value=%08X ctl=%04X list=%llu\n",
                 dq8_layer_t(), args[0], args[2], args[1], args[6] & 0xFFFFu,
@@ -7901,6 +9083,10 @@ static void gsp_memory_fill(uint32_t *args) {
         if (starts[b] && ends[b] >= starts[b] &&
             guest_memory_range(starts[b], bytes, &start)) {
             end = start + (uint32_t)bytes;
+            /* t_477973bb: the fill overwrites guest pixels — the FBO must be
+               re-synced from them before the next draw (same contract as the
+               flush above, and the reason the shadow compare exists). */
+            pica_gl_note_guest_write(ram + start, end - start);
             uint32_t bytes_per_pixel = (control >> 8u) == 0u ? 2u :
                                       (control >> 8u) == 1u ? 3u : 4u;
             uint32_t pattern_bytes = bytes_per_pixel;
@@ -7947,16 +9133,125 @@ static void gsp_memory_fill(uint32_t *args) {
         if (control & 1u)
             gsp_enqueue_interrupt((uint8_t)b); /* PSC0 / PSC1 */
     }
-    if (getenv("DQ8_TRACE_GPU"))
+    if (dq8_env_on("DQ8_TRACE_GPU", &dq8_env_trace_gpu))
         fprintf(stderr, "GSP memory-fill %08X..%08X value=%08X control=%04X; %08X..%08X value=%08X control=%04X\n",
                 starts[0], ends[0], values[0], controls[0], starts[1], ends[1], values[1], controls[1]);
 }
+/* XFERPROF (t_2d934e23): the scan-out transfer is one of the two heaviest
+   shims in a spike frame (28.1 ms per frame over 2 transfers, 27 % of it).
+   Split its wall time at the three real boundaries so the fix targets the
+   actual cost, not a guess: (1) pica_gl_flush_guest_rt (GL readback + the
+   deferred write-back of the render target into guest RAM), (2) the per-pixel
+   source->dest conversion loop, (3) host_display_capture_transfer (the
+   guest-RAM -> host shadow conversion that feeds the window).  Aggregate over
+   a ~2 s window; one getenv per process when the knob is off. */
+static int xfer_prof_enabled(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DQ8_XFERPROF"); v = (e && e[0] && e[0] != '0'); }
+    return v;
+}
+static uint64_t xfer_prof_flush_ns, xfer_prof_loop_ns, xfer_prof_cap_ns;
+static uint64_t xfer_prof_max_flush_ns, xfer_prof_max_loop_ns, xfer_prof_max_cap_ns;
+static uint64_t xfer_prof_src_bytes, xfer_prof_dst_bytes;
+static unsigned xfer_prof_n;
+static double xfer_prof_last;
+/* t_2d934e23: GSP TriggerCmdReqQueue (cmd 0x000C0000) calls — the guest's
+   per-3D-frame GPU command queue, i.e. one logic/render tick.  Printed with
+   the XFERPROF window so the tick rate is readable next to the transfer cost. */
+static unsigned long long gsp_queue_calls;
+static void xfer_prof_report(uint64_t t_flush, uint64_t t_loop, uint64_t t_cap,
+                             uint32_t in_w, uint32_t in_h, uint32_t out_w,
+                             uint32_t out_h, uint32_t flags) {
+    double now = dq8_layer_t();
+    pf_shim(PF_SH_XFER_FLUSH, t_flush);
+    pf_shim(PF_SH_XFER_LOOP, t_loop);
+    pf_shim(PF_SH_XFER_CAP, t_cap);
+    xfer_prof_flush_ns += t_flush; xfer_prof_loop_ns += t_loop; xfer_prof_cap_ns += t_cap;
+    if (t_flush > xfer_prof_max_flush_ns) xfer_prof_max_flush_ns = t_flush;
+    if (t_loop > xfer_prof_max_loop_ns) xfer_prof_max_loop_ns = t_loop;
+    if (t_cap > xfer_prof_max_cap_ns) xfer_prof_max_cap_ns = t_cap;
+    xfer_prof_src_bytes += (uint64_t)in_w * in_h * 4u;
+    xfer_prof_dst_bytes += (uint64_t)out_w * out_h * 3u;
+    ++xfer_prof_n;
+    if (xfer_prof_last == 0.0) { xfer_prof_last = now; return; }
+    if (now - xfer_prof_last >= 2.0) {
+        fprintf(stderr, "XFERPROF n=%u flush_ms=%.2f loop_ms=%.2f capture_ms=%.2f "
+                "total_ms=%.2f mean_ms=%.2f max[flush/loop/cap]=%.2f/%.2f/%.2f "
+                "flags=%08X queue=%llu\n",
+                xfer_prof_n, (double)xfer_prof_flush_ns / 1e6,
+                (double)xfer_prof_loop_ns / 1e6, (double)xfer_prof_cap_ns / 1e6,
+                (double)(xfer_prof_flush_ns + xfer_prof_loop_ns + xfer_prof_cap_ns) / 1e6,
+                (double)(xfer_prof_flush_ns + xfer_prof_loop_ns + xfer_prof_cap_ns) /
+                    (double)xfer_prof_n / 1e6,
+                (double)xfer_prof_max_flush_ns / 1e6, (double)xfer_prof_max_loop_ns / 1e6,
+                (double)xfer_prof_max_cap_ns / 1e6, flags, gsp_queue_calls);
+        gsp_queue_calls = 0;
+        xfer_prof_flush_ns = xfer_prof_loop_ns = xfer_prof_cap_ns = 0;
+        xfer_prof_max_flush_ns = xfer_prof_max_loop_ns = xfer_prof_max_cap_ns = 0;
+        xfer_prof_src_bytes = xfer_prof_dst_bytes = 0;
+        xfer_prof_n = 0;
+        xfer_prof_last = now;
+    }
+}
+/* t_fa78ea1f DARKLOG: last display transfer (defined with the sampler). */
+/* Per-render-target draw tallies since the last top-screen display transfer,
+   so a frame that presents a UI-less image can be attributed to "the guest drew
+   no UI draws into the RT" vs "the backend lost them". */
+static int dlog_enabled(void); /* defined with the scan-out sampler */
+#define DLOG_RT_SLOTS 8
+static struct { uint32_t addr, w, h; unsigned draws; } dlog_rt[DLOG_RT_SLOTS];
+static unsigned dlog_rt_n;
+static void dlog_note_draw(void) {
+    unsigned i;
+    for (i = 0; i < dlog_rt_n; ++i)
+        if (dlog_rt[i].addr == pica_rt_addr) { ++dlog_rt[i].draws; return; }
+    if (dlog_rt_n < DLOG_RT_SLOTS) {
+        dlog_rt[dlog_rt_n].addr = pica_rt_addr;
+        dlog_rt[dlog_rt_n].w = pica_rt_w;
+        dlog_rt[dlog_rt_n].h = pica_rt_h;
+        dlog_rt[dlog_rt_n].draws = 1;
+        ++dlog_rt_n;
+    }
+}
+/* Dark share of a colour buffer in PICA tiled layout. */
+static double dlog_dark_tiled(uint32_t addr, uint32_t w, uint32_t h, uint32_t gsp_fmt) {
+    uint32_t x, y, n = 0, dark = 0, fmt = gsp_fmt;
+    uint8_t r, g, b, a;
+    if (!addr || !w || !h) return -1.0;
+    if (fmt == 2u) fmt = 3u; else if (fmt == 3u) fmt = 2u;
+    for (y = 0; y < h; y += 8u) {
+        for (x = 0; x < w; x += 8u) {
+            if (!pica_get_pixel(addr, w, h, fmt, x, y, &r, &g, &b, &a)) return -1.0;
+            unsigned m = r > g ? (r > b ? r : b) : (g > b ? g : b);
+            ++n;
+            if (m <= 16u) ++dark;
+        }
+    }
+    return n ? 100.0 * (double)dark / (double)n : -1.0;
+}
+
+static uint32_t dlog_xsrc, dlog_xdst, dlog_xw, dlog_xh, dlog_xfmt, dlog_xn;
 static void gsp_display_transfer(uint32_t *args) {
+    int xp = xfer_prof_enabled();
+    uint64_t xp_t0 = 0, xp_flush = 0, xp_loop = 0;
+    if (xp) xp_t0 = host_monotonic_ns();
     pica_gl_flush_guest_rt(); /* transfer reads source pixels from guest RAM */
+    if (xp) { xp_flush = host_monotonic_ns() - xp_t0; xp_t0 = host_monotonic_ns(); }
     if (dq8_layer_trace())
         fprintf(stderr, "LAYER t=%.2f xfer src=%08X in=%ux%u ifmt=%u -> dst=%08X out=%ux%u ofmt=%u flags=%08X list=%llu\n",
                 dq8_layer_t(), args[0], (args[2] & 0xFFFFu), (args[2] >> 16u), (args[4] >> 8) & 7u,
                 args[1], (args[3] & 0xFFFFu), (args[3] >> 16u), (args[4] >> 12) & 7u, args[4], pica_list_no);
+    if (dlog_enabled() && ((args[2] >> 16u) == 400u)) {
+        unsigned i;
+        fprintf(stderr, "XFDARK src=%08X dst=%08X src_dark=%.1f draws=%llu rts=",
+                args[0], args[1],
+                dlog_dark_tiled(args[0], args[2] & 0xFFFFu, args[2] >> 16u, (args[4] >> 8) & 7u),
+                (unsigned long long)pica_draw_count);
+        for (i = 0; i < dlog_rt_n; ++i)
+            fprintf(stderr, "%s%08X:%u", i ? " " : "", dlog_rt[i].addr, dlog_rt[i].draws);
+        fputc(10, stderr);
+        dlog_rt_n = 0;
+    }
     uint32_t source = args[0], dest = args[1], input_dim = args[2], output_dim = args[3], flags = args[4];
     uint32_t input_w = input_dim & 0xFFFFu, input_h = input_dim >> 16u;
     uint32_t output_w = output_dim & 0xFFFFu, output_h = output_dim >> 16u;
@@ -7977,6 +9272,9 @@ static void gsp_display_transfer(uint32_t *args) {
         return;
     }
     uint32_t guest_src = source, guest_dst = dest;
+    dlog_xsrc = guest_src; dlog_xdst = guest_dst;
+    dlog_xw = output_w; dlog_xh = output_h; dlog_xfmt = output_format;
+    ++dlog_xn;
     source = mapped_source;
     dest = mapped_dest;
     int vflip = flags & 1u;
@@ -7991,7 +9289,7 @@ static void gsp_display_transfer(uint32_t *args) {
     uint32_t v_scale = (scaling == 2u) ? 1u : 0u;
     uint32_t out_w = output_w >> h_scale;
     uint32_t out_h = output_h >> v_scale;
-    if (getenv("DQ8_TRACE_GPU")) {
+    if (dq8_env_on("DQ8_TRACE_GPU", &dq8_env_trace_gpu)) {
         static unsigned xfer_log;
         /* Every transfer: source/dest/dims, to see whether bottom uses the top RT. */
         if (xfer_log++ < 500u)
@@ -8000,6 +9298,53 @@ static void gsp_display_transfer(uint32_t *args) {
                     input_w, input_h, output_w, output_h, out_w, out_h,
                     input_format, output_format, flags, vflip, input_linear, dont_swizzle, scaling,
                     pica_rt_addr, pica_rt_w, pica_rt_h, pica_rt_format);
+    }
+    /* t_2d934e23: scan-out conversion fast path.  The per-frame display
+       transfer is tiled RGBA8 -> linear RGB8 (ScaleX box filter), i.e. exactly
+       this shape; the generic loop below resolves pica_get_pixel (Morton math
+       + guest_memory_range) TWICE per output pixel and re-derives the fb
+       format every iteration: measured 3.7 ms for 240x400 (96 k pixels,
+       39 ns/pixel).  Here the Morton tile offset is computed once per row
+       slice and the format conversion is inlined, so the same bytes are
+       produced with a handful of loads/stores per pixel.  Byte identity is
+       verified against the generic path (DQ8_XFER_FAST=0) with the
+       DQ8_DUMP_TRANSFER_PREFIX PPM dumps. */
+    {
+        static int xfer_fast_on = -1;
+        if (xfer_fast_on < 0) {
+            const char *e = getenv("DQ8_XFER_FAST");
+            xfer_fast_on = (e && e[0] == '0' && !e[1]) ? 0 : 1;
+        }
+        if (xfer_fast_on && input_format == 0u && output_format == 1u &&
+            in_bpp == 4u && out_bpp == 3u && !input_linear && !dont_swizzle &&
+            !vflip && v_scale == 0u && out_w <= input_w && out_h <= input_h &&
+            !(input_w & 7u) && !(input_h & 7u)) {
+            static const uint32_t xl[8] = {0u, 1u, 4u, 5u, 16u, 17u, 20u, 21u};
+            static const uint32_t yl[8] = {0u, 2u, 8u, 10u, 32u, 34u, 40u, 42u};
+            uint32_t tiles_per_row = input_w >> 3u;
+            for (uint32_t y = 0; y < out_h; ++y) {
+                /* v_scale == 0 so the source row is y itself */
+                uint32_t trow = (y >> 3u) * tiles_per_row * 256u +
+                                yl[y & 7u] * 4u;
+                uint8_t *dp = ram + dest + (uint64_t)y * out_w * 3u;
+                for (uint32_t x = 0; x < out_w; ++x) {
+                    uint32_t sx = x << h_scale;
+                    const uint8_t *p0 = ram + source + trow +
+                        ((sx >> 3u) * 256u + xl[sx & 7u] * 4u);
+                    uint8_t r = p0[3], g = p0[2], b = p0[1];
+                    if (h_scale) {
+                        const uint8_t *p1 = ram + source + trow +
+                            (((sx + 1u) >> 3u) * 256u + xl[(sx + 1u) & 7u] * 4u);
+                        r = (uint8_t)(((unsigned)r + p1[3]) / 2u);
+                        g = (uint8_t)(((unsigned)g + p1[2]) / 2u);
+                        b = (uint8_t)(((unsigned)b + p1[1]) / 2u);
+                    }
+                    dp[0] = b; dp[1] = g; dp[2] = r;
+                    dp += 3;
+                }
+            }
+            goto transfer_pixels_done;
+        }
     }
     for (uint32_t y = 0; y < out_h; ++y) {
         uint32_t sy = y << v_scale;
@@ -8079,6 +9424,8 @@ static void gsp_display_transfer(uint32_t *args) {
             }
         }
     }
+transfer_pixels_done:
+    if (xp) { xp_loop = host_monotonic_ns() - xp_t0; xp_t0 = host_monotonic_ns(); }
     const char *prefix = getenv("DQ8_DUMP_TRANSFER_PREFIX");
     if (prefix && output_format == 1u) {
         char path[1024];
@@ -8098,7 +9445,7 @@ static void gsp_display_transfer(uint32_t *args) {
             fprintf(stderr, "GSP display-transfer dump: src=%08X dst=%08X %ux%u -> %s\n", guest_src, dest, out_w, out_h, path);
         }
     }
-    if (getenv("DQ8_TRACE_GPU"))
+    if (dq8_env_on("DQ8_TRACE_GPU", &dq8_env_trace_gpu))
         fprintf(stderr, "GSP display-transfer src=%08X %ux%u fmt=%u -> dst=%08X %ux%u fmt=%u flags=%08X\n",
                 source, input_w, input_h, input_format, dest, out_w, out_h, output_format, flags);
     /* Scan-out shield: once the guest registers framebuffer info, the LCD
@@ -8107,12 +9454,17 @@ static void gsp_display_transfer(uint32_t *args) {
     {
         int screen = (out_h == 400u || out_h == 800u) ? 0 : 1;
         if (gsp_fb_valid[screen] && guest_dst != gsp_fb_addr[screen][gsp_fb_shown[screen]]) {
-            if (getenv("DQ8_TRACE_GSP_FB"))
+            if (dq8_env_on("DQ8_TRACE_GSP_FB", &dq8_env_trace_gsp_fb))
                 fprintf(stderr, "GSP transfer dst=%08X not shown (screen=%u shown=%08X) — shadow kept\n",
                         guest_dst, screen, gsp_fb_addr[screen][gsp_fb_shown[screen]]);
         } else {
             host_display_capture_transfer(dest, out_w, out_h, output_format);
         }
+    }
+    if (xp) {
+        uint64_t xp_t1 = host_monotonic_ns();
+        xfer_prof_report(xp_flush, xp_loop, xp_t1 - xp_t0,
+                         input_w, input_h, out_w, out_h, flags);
     }
     /* Optional diagnostic overlay; use only an already discovered texture.
        Early transfers precede BFLIM loading. A failed RAM search per pixel
@@ -8172,7 +9524,7 @@ static void gsp_write_screen_ppms_impl(void) {
     ++bench_snapshots;
     {
         static uint64_t last_ppm_ns;
-        uint64_t now = host_monotonic_ns();
+        uint64_t now = dq8_guest_now_ns();
         if (now - last_ppm_ns < 200000000ull) return;
         last_ppm_ns = now;
     }
@@ -8417,6 +9769,73 @@ static void frame_stats_sample(void) {
                 pgl_tex_misses);
 }
 
+/* t_fa78ea1f diagnostic (DQ8_DARKLOG=1): per presented frame, report how much
+   of each candidate image is black so a "menu missing" frame can be attributed
+   to the render target (draw lost), the scan-out slot (transfer problem) or the
+   presented shadow (capture).  dark = max(r,g,b) <= 16, sampled every 2nd px. */
+static int dlog_on = -1;
+static int dlog_enabled(void) {
+    if (dlog_on < 0) {
+        const char *e = getenv("DQ8_DARKLOG");
+        dlog_on = (e && e[0] && e[0] != '0');
+    }
+    return dlog_on;
+}
+/* Dark share of a linear RGB8 guest region (scan-out slot layout). */
+static double dlog_dark_linear(uint32_t addr, uint32_t stride, uint32_t h) {
+    uint32_t mapped, x, y, n = 0, dark = 0;
+    if (!addr || !guest_memory_range(addr, (uint64_t)stride * h, &mapped)) return -1.0;
+    for (y = 0; y < h; y += 2u) {
+        const uint8_t *p = ram + mapped + (uint64_t)y * stride;
+        for (x = 0; x < stride; x += 6u) {
+            uint8_t r = p[x+2], g = p[x+1], b = p[x];
+            uint8_t m = r > g ? (r > b ? r : b) : (g > b ? g : b);
+            ++n;
+            if (m <= 16u) ++dark;
+        }
+    }
+    return n ? 100.0 * (double)dark / (double)n : -1.0;
+}
+/* Dark share of the GPU render target (Morton-tiled RGBA8). */
+static double dlog_dark_rt(void) {
+    uint32_t x, y, n = 0, dark = 0;
+    uint8_t r, g, b, a;
+    if (!pica_rt_addr || !pica_rt_w || !pica_rt_h) return -1.0;
+    for (y = 0; y < pica_rt_h; y += 8u) {
+        for (x = 0; x < pica_rt_w; x += 8u) {
+            if (!pica_get_pixel(pica_rt_addr, pica_rt_w, pica_rt_h,
+                                pica_rt_format, x, y, &r, &g, &b, &a)) return -1.0;
+            unsigned m = r > g ? (r > b ? r : b) : (g > b ? g : b);
+            ++n;
+            if (m <= 16u) ++dark;
+        }
+    }
+    return n ? 100.0 * (double)dark / (double)n : -1.0;
+}
+static void pica_darklog_sample(void) {
+    unsigned long long n, dark = 0;
+    if (!dlog_enabled()) return;
+    if (!gsp_fb_valid[0]) return;
+    n = (unsigned long long)HOST_TOP_W * HOST_TOP_H;
+    for (unsigned long long i = 0; i < n; i += 2u) {
+        unsigned m = host_shadow_top[i * 4u];
+        if (host_shadow_top[i * 4u + 1u] > m) m = host_shadow_top[i * 4u + 1u];
+        if (host_shadow_top[i * 4u + 2u] > m) m = host_shadow_top[i * 4u + 2u];
+        if (m <= 16u) ++dark;
+    }
+    fprintf(stderr,
+            "DARKLOG shadow=%.1f rt=%08X %ux%u rt_dark=%.1f "
+            "slot0=%08X d0=%.1f slot1=%08X d1=%.1f shown=%u stride=%u "
+            "xfer=%08X->%08X %ux%u fmt=%u n=%u draws=%llu\n",
+            100.0 * (double)dark / (double)(n / 2u),
+            pica_rt_addr, pica_rt_w, pica_rt_h, dlog_dark_rt(),
+            gsp_fb_addr[0][0], dlog_dark_linear(gsp_fb_addr[0][0], gsp_fb_stride[0], 240u),
+            gsp_fb_addr[0][1], dlog_dark_linear(gsp_fb_addr[0][1], gsp_fb_stride[0], 240u),
+            gsp_fb_shown[0] & 1u, gsp_fb_stride[0],
+            dlog_xsrc, dlog_xdst, dlog_xw, dlog_xh, dlog_xfmt, dlog_xn,
+            (unsigned long long)pica_draw_count);
+}
+
 static void gsp_scanout_capture(void) {
     pica_gl_flush_guest_rt(); /* scan-out pixels must be current in guest RAM */
     if (!gsp_shared_base) return;
@@ -8442,6 +9861,7 @@ static void gsp_scanout_capture(void) {
            it (level semantics: writer discipline is not observable here, and
            re-applying one entry is idempotent). */
         if (dirty) {
+            if (screen == 0u) tempo_swap_seen(); /* guest published a top-screen frame */
             if (addr) {
                 gsp_fb_addr[screen][active_fb] = addr;
                 gsp_fb_fmt[screen] = fmt;
@@ -8460,7 +9880,7 @@ static void gsp_scanout_capture(void) {
         uint32_t w = stride / bpp, h = screen ? 320u : 400u;
         uint32_t mapped_fb;
         if (!guest_memory_range(addr, (uint64_t)stride * h, &mapped_fb)) continue;
-        if (getenv("DQ8_TRACE_GSP_FB") &&
+        if (dq8_env_on("DQ8_TRACE_GSP_FB", &dq8_env_trace_gsp_fb) &&
             (addr != gsp_fb_addr[screen][!show] || dirty))
             fprintf(stderr, "GSP scan-out screen=%u addr=%08X fmt=%u stride=%u "
                     "slot=%u shown=%u dirty=%u\n",
@@ -8471,6 +9891,7 @@ static void gsp_scanout_capture(void) {
        shown-slot regions (both screens, guest RAM, capture-independent). */
     idle_scanout_sample();
     frame_stats_sample(); /* FRAMESTAT redundancy instrumentation (opt-in) */
+    pica_darklog_sample(); /* t_fa78ea1f menu-flicker diagnosis (opt-in) */
     /* Refresh the snapshots: gsp_write_screen_ppms is opt-in
        (DQ8_CAPTURE_PPM=1) and carries the shared 5/s throttle for every
        producer, so this call site needs no throttle of its own. */
@@ -8478,11 +9899,10 @@ static void gsp_scanout_capture(void) {
 }
 static void gsp_enqueue_interrupt(uint8_t event) {
     if (event < 8u) ++bench_irq_counts[event]; /* measurement harness only */
-    if (event == 2u) { gsp_scanout_capture(); ++pqt_frames; } /* PDC0: evaluate scan-out buffer */
-    if (!gsp_shared_base) return;
+    if (event == 2u) { PF_ENTER(PF_PRESENT); gsp_scanout_capture(); PF_EXIT(); pf_frame_end(); ++pqt_frames; tempo_frame_seen(); } /* PDC0: evaluate scan-out buffer */    if (!gsp_shared_base) return;
     uint32_t q = gsp_shared_base + gsp_thread_id * 0x40u;
     uint8_t cur = mem8(q), count = mem8(q + 1u);
-    if (count >= ((event == 2u || event == 3u) ? 0x20u : 0x34u)) return;
+    if (count >= ((event == 2u || event == 3u) ? 0x20u : 0x34u)) { tempo_gsp_drop_seen(); return; }
     put8(q + 0x0Cu + ((cur + count) % 0x34u), event);
     put8(q + 1u, (uint8_t)(count + 1u));
     if (gsp_relay_registered && gsp_relay_event < next_event_handle && event_live[gsp_relay_event]) {
@@ -8615,6 +10035,7 @@ static void put32(uint32_t a, uint32_t v) {
                 active_guest_regs ? active_guest_regs[1] : 0u, active_guest_regs ? active_guest_regs[4] : 0u);
     }
     memcpy(ram + mapped, &v, sizeof(v));
+    pica_gl_note_guest_write(ram + mapped, 4u);
 }
 static void put8(uint32_t a, uint32_t v) {
     guest_mem_check(a, 1);
@@ -8624,6 +10045,7 @@ static void put8(uint32_t a, uint32_t v) {
                 mem8(a), (uint8_t)v, active_guest_regs ? active_guest_regs[14] : 0u,
                 active_guest_regs ? active_guest_regs[13] : 0u);
     ram[guest_memory_address(a)] = (uint8_t)v;
+    pica_gl_note_guest_write(ram + guest_memory_address(a), 1u);
 }
 static void put16(uint32_t a, uint32_t v) {
     guest_mem_check(a, 2);
@@ -8633,6 +10055,7 @@ static void put16(uint32_t a, uint32_t v) {
                 mem16(a), (uint16_t)v, active_guest_regs ? active_guest_regs[14] : 0u,
                 active_guest_regs ? active_guest_regs[13] : 0u);
     uint16_t x = (uint16_t)v; memcpy(ram + guest_memory_address(a), &x, sizeof(x));
+    pica_gl_note_guest_write(ram + guest_memory_address(a), 2u);
 }
 static uint32_t arm_shift(uint32_t value, unsigned kind, unsigned amount) {
     if (!amount) return value;
@@ -8798,17 +10221,78 @@ static uint64_t idle_vblank_period_ns(void) {
     return idle_armed ? idle_period_ns : GUEST_HOST_POLL_NS;
 }
 
+/* PACE (t_3463e625): the guest-visible vblank clock is a property of the
+   emulated hardware, not of how long our own frame took.  The inline path used
+   to re-anchor the vblank deadline at `now` on every guest wait, so the guest's
+   frame clock ran at 1/(16.67 ms + work-per-frame) instead of 60 Hz - a slow
+   renderer slowed GAME time, not just the frame rate (measured 0.70x wall time
+   on the savestate scene, worse on the operator's machine).  The chain below is
+   deadline-based: each period is added to the previous deadline, so time the
+   guest spent elsewhere is caught up (bounded by the cap) instead of given away.
+   DQ8_VBLANK_CHAIN=0 restores the re-anchored behaviour for A/B. */
+static uint64_t guest_vblank_period_ns(void) {
+    static uint64_t period;
+    if (!period) {
+        const char *e = getenv("DQ8_VBLANK_HZ");
+        unsigned long hz = (e && e[0]) ? strtoul(e, NULL, 10) : 0ul;
+        period = hz ? (1000000000ull / hz) : GUEST_HOST_POLL_NS;
+        if (!period) period = GUEST_HOST_POLL_NS;
+    }
+    return period;
+}
+static int vblank_chain_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("DQ8_VBLANK_CHAIN");
+        enabled = (e && e[0] == '0' && !e[1]) ? 0 : 1;
+    }
+    return enabled;
+}
+/* How many elapsed vblank periods one service call may deliver.  The bound
+   limits the burst cost; the value matters because a period that is NOT
+   delivered is guest frame time that never comes back (the resync below).
+   One delivered period costs a scan-out, and the relay queue holds 32 entries
+   (PDC0+PDC1 per period), so 16 is the largest safe value.
+   DQ8_VBLANK_CATCHUP overrides it for measurement. */
+static unsigned vblank_catchup_cap(void) {
+    static unsigned cap;
+    if (!cap) {
+        const char *e = getenv("DQ8_VBLANK_CATCHUP");
+        unsigned long v = (e && e[0]) ? strtoul(e, NULL, 10) : 16ul;
+        if (v < 1ul) v = 1ul;
+        if (v > 16ul) v = 16ul;
+        cap = (unsigned)v;
+    }
+    return cap;
+}
+static void guest_vblank_service(uint64_t now) {
+    if (split_render_enabled()) { gsp_vblank_service(now); return; }
+    /* VBLANK WALLCLOCK (t_d1be62fc): the 60 Hz chain lives on the pacer
+       thread; this call site only delivers the periods it has accounted. */
+    if (vblank_wallclock_enabled()) { gsp_vbl_deliver_owed(); return; }
+    if (!vblank_chain_enabled()) {
+        if (gsp_relay_registered && (!gsp_next_vblank_ns || now >= gsp_next_vblank_ns)) {
+            gsp_next_vblank_ns = now + idle_vblank_period_ns();
+            gsp_enqueue_interrupt(2u); /* PDC0: top-screen VBlank */
+            gsp_enqueue_interrupt(3u); /* PDC1: bottom-screen VBlank */
+        }
+        return;
+    }
+    /* Idle: one throttled delivery per tuned period (the shipped idle-throttle
+       behaviour, which exists to stop a static menu burning a core).  Active:
+       the hardware 60 Hz chain with bounded catch-up.
+       DQ8_VBLANK_HZ overrides the active period for measurement only: it is
+       how the guest's frame-lock ratio (logic ticks per vblank) is identified
+       without guessing. */
+    gsp_vblank_service_period(now, idle_armed ? idle_period_ns : guest_vblank_period_ns(),
+                              idle_armed ? 1u : vblank_catchup_cap());
+}
+
 /* Service the externally paced sources while a main-context syscall waits.
    HID input is still sampled no slower than one actual ring period; GSP keeps
    its own vblank deadline, and schedule_guest_thread() services DSP quanta. */
 static void guest_service_host_deadlines(uint64_t now) {
-    if (split_render_enabled()) {
-        gsp_vblank_service(now); /* F5: wall-clock 60 Hz, load-independent */
-    } else if (gsp_relay_registered && (!gsp_next_vblank_ns || now >= gsp_next_vblank_ns)) {
-        gsp_next_vblank_ns = now + idle_vblank_period_ns();
-        gsp_enqueue_interrupt(2u); /* PDC0: top-screen VBlank */
-        gsp_enqueue_interrupt(3u); /* PDC1: bottom-screen VBlank */
-    }
+    guest_vblank_service(now);
     if (!guest_next_host_poll_ns || now >= guest_next_host_poll_ns) {
         ++idle_pump_count;
         idle_service_host_wake(now);
@@ -8842,9 +10326,56 @@ static uint64_t guest_next_wait_deadline(uint64_t caller_deadline) {
    and established that no peer is runnable.  Never park runnable guest work. */
 static void guest_wait_until_deadline(uint64_t caller_deadline) {
     if (guest_any_runnable_thread()) return;
-    uint64_t now = host_monotonic_ns();
+    uint64_t now = dq8_guest_now_ns();
     uint64_t wake = guest_next_wait_deadline(caller_deadline);
-    if (wake != UINT64_MAX && wake > now) guest_host_sleep_ns(wake - now);
+    if (dq8_det_mode) {
+        /* DETERMINISTIC (t_115d297c): sleeping on the host cannot advance a
+           virtual clock, so hand out the virtual time up to the earliest
+           deadline instead.  The jump is a pure function of the scheduler
+           state, so the same state always yields the same next event.  An
+           unbounded wait (no deadline at all) advances one host-poll period
+           so an external producer still gets a chance to run. */
+        dq8_det_advance_to(wake == UINT64_MAX ? now + GUEST_HOST_POLL_NS : wake);
+        return;
+    }
+    if (wake != UINT64_MAX && wake > now) {
+        /* FRAMEPROF: a nap bounded by the GSP vblank deadline is the frame's
+           vblank parking (present_ms); any other park is idle_ms. */
+        int pf_vblank_park = (gsp_relay_registered && gsp_next_vblank_ns &&
+                              wake == gsp_next_vblank_ns);
+        PF_ENTER(pf_vblank_park ? PF_PRESENT : PF_IDLE);
+        guest_host_sleep_ns(wake - now);
+        PF_EXIT();
+    }
+}
+
+/* Q1 (t_039e900a) A/B gate for the runnable-aware nap.  When a main-context
+   wait serviced its peers and found none runnable it has two choices:
+
+     * merged policy (DQ8_RUNNABLE_NAP unset or non-"0"): nap only to the
+       earliest main/worker/vblank/DSP/HID-poll deadline (guest_wait_until_deadline),
+       so a host sleep never covers a timeout that some peer could still meet;
+     * control policy (DQ8_RUNNABLE_NAP=0): the pre-da1d8ff fixed-pacing nap --
+       one short host sleep per serviced round regardless of the deadline.
+
+   Read once per process (dq8_env_on() style) so the hot wait loops do not pay
+   a getenv per iteration.  The gate defaults to the merged policy, so an
+   environment without the variable executes exactly the previous statements. */
+static int runnable_nap_gate = -1;
+static int runnable_nap(void) {
+    if (runnable_nap_gate < 0) {
+        const char *e = getenv("DQ8_RUNNABLE_NAP");
+        runnable_nap_gate = !(e && e[0] == '0' && e[1] == '\0');
+    }
+    return runnable_nap_gate;
+}
+/* Legacy fixed-pacing nap: sleep `quantum` (clamped to the caller deadline and
+   never negative).  Used only when DQ8_RUNNABLE_NAP=0. */
+static void guest_pacing_nap(uint64_t caller_deadline, uint64_t quantum) {
+    uint64_t now = dq8_guest_now_ns();
+    uint64_t wake = now + quantum;
+    if (caller_deadline && caller_deadline < wake) wake = caller_deadline;
+    if (wake > now) guest_host_sleep_ns(wake - now);
 }
 
 /* Main-context sleep: execute bounded round-robin peer slices until the
@@ -8853,15 +10384,16 @@ static void guest_wait_until_deadline(uint64_t caller_deadline) {
    the established no-wake semantics: it runs ready peers and returns once
    there is no runnable peer. */
 static void main_context_sleep(int64_t duration) {
-    uint64_t start = host_monotonic_ns();
+    uint64_t start = dq8_guest_now_ns();
     uint64_t deadline = duration > 0 ? start + (uint64_t)duration : 0u;
     for (;;) {
-        uint64_t now = host_monotonic_ns();
+        uint64_t now = dq8_guest_now_ns();
         if (deadline && now >= deadline) return;
         schedule_guest_thread();
-        guest_service_host_deadlines(host_monotonic_ns());
+        guest_service_host_deadlines(dq8_guest_now_ns());
         if (!deadline && !guest_any_runnable_thread()) return;
         if (guest_any_runnable_thread()) continue;
+        if (!runnable_nap()) { guest_pacing_nap(deadline, 1000000ull); continue; }
         guest_wait_until_deadline(deadline);
     }
 }
@@ -8880,6 +10412,7 @@ static void svc_sleep(uint64_t ns) {
        deadline; -1 (any negative, as azahar's WakeAfterDelay treats it) means
        no wake event, i.e. an indefinite park. */
     int64_t duration = (int64_t)ns;
+    tempo_sleep_seen(duration > 0 ? (uint64_t)duration : 0u);
     if (thread_execution_depth) {
         thread_yield_requested = 1;
         if (duration == 0) {
@@ -8941,7 +10474,7 @@ static int arm_shift_imm_carry(uint32_t value, unsigned kind, unsigned amount, i
 }
 static uint32_t branch_indirect(uint32_t target) {
     static unsigned trace_branch_count;
-    if (getenv("DQ8_TRACE_BRANCH") && target >= 0x00167000u && target < 0x00168000u && trace_branch_count++ < 128u)
+    if (dq8_env_on("DQ8_TRACE_BRANCH", &dq8_env_trace_branch) && target >= 0x00167000u && target < 0x00168000u && trace_branch_count++ < 128u)
         fprintf(stderr, "guest BX pc=%08X target=%08X lr=%08X r0-r7=%08X/%08X/%08X/%08X/%08X/%08X/%08X/%08X sp=%08X\n",
                 current_guest_pc, target,
                 active_guest_regs ? active_guest_regs[14] : 0u,
@@ -8967,7 +10500,7 @@ static uint32_t branch_indirect(uint32_t target) {
         /* Optional object callbacks are often still null at this stage of the
            runtime. Returning to LR lets the caller continue; set
            DQ8_STRICT_NULL_CALLBACK=1 to treat a null target as fatal instead. */
-        if (!getenv("DQ8_STRICT_NULL_CALLBACK"))
+        if (!dq8_env_on("DQ8_STRICT_NULL_CALLBACK", &dq8_env_strict_null))
             return active_guest_regs ? active_guest_regs[14] : 0u;
     } else if (target < 0x00100000u || (target >= 0x00600000u && target < 0x30000000u)) {
         /* A non-null target outside the code region is a corrupt function
@@ -9084,14 +10617,19 @@ static uint32_t svc_arbitrate(uint32_t handle, uint32_t address, uint32_t type,
     if (address >= GUEST_RAM_SIZE || (address & 3u)) return 0xD8E007F7u;
     static unsigned arbiter_trace_count;
     static unsigned arbiter_wait_trace_count;
-    const char *arbiter_address_text = getenv("DQ8_TRACE_ARBITER_ADDRESS");
-    uint32_t arbiter_trace_address = arbiter_address_text
-        ? (uint32_t)strtoul(arbiter_address_text, NULL, 0) : 0xFFFFFFFFu;
+    if (!dq8_env_arbiter_addr_init) {
+        /* t_275eb521: the trace address was re-parsed with strtoul on every
+           arbiter operation; parse it once. */
+        const char *text = getenv("DQ8_TRACE_ARBITER_ADDRESS");
+        dq8_env_arbiter_addr_init = 1;
+        dq8_env_arbiter_addr = text ? (uint32_t)strtoul(text, NULL, 0) : 0xFFFFFFFFu;
+    }
+    uint32_t arbiter_trace_address = dq8_env_arbiter_addr;
     int trace_this_arbiter = address == arbiter_trace_address;
-    if (trace_this_arbiter || (getenv("DQ8_TRACE_ARBITER") && arbiter_trace_count++ < 256u))
+    if (trace_this_arbiter || (dq8_env_on("DQ8_TRACE_ARBITER", &dq8_env_trace_arbiter) && arbiter_trace_count++ < 256u))
         fprintf(stderr, "guest arbiter pc=%08X depth=%u handle=%08X addr=%08X type=%u value=%08X word=%08X\n",
                 current_guest_pc, thread_execution_depth, handle, address, type, value, mem32(address));
-    if ((trace_this_arbiter || getenv("DQ8_TRACE_ARBITER")) && type != 0u &&
+    if ((trace_this_arbiter || dq8_env_on("DQ8_TRACE_ARBITER", &dq8_env_trace_arbiter)) && type != 0u &&
         (trace_this_arbiter || arbiter_wait_trace_count++ < 128u))
         fprintf(stderr, "guest arbiter wait pc=%08X depth=%u handle=%08X addr=%08X type=%u value=%08X timeout=%08X:%08X word=%08X\n",
                 current_guest_pc, thread_execution_depth, handle, address, type, value,
@@ -9164,14 +10702,15 @@ static uint32_t svc_arbitrate(uint32_t handle, uint32_t address, uint32_t type,
         main_arbiter_handle = handle;
         main_arbiter_address = address;
         uint64_t deadline = timed && (int64_t)timeout > 0
-            ? host_monotonic_ns() + idle_stretch_wait(timeout) : 0u;
+            ? dq8_guest_now_ns() + idle_stretch_wait(timeout) : 0u;
         for (;;) {
             schedule_guest_thread();
-            uint64_t now = host_monotonic_ns();
+            uint64_t now = dq8_guest_now_ns();
             guest_service_host_deadlines(now);
             if (main_arbiter_signaled) break;
             if (deadline && now >= deadline) break;
             if (guest_any_runnable_thread()) continue;
+            if (!runnable_nap()) { guest_pacing_nap(deadline, 1000000ull); continue; }
             guest_wait_until_deadline(deadline);
         }
         int signaled = main_arbiter_signaled;
@@ -9559,16 +11098,16 @@ static uint32_t svc_send_sync(uint32_t handle) {
     uint32_t command = mem32(active_tls_base + 0x80u);
     if (getenv("DQ8_DSP_DUMP")) dsp_dump_maybe();
     static unsigned ipc_trace_count;
-    if (getenv("DQ8_TRACE_IPC") && ipc_trace_count++ < 20000u)
+    if (dq8_env_on("DQ8_TRACE_IPC", &dq8_env_trace_ipc) && ipc_trace_count++ < 20000u)
         fprintf(stderr, "guest IPC pc=%08X lr=%08X handle=%08X command=%08X args=%08X/%08X/%08X/%08X\n",
                 current_guest_pc, active_guest_regs ? active_guest_regs[14] : 0u,
                 handle, command, mem32(active_tls_base + 0x84u), mem32(active_tls_base + 0x88u),
                 mem32(active_tls_base + 0x8Cu), mem32(active_tls_base + 0x90u));
-    if (getenv("DQ8_TRACE_IPC") && handle >= 0x20u && handle < 0x100u && command == 0x080200C2u)
+    if (dq8_env_on("DQ8_TRACE_IPC", &dq8_env_trace_ipc) && handle >= 0x20u && handle < 0x100u && command == 0x080200C2u)
         fprintf(stderr, "FS Read handle=%08X offset=%08X:%08X size=%08X buffer=%08X\n", handle,
                 mem32(active_tls_base + 0x88u), mem32(active_tls_base + 0x84u), mem32(active_tls_base + 0x8Cu),
                 mem32(active_tls_base + 0x94u));
-    if (getenv("DQ8_TRACE_IPC") && handle == 8u && command == 0x08030204u) {
+    if (dq8_env_on("DQ8_TRACE_IPC", &dq8_env_trace_ipc) && handle == 8u && command == 0x08030204u) {
         uint32_t ap = mem32(active_tls_base + 0xA8u), fp = mem32(active_tls_base + 0xB0u);
         fprintf(stderr, "FS OpenFileDirectly pc=%08X archive=%08X archivePathType=%08X archivePathSize=%08X filePathType=%08X filePathSize=%08X flags=%08X raw=",
                 current_guest_pc,
@@ -9868,7 +11407,7 @@ static uint32_t svc_send_sync(uint32_t handle) {
             put32(active_tls_base + 0x84u, 0xC8A0CFEFu); /* APT NoData */
             return 0;
         }
-        if (getenv("DQ8_TRACE_IPC"))
+        if (dq8_env_on("DQ8_TRACE_IPC", &dq8_env_trace_ipc))
             fprintf(stderr, "APT parameter signal=%u consume=%u\n", apt_pending_signal, command == 0x000D0080u);
         put32(active_tls_base + 0x80u, id | 0x104u);
         put32(active_tls_base + 0x84u, 0u);
@@ -9974,7 +11513,7 @@ static uint32_t svc_send_sync(uint32_t handle) {
             if (memfile) {
                 guest_memfile_data[file_handle] = BAD_WORD_LIST_DATA;
                 guest_memfile_size[file_handle] = (uint32_t)sizeof(BAD_WORD_LIST_DATA);
-                if (getenv("DQ8_TRACE_IPC"))
+                if (dq8_env_on("DQ8_TRACE_IPC", &dq8_env_trace_ipc))
                     fprintf(stderr, "FS OpenFileDirectly -> NG word list memfile handle=%08X size=%u\n",
                             file_handle, guest_memfile_size[file_handle]);
             }
@@ -9996,7 +11535,7 @@ static uint32_t svc_send_sync(uint32_t handle) {
     }
     if (handle == 8u && command == 0x080201C2u) {
         uint32_t archive_handle = mem32(active_tls_base + 0x8Cu);
-        if (getenv("DQ8_TRACE_IPC")) {
+        if (dq8_env_on("DQ8_TRACE_IPC", &dq8_env_trace_ipc)) {
             uint32_t path_ptr = mem32(active_tls_base + 0xA4u);
             uint32_t path_size = mem32(active_tls_base + 0x94u);
             fprintf(stderr, "FS OpenFile archive=%08X type=%08X size=%08X path@%08X=",
@@ -10024,10 +11563,10 @@ static uint32_t svc_send_sync(uint32_t handle) {
         uint32_t dirname_size = mem32(active_tls_base + 0x90u);
         uint32_t dirname_ptr = mem32(active_tls_base + 0x98u);
         uint32_t archive_handle = archive_hi ? archive_hi : archive_lo;
-        if (getenv("DQ8_TRACE_IPC"))
+        if (dq8_env_on("DQ8_TRACE_IPC", &dq8_env_trace_ipc))
             fprintf(stderr, "FS OpenDirectory archive=%08X/%08X type=%08X size=%08X path@%08X=",
                     archive_lo, archive_hi, dirname_type, dirname_size, dirname_ptr);
-        if (getenv("DQ8_TRACE_IPC")) {
+        if (dq8_env_on("DQ8_TRACE_IPC", &dq8_env_trace_ipc)) {
             for (unsigned i = 0; i < dirname_size && i < 64u && dirname_ptr + i < GUEST_RAM_SIZE; ++i)
                 fprintf(stderr, "%02X", mem8(dirname_ptr + i));
             fputc('\n', stderr);
@@ -10072,14 +11611,14 @@ static uint32_t svc_send_sync(uint32_t handle) {
             ram[buffer + 0x21Fu] = 1u;    /* is_read_only */
             put32(buffer + 0x220u, 0x00001000u); /* file_size */
             put32(buffer + 0x224u, 0u);
-            if (getenv("DQ8_TRACE_IPC"))
+            if (dq8_env_on("DQ8_TRACE_IPC", &dq8_env_trace_ipc))
                 fprintf(stderr, "Directory:Read -> honeySave.bin buffer=%08X\n", buffer);
             put32(active_tls_base + 0x80u, 0x08010082u);
             put32(active_tls_base + 0x84u, 0u);
             put32(active_tls_base + 0x88u, 1u); /* one entry */
             return 0;
         }
-        if (getenv("DQ8_TRACE_IPC"))
+        if (dq8_env_on("DQ8_TRACE_IPC", &dq8_env_trace_ipc))
             fprintf(stderr, "Directory:Read -> empty buffer=%08X count=%u\n", buffer, count);
         put32(active_tls_base + 0x80u, 0x08010082u);
         put32(active_tls_base + 0x84u, 0u);
@@ -10143,6 +11682,24 @@ static uint32_t svc_send_sync(uint32_t handle) {
     }
     if (handle == 8u && (command == 0x08610042u || command == 0x08620040u || command == 0x08630000u || command == 0x08010002u)) {
         put32(active_tls_base + 0x84u, 0u);
+        return 0;
+    }
+    if (handle == 8u && command == 0x08490040u) {
+        /* FS:GetArchiveResource (azahar fs_user.h:524, fs_user.cpp:1123).
+         * Input: media type (ignored by azahar).  Reply: Result + the fixed
+         * ArchiveResource azahar returns for every media type
+         * (archive.cpp:325): sector 512 B, cluster 16384 B, capacity and free
+         * space 0x80000 clusters (8 GiB) - the in-game menu queries this for
+         * the save archive right after the START press, and a zero free-space
+         * figure would fail its space check.  Response header: command_id
+         * echo (bits[31:16]) + normal_params_size 5 (azahar ipc.h Header:
+         * bits[11:6] -> 5<<6 = 0x0140). */
+        put32(active_tls_base + 0x80u, 0x08490140u);
+        put32(active_tls_base + 0x84u, 0u);
+        put32(active_tls_base + 0x88u, 512u);
+        put32(active_tls_base + 0x8Cu, 16384u);
+        put32(active_tls_base + 0x90u, 0x80000u);
+        put32(active_tls_base + 0x94u, 0x80000u);
         return 0;
     }
     if (handle == 8u && command == 0x080E0080u) {
@@ -10281,7 +11838,7 @@ static uint32_t svc_send_sync(uint32_t handle) {
                 put8(buffer + i, dsp_audio_pipe[dsp_audio_pipe_pos + i]);
         else actual = 0u;
         dsp_audio_pipe_pos += actual;
-        if (getenv("DQ8_TRACE_IPC"))
+        if (dq8_env_on("DQ8_TRACE_IPC", &dq8_env_trace_ipc))
             fprintf(stderr, "DSP pipe read requested=%u actual=%u pos=%u buffer=%08X\n",
                     requested, actual, dsp_audio_pipe_pos, buffer);
         if (dsp_audio_pipe_pos == dsp_audio_pipe_size) {
@@ -10506,7 +12063,7 @@ static uint32_t svc_send_sync(uint32_t handle) {
         }
         gsp_thread_id = 1u;
         gsp_relay_registered = 1u;
-        if (getenv("DQ8_TRACE_WAIT"))
+        if (dq8_env_on("DQ8_TRACE_WAIT", &dq8_env_trace_wait))
             fprintf(stderr, "GSP relay registration event=%08X live=%u next_event=%08X arg1=%08X arg2=%08X arg3=%08X\n",
                     relay, relay < 256u ? event_live[relay] : 0u, next_event_handle,
                     mem32(active_tls_base + 0x84u), mem32(active_tls_base + 0x88u), mem32(active_tls_base + 0x90u));
@@ -10515,7 +12072,7 @@ static uint32_t svc_send_sync(uint32_t handle) {
     if (handle == 7u && command == 0x000B0040u) {
         gsp_lcd_force_black = mem32(active_tls_base + 0x84u) ? 1u : 0u;
         put32(active_tls_base + 0x84u, 0u);
-        if (getenv("DQ8_TRACE_GPU"))
+        if (dq8_env_on("DQ8_TRACE_GPU", &dq8_env_trace_gpu))
             fprintf(stderr, "GSP SetLcdForceBlack enabled=%u\n", gsp_lcd_force_black);
         return 0;
     }
@@ -10527,25 +12084,26 @@ static uint32_t svc_send_sync(uint32_t handle) {
         uint32_t result = (address <= GUEST_RAM_SIZE && size <= GUEST_RAM_SIZE - address)
             ? 0u : 0xE0E02BF5u;
         put32(active_tls_base + 0x84u, result);
-        if (getenv("DQ8_TRACE_GPU"))
+        if (dq8_env_on("DQ8_TRACE_GPU", &dq8_env_trace_gpu))
             fprintf(stderr, "GSP StoreDataCache address=%08X size=%08X result=%08X\n", address, size, result);
         return 0;
     }
     if (handle == 7u && command == 0x000C0000u) {
+        ++gsp_queue_calls; /* t_2d934e23: one guest logic/render tick */
         uint32_t queue = gsp_shared_base + 0x800u + gsp_thread_id * 0x200u;
         uint32_t header = mem32(queue);
         unsigned index = header & 0xFFu, count = (header >> 8) & 0xFFu;
-        if (getenv("DQ8_TRACE_GPU"))
+        if (dq8_env_on("DQ8_TRACE_GPU", &dq8_env_trace_gpu))
             fprintf(stderr, "GSP TriggerCmdReqQueue base=%08X tid=%u queue=%08X header=%08X index=%u count=%u\n",
                     gsp_shared_base, gsp_thread_id, queue, header, index, count);
         for (unsigned i = 0; i < count && i < 15u; ++i) {
             uint32_t slot = queue + 0x20u + ((index + i) % 15u) * 0x20u;
             uint32_t cmd = mem32(slot);
-            if (getenv("DQ8_TRACE_GPU"))
+            if (dq8_env_on("DQ8_TRACE_GPU", &dq8_env_trace_gpu))
                 fprintf(stderr, "GSP command slot=%u words=%08X/%08X/%08X/%08X/%08X/%08X/%08X/%08X\n",
                         i, cmd, mem32(slot + 4u), mem32(slot + 8u), mem32(slot + 12u),
                         mem32(slot + 16u), mem32(slot + 20u), mem32(slot + 24u), mem32(slot + 28u));
-            if ((cmd & 0xFFu) == 1u && getenv("DQ8_TRACE_GPU")) {
+            if ((cmd & 0xFFu) == 1u && dq8_env_on("DQ8_TRACE_GPU", &dq8_env_trace_gpu)) {
                 uint32_t list = mem32(slot + 4u), size = mem32(slot + 8u);
                 fprintf(stderr, "PICA list addr=%08X bytes=%u first_words=", list, size);
                 for (unsigned j = 0; j < 32u && j * 4u < size; ++j)
@@ -10799,8 +12357,22 @@ static uint32_t svc_get_process_info(uint32_t *r) {
 }
 static void svc_get_system_tick(uint32_t *r) {
     struct timespec now;
+    uint64_t ticks;
+    if (dq8_det_mode) {
+        /* DETERMINISTIC (t_115d297c): read the virtual clock so the same
+           instruction budget returns the same tick on every run.  Same
+           268.111856 MHz tick rate as the hardware. */
+        uint64_t ns = dq8_guest_now_ns();
+        ticks = ns / 1000000000ull * 268111856ull +
+                ns % 1000000000ull * 268111856ull / 1000000000ull;
+        tempo_tick_seen(ticks, current_guest_pc);
+        r[0] = (uint32_t)ticks;
+        r[1] = (uint32_t)(ticks >> 32);
+        return;
+    }
     if (clock_gettime(CLOCK_MONOTONIC, &now)) { perror("clock_gettime"); exit(25); }
-    uint64_t ticks = (uint64_t)now.tv_sec * 268111856ull + (uint64_t)now.tv_nsec * 268111856ull / 1000000000ull;
+    ticks = (uint64_t)now.tv_sec * 268111856ull + (uint64_t)now.tv_nsec * 268111856ull / 1000000000ull;
+    tempo_tick_seen(ticks, current_guest_pc);
     r[0] = (uint32_t)ticks;
     r[1] = (uint32_t)(ticks >> 32);
 }
@@ -10859,6 +12431,7 @@ static int guest_fast_page_list(uint32_t *r, uint32_t *pc,
     *steps += ((uint64_t)r[5] - first) * 15u;
     return 1;
 }
+static void guest_stack_release(unsigned slot);
 static void svc_exit_thread(void) {
     /* Audit R2-03: thread termination releases every kernel mutex the
        thread still owns, the way the 3DS kernel's ReleaseThreadMutexes
@@ -10886,6 +12459,16 @@ static void svc_exit_thread(void) {
         if (guest_thread_waits_on(t, my_handle) && !t->wait_n_active)
             guest_wait_finish(t, 0u, 0u, 0);
     }
+    /* Release the stack-extent slot: a later thread that reuses this
+       stack address must not be reported as a live overlap.  Without
+       this, slots of finished threads stay 'live' forever and the
+       overlap check fires on every frame (t_eb3aef76 follow-up). */
+    for (unsigned i = 0; i < guest_thread_count; ++i) {
+        if (guest_threads[i].guest_thread_id == my_handle) {
+            guest_stack_release(i);
+            break;
+        }
+    }
     /* The currently executing guest thread returns to its creator's scheduler. */
 }
 static void svc_exit_process(void) {
@@ -10893,8 +12476,14 @@ static void svc_exit_process(void) {
     exit(0);
 }
 static int guest_threads_enabled(void) {
-    const char *value = getenv("DQ8_RUN_GUEST_THREADS");
-    return value && *value && strcmp(value, "0") != 0 && strcmp(value, "false") != 0;
+    /* t_275eb521: called from the scheduler/svc paths; resolve once per
+       process (the value cannot change at run time). */
+    static int cached = -1;
+    if (cached < 0) {
+        const char *value = getenv("DQ8_RUN_GUEST_THREADS");
+        cached = value && *value && strcmp(value, "0") != 0 && strcmp(value, "false") != 0;
+    }
+    return cached;
 }
 /* Reserved stack size per guest thread.  The CreateThread ABI passes only the
    stack *top* (r[3]); the base is the allocator's block.  We conservatively
@@ -10999,6 +12588,13 @@ static int guest_stack_track(unsigned slot, uint32_t sp) {
         uint32_t a_lo = guest_stack_low[slot], a_hi = guest_stack_top[slot];
         uint32_t b_lo = guest_stack_low[j], b_hi = guest_stack_top[j];
         if (a_lo < b_hi && b_lo < a_hi) {
+            static uint64_t overlap_warned;
+            unsigned pair = (slot < j ? slot : j) * 64u + (slot < j ? j : slot);
+            if (!(overlap_warned & (1ull << (pair & 63u)))) {
+                overlap_warned |= 1ull << (pair & 63u);
+            } else {
+                return 1;
+            }
             fprintf(stderr,
                     "guest thread-stack OVERLAP: slot %u [0x%08X,0x%08X) vs slot %u "
                     "[0x%08X,0x%08X) pc=%08X (aliasing class: stack/heap share a block)\n",
@@ -11099,10 +12695,12 @@ static uint32_t svc_create_thread(uint32_t *r) {
     return 0u;
 }
 static void schedule_guest_thread(void) {
+    PF_ENTER(PF_AUDIO);
     dsp_audio_tick();
+    PF_EXIT();
     if (!guest_threads_enabled() || thread_execution_depth || !guest_thread_count) return;
     movie_trace_tick();
-    uint64_t now = host_monotonic_ns();
+    uint64_t now = dq8_guest_now_ns();
     for (unsigned i = 0; i < guest_thread_count; ++i) {
         GuestThread *candidate = &guest_threads[i];
         if (!candidate->active || !candidate->blocked) continue;
@@ -11193,10 +12791,10 @@ static void schedule_guest_thread(void) {
                 thread->wait_arbiter = thread_wait_arbiter_requested;
                 thread->wait_type = thread_wait_type_requested;
                 thread->wait_value = thread_wait_value_requested;
-                thread->wake_ns = thread_sleep_requested_ns ? host_monotonic_ns() + thread_sleep_requested_ns : 0u;
+                thread->wake_ns = thread_sleep_requested_ns ? dq8_guest_now_ns() + thread_sleep_requested_ns : 0u;
                 thread->wake_result = thread_wake_result_requested;
                 if (movie_trace()) {
-                    thread->block_since_ns = host_monotonic_ns();
+                    thread->block_since_ns = dq8_guest_now_ns();
                     ++thread->blocked_count;
                     ++movie_trace_parks;
                     movie_trace_event("park thread=%08X pc=%08X handle=%08X addr=%08X "
@@ -11395,7 +12993,7 @@ static void guest_wait_finish(GuestThread *t, uint32_t result, uint32_t index, i
     int was_n = t->wait_n_active;
     if (has_index) t->r[1] = index;
     t->r[0] = result;
-    if (getenv("DQ8_TRACE_WAIT") && trace_count++ < 256u)
+    if (dq8_env_on("DQ8_TRACE_WAIT", &dq8_env_trace_wait) && trace_count++ < 256u)
         fprintf(stderr, "guest wait complete thread=%08X handle=%08X waitn=%d result=%08X index=%08X\n",
                 t->guest_thread_id, handle, was_n, result, has_index ? index : 0xFFFFFFFFu);
     guest_wait_release(t);
@@ -11405,7 +13003,7 @@ static void guest_wait_finish(GuestThread *t, uint32_t result, uint32_t index, i
    record the result, run.  Returns how many waiters the object satisfied. */
 static unsigned guest_notify_handle(uint32_t handle) {
     unsigned woken = 0;
-    uint64_t now = host_monotonic_ns();
+    uint64_t now = dq8_guest_now_ns();
     movie_trace_wake_reason = "signal";
     for (;;) {
         int best = -1;
@@ -11450,7 +13048,7 @@ static uint32_t svc_create_mutex(uint32_t *r) {
     mutex_recursion[slot] = r[1] != 0 ? 1u : 0u;
     r[1] = handle;
     static unsigned trace_count;
-    if (getenv("DQ8_TRACE_WAIT") && trace_count++ < 128u)
+    if (dq8_env_on("DQ8_TRACE_WAIT", &dq8_env_trace_wait) && trace_count++ < 128u)
         fprintf(stderr, "guest CreateMutex pc=%08X handle=%08X initial=%u\n",
                 current_guest_pc, handle, mutex_locked[slot]);
     return 0;
@@ -11459,7 +13057,7 @@ static uint32_t svc_release_mutex(uint32_t handle) {
     if (handle >= 0x10000u && handle < next_mutex_handle && mutex_live[handle - 0x10000u]) {
         unsigned slot = handle - 0x10000u;
         static unsigned trace_count;
-        if (getenv("DQ8_TRACE_WAIT") && trace_count++ < 128u)
+        if (dq8_env_on("DQ8_TRACE_WAIT", &dq8_env_trace_wait) && trace_count++ < 128u)
             fprintf(stderr, "guest ReleaseMutex pc=%08X thread=%08X handle=%08X locked=%u owner=%08X recursion=%u\n",
                     current_guest_pc, current_guest_thread_id, handle,
                     mutex_locked[slot], mutex_owner[slot], mutex_recursion[slot]);
@@ -11470,7 +13068,7 @@ static uint32_t svc_release_mutex(uint32_t handle) {
                leaves the owner, the nesting depth and the waiters exactly
                as they were (0xD8E0041F: desc=31, kernel module, same
                summary/level as the other kernel argument errors). */
-            if (getenv("DQ8_TRACE_WAIT"))
+            if (dq8_env_on("DQ8_TRACE_WAIT", &dq8_env_trace_wait))
                 fprintf(stderr, "guest ReleaseMutex DENIED thread=%08X handle=%08X owner=%08X recursion=%u\n",
                         current_guest_thread_id, handle, mutex_owner[slot], mutex_recursion[slot]);
             return 0xD8E0041Fu;
@@ -11491,7 +13089,7 @@ static uint32_t svc_create_event(uint32_t *r) {
     event_live[handle] = 1;
     event_manual_reset[handle] = r[1] != 0;
     event_signaled[handle] = 0;
-    if (getenv("DQ8_TRACE_WAIT"))
+    if (dq8_env_on("DQ8_TRACE_WAIT", &dq8_env_trace_wait))
         fprintf(stderr, "guest CreateEvent pc=%08X thread=%08X handle=%08X manual=%u\n",
                 current_guest_pc, current_guest_thread_id, handle, event_manual_reset[handle]);
     /* SVC veneers store the returned handle from r1 through their saved
@@ -11502,7 +13100,7 @@ static uint32_t svc_create_event(uint32_t *r) {
 static uint32_t svc_signal_event(uint32_t handle) {
     if (handle == 0u || handle == 0xFFFFFFFFu) return 0;
     if (handle < next_event_handle && event_live[handle]) {
-        if (getenv("DQ8_TRACE_WAIT"))
+        if (dq8_env_on("DQ8_TRACE_WAIT", &dq8_env_trace_wait))
             fprintf(stderr, "guest SignalEvent pc=%08X thread=%08X handle=%08X\n",
                     current_guest_pc, current_guest_thread_id, handle);
         event_signaled[handle] = 1;
@@ -11516,7 +13114,7 @@ static uint32_t svc_signal_event(uint32_t handle) {
 }
 static uint32_t svc_clear_event(uint32_t handle) {
     static unsigned trace_count;
-    if (getenv("DQ8_TRACE_WAIT") && trace_count++ < 128u)
+    if (dq8_env_on("DQ8_TRACE_WAIT", &dq8_env_trace_wait) && trace_count++ < 128u)
         fprintf(stderr, "guest ClearEvent pc=%08X thread=%08X handle=%08X live=%u\n",
                 current_guest_pc, current_guest_thread_id, handle,
                 handle < next_event_handle ? event_live[handle] : 0u);
@@ -11528,9 +13126,9 @@ static uint32_t svc_clear_event(uint32_t handle) {
     }
     fprintf(stderr, "unimplemented 3DS SVC ClearEvent: handle=%08X\n", handle); exit(24);
 }
-static uint32_t svc_wait_synchronization(uint32_t handle, uint64_t timeout) {
+static uint32_t svc_wait_synchronization_inner(uint32_t handle, uint64_t timeout) {
     static unsigned trace_count;
-    if (getenv("DQ8_TRACE_WAIT") && trace_count++ < 128u)
+    if (dq8_env_on("DQ8_TRACE_WAIT", &dq8_env_trace_wait) && trace_count++ < 128u)
         fprintf(stderr, "guest WaitSynchronization pc=%08X thread=%08X handle=%08X timeout=%016llX live=%u signaled=%u mutex_locked=%u\n",
                 current_guest_pc, current_guest_thread_id, handle,
                 (unsigned long long)timeout,
@@ -11573,26 +13171,19 @@ static uint32_t svc_wait_synchronization(uint32_t handle, uint64_t timeout) {
         uint32_t q = gsp_shared_base + gsp_thread_id * 0x40u;
         uint8_t cur = mem8(q), count = mem8(q + 1u);
         static unsigned relay_trace_count;
-        if (getenv("DQ8_TRACE_WAIT") && relay_trace_count++ < 8u)
+        if (dq8_env_on("DQ8_TRACE_WAIT", &dq8_env_trace_wait) && relay_trace_count++ < 8u)
             fprintf(stderr, "GSP relay wait event=%u queue=%08X cur=%u count=%u live=%u registered=%u timeout=%016llX\n",
                     handle, q, cur, count, event_live[handle], gsp_relay_registered,
                     (unsigned long long)timeout);
         (void)cur;
         (void)count;
-        uint64_t now = host_monotonic_ns();
-        if (!gsp_next_vblank_ns || now >= gsp_next_vblank_ns) {
-            /* The frame deadline is due: consume it, queue the scan
-               events and present, then fall through to the ordinary
-               readiness and timeout checks below. */
-            if (split_render_enabled()) {
-                /* F5: wall-clock chain with catch-up; the enqueue itself
-                   signals the relay event, so the wait completes normally. */
-                gsp_vblank_service(now);
-            } else {
-                gsp_next_vblank_ns = now + idle_vblank_period_ns();
-                gsp_enqueue_interrupt(2u); /* PDC0: top-screen VBlank */
-                gsp_enqueue_interrupt(3u); /* PDC1: bottom-screen VBlank */
-            }
+        uint64_t now = dq8_guest_now_ns();
+        if (!gsp_next_vblank_ns || now >= gsp_next_vblank_ns || gsp_vbl_owed_pending()) {
+            /* The frame deadline is due: deliver every elapsed vblank on the
+               wall-clock chain (PACE, t_3463e625: identical for both render
+               modes; the enqueue signals the relay event, so the wait
+               completes through the ordinary readiness path below). */
+            guest_vblank_service(now);
             host_display_pump_events();
             host_display_present();
         } else if (timeout && thread_execution_depth) {
@@ -11602,19 +13193,18 @@ static uint32_t svc_wait_synchronization(uint32_t handle, uint64_t timeout) {
                the caller's timeout would land first, the deadline pass
                records the real kernel timeout instead.  A zero timeout
                skips this branch entirely and polls below.
-               DQ8_SPLIT_RENDER=1 (F5): the provisional PDC0/PDC1 enqueue
-               is REMOVED — it delivered a vblank ahead of the frame
-               deadline (the movie scene measured 92/s from this double
-               delivery).  The wall-clock service fires the vblank when
-               the park expires and the wait re-entry completes it, so the
-               park always ends as the caller's own timeout. */
+               The provisional PDC0/PDC1 enqueue that this park used to
+               perform is REMOVED for every render mode (it was removed for
+               DQ8_SPLIT_RENDER=1 in F5 after the movie scene measured 92/s
+               from that double delivery): it delivered a vblank AHEAD of the
+               frame deadline, so every wait returned after ~0 ms instead of
+               the remaining span, and the guest's frame clock became the
+               guest's own loop rate rather than 60 Hz.  The wall-clock
+               service fires the vblank when the park expires, and the wait
+               re-entry completes it. */
             uint64_t until_vblank = gsp_next_vblank_ns - now;
             uint64_t span = (uint64_t)timeout < until_vblank ? (uint64_t)timeout : until_vblank;
             int timeout_lands_first = (int64_t)timeout > 0 && (uint64_t)timeout < until_vblank;
-            if (!split_render_enabled()) {
-                gsp_enqueue_interrupt(2u); /* PDC0: top-screen VBlank */
-                gsp_enqueue_interrupt(3u); /* PDC1: bottom-screen VBlank */
-            }
             thread_yield_requested = 1;
             thread_blocked_requested = 1;
             thread_wait_handle_requested = handle;
@@ -11647,15 +13237,15 @@ static uint32_t svc_wait_synchronization(uint32_t handle, uint64_t timeout) {
        DSP, and the host window run inside this call until the handle signals
        or the wait expires. */
     if (thread_execution_depth == 0) {
-        uint64_t start_ns = host_monotonic_ns();
+        uint64_t start_ns = dq8_guest_now_ns();
         uint64_t deadline_ns = (int64_t)timeout < 0 ? 0u : start_ns + idle_stretch_wait(timeout);
         for (unsigned spin = 0; spin < 20000000u; ++spin) {
             ++perf_main_wait_spins;
-            if (getenv("DQ8_TRACE_WAIT") && (spin % 2000u) == 0u)
+            if (dq8_env_on("DQ8_TRACE_WAIT", &dq8_env_trace_wait) && (spin % 2000u) == 0u)
                 fprintf(stderr, "main-wait spin=%u handle=%08X depth=%u\n", spin, handle, thread_execution_depth);
-            guest_service_host_deadlines(host_monotonic_ns());
+            guest_service_host_deadlines(dq8_guest_now_ns());
             schedule_guest_thread();
-            uint64_t now = host_monotonic_ns();
+            uint64_t now = dq8_guest_now_ns();
             guest_service_host_deadlines(now);
             if (guest_object_ready(handle, current_guest_thread_id)) {
                 if (!guest_object_acquire(handle, current_guest_thread_id)) return 0xD8E007F7u;
@@ -11664,10 +13254,19 @@ static uint32_t svc_wait_synchronization(uint32_t handle, uint64_t timeout) {
             if (deadline_ns && now >= deadline_ns)
                 return 0x09401BFEu;
             if (guest_any_runnable_thread()) continue;
+            if (!runnable_nap()) { guest_pacing_nap(deadline_ns, 2000000ull); continue; }
             guest_wait_until_deadline(deadline_ns);
         }
     }
     return 0x09401BFEu; /* timeout */
+}
+/* TEMPO wrapper: counts one completed wait per logic iteration of whatever
+   loop owns `handle` and the wall gap between consecutive completions. */
+static uint32_t svc_wait_synchronization(uint32_t handle, uint64_t timeout) {
+    int tempo_slot = tempo_wait_enter(handle);
+    uint32_t result = svc_wait_synchronization_inner(handle, timeout);
+    if (result == 0u) tempo_wait_ready(tempo_slot);
+    return result;
 }
 /* Probe (and optionally acquire) until the complete wait condition is met.
    Returns -1 for invalid handles, 0 for pending, 1 for acquired.  With
@@ -11709,10 +13308,11 @@ static uint32_t svc_wait_synchronization_n(uint32_t *r) {
         return 0xD8E007F7u;
     uint32_t handles[64];
     for (unsigned i = 0; i < count; ++i) handles[i] = mem32(handles_va + i * 4u);
+    int tempo_slot = count ? tempo_wait_enter(handles[0]) : -1;
     uint32_t index = r[1];
     int result = guest_poll_wait_n(handles, count, all, &index, 1, current_guest_thread_id);
     if (result < 0) return 0xD8E007F7u;
-    if (result) { r[1] = index; return 0; }
+    if (result) { r[1] = index; tempo_wait_ready(tempo_slot); return 0; }
     if (!timeout) return 0x09401BFEu;
     if (thread_execution_depth) {
         for (unsigned i = 0; i < guest_thread_count; ++i)
@@ -11731,20 +13331,21 @@ static uint32_t svc_wait_synchronization_n(uint32_t *r) {
             }
         return 0xD8E007F7u;
     }
-    uint64_t start = host_monotonic_ns();
+    uint64_t start = dq8_guest_now_ns();
     uint64_t deadline = (int64_t)timeout >= 0 ? start + idle_stretch_wait(timeout) : 0u;
     for (;;) {
         schedule_guest_thread();
-        uint64_t now = host_monotonic_ns();
+        uint64_t now = dq8_guest_now_ns();
         guest_service_host_deadlines(now);
         index = 0xFFFFFFFFu;
         result = guest_poll_wait_n(handles, count, all, &index, 1, current_guest_thread_id);
         if (result < 0) return 0xD8E007F7u;
-        if (result) { r[1] = index; return 0; }
+        if (result) { r[1] = index; tempo_wait_ready(tempo_slot); return 0; }
         if (deadline && now >= deadline) {
             r[1] = 0xFFFFFFFFu; return 0x09401BFEu;
         }
         if (guest_any_runnable_thread()) continue;
+        if (!runnable_nap()) { guest_pacing_nap(deadline, 1000000ull); continue; }
         guest_wait_until_deadline(deadline);
     }
 }
@@ -11761,7 +13362,7 @@ static uint32_t svc_map_memory_block(uint32_t handle, uint32_t address) {
             trace_hid_read_base=address;trace_hid_read_end=address+0x1000u;
         }
         if (handle == 0x30020u) gsp_shared_base = address;
-        if (getenv("DQ8_TRACE_GPU"))
+        if (dq8_env_on("DQ8_TRACE_GPU", &dq8_env_trace_gpu))
             fprintf(stderr, "MapMemoryBlock handle=%08X addr=%08X\n", handle, address);
         return 0;
     }
@@ -11858,6 +13459,48 @@ static int guest_host_snprintf(uint32_t *r) {
     if (oi >= cap) oi = cap - 1u;
     memcpy(ram + dest, out, oi + 1u);
     return (int)oi;
+}
+/* t_d1be62fc: diagnosis hook — snapshot guest RAM at wall-clock offsets so the
+   in-game play-time counter (u32 seconds) can be measured without the save
+   menu.  DQ8_DUMP_RAM_AT="30,90" DQ8_DUMP_RAM_DIR=/path (off by default; the
+   dump is a plain 1 GiB image of guest RAM at that offset). */
+static void dq8_dump_ram_service(void) {
+    static uint64_t t0;
+    static int init, all_done;
+    static unsigned idx;
+    static const char *spec;
+    static const char *cur;
+    if (!init) {
+        init = 1;
+        spec = getenv("DQ8_DUMP_RAM_AT");
+        if (spec && *spec) t0 = host_monotonic_ns();
+        else all_done = 1;
+    }
+    if (all_done) return;
+    {
+        double elapsed = (double)(host_monotonic_ns() - t0) / 1e9;
+        if (!cur) cur = spec;
+        while (*cur && idx < 31u) {
+            char *end = NULL;
+            double at = strtod(cur, &end);
+            if (end == cur) { all_done = 1; return; }
+            if (elapsed < at) return;   /* earliest pending offset not reached */
+            {
+                const char *dir = getenv("DQ8_DUMP_RAM_DIR");
+                char path[512];
+                FILE *f;
+                snprintf(path, sizeof path, "%s/ram_%u.bin",
+                         (dir && *dir) ? dir : ".", idx);
+                f = fopen(path, "wb");
+                if (f) { fwrite(ram, 1, GUEST_RAM_SIZE, f); fclose(f); }
+                fprintf(stderr, "DUMPRAM at=%.0fs elapsed=%.2fs wrote=%s\n", at, elapsed, path);
+            }
+            ++idx;
+            if (*end != ',') { all_done = 1; return; }
+            cur = end + 1;
+            if (!*cur) { all_done = 1; return; }
+        }
+    }
 }
 /* DQ8_SKIP_MOVIE: skip the opening movie.  Read once from the environment;
    0/unset keeps the unmodified movie behaviour, anything else arms the bypass
@@ -11956,11 +13599,21 @@ static void translated_from(uint32_t *r, uint32_t start_pc, GuestThread *context
     (void)n; (void)z; (void)c; (void)v; (void)ge;
     uint64_t dq8_gt_last = 0;
     while (running && steps++ < (thread_execution_depth ? 5000ull : bench_step_limit)) {
+        /* DETERMINISTIC (t_115d297c): fold retired main-context instructions
+           into the virtual guest clock at a coarse watermark.  Off by default
+           (one predictable branch per dispatch iteration). */
+        if (dq8_det_mode && !context && steps >= dq8_det_next_main_mark) {
+            dq8_det_next_main_mark = steps + 4096ull;
+            dq8_det_fold_main(steps);
+        }
         if (dq8_guest_time_enabled && thread_execution_depth == 0) {
             uint64_t dq8_gt_now = dq8_guest_cpu_ns();
             if (dq8_gt_last) dq8_guest_time_ns += dq8_gt_now - dq8_gt_last;
             dq8_gt_last = dq8_gt_now;
         }
+        /* SPIKETRAP (t_5a3c517a): the guest PC that owns the current frame's
+           host work, for the SPIKETRAP line.  One load+branch per dispatch. */
+        if (pf_trap_on > 0) pf_trap_pc = pc;
         /* SAVESTATE_HOOK (t_d50c9503): F5/F9 are serviced only here, at a main-
            context dispatch boundary where every guest thread's state is already
            quiescent (pc = next instruction, regs/flags = its input) and no
@@ -11973,6 +13626,7 @@ static void translated_from(uint32_t *r, uint32_t start_pc, GuestThread *context
             if (getenv("DQ8_TRACE_SAVESTATE"))
                 fprintf(stderr, "SAVESTATE: dispatch resumed at pc=%08X\n", pc);
         }
+        if (!context && thread_execution_depth == 0) dq8_dump_ram_service();
         if (guest_fast_page_list(r, &pc, &n, &z, &c, &v, &steps)) continue;
         if ((pc & ~1u) == 0x00143974u) {
             r[0] = (uint32_t)guest_host_snprintf(r);
@@ -12297,7 +13951,7 @@ static void translated_from(uint32_t *r, uint32_t start_pc, GuestThread *context
             }
             fputc('\n', stderr);
         }
-        if (getenv("DQ8_TRACE_FORMAT_PATH")) {
+        if (dq8_env_on("DQ8_TRACE_FORMAT_PATH", &dq8_env_trace_fmtpath)) {
             if (pc == 0x00143974u && r[14] == 0x003A5138u) {
                 trace_format_path_active = 1;
                 trace_format_path_dest = r[0];
@@ -12418,6 +14072,7 @@ static void translated_from(uint32_t *r, uint32_t start_pc, GuestThread *context
 "#,
     );
     c = c.replace("/* PICA_GL_RUNTIME */", include_str!("pica_gl.c"));
+    c = c.replace("/* FRAME_PROF_RUNTIME */", include_str!("frame_prof.c"));
     c = c.replace("/* PICA_VS_RUNTIME */", include_str!("pica_vs.c"));
     c = c.replace("/* NATIVE_FS_RUNTIME */", include_str!("native_fs.c"));
     c = c.replace("/* NATIVE_CECD_RUNTIME */", include_str!("native_cecd.c"));
@@ -12510,7 +14165,7 @@ static void translated_from(uint32_t *r, uint32_t start_pc, GuestThread *context
         }
         c.push_str("default: fprintf(stderr, \"translated PC escaped to %08X after %08X r0-r7=%08X/%08X/%08X/%08X/%08X/%08X/%08X/%08X lr=%08X sp=%08X\\n\", pc, previous_guest_pc, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[14], r[13]); exit(3); } break;\n");
     }
-    c.push_str("default: fprintf(stderr, \"translated PC escaped to %08X after %08X r0-r7=%08X/%08X/%08X/%08X/%08X/%08X/%08X/%08X lr=%08X sp=%08X\\n\", pc, previous_guest_pc, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[14], r[13]); exit(3); } } if(!context && bench_enabled && steps >= bench_step_limit) bench_report(steps, pc); if(steps>=1000000000000ull) { fprintf(stderr, \"guest instruction budget exhausted at pc=%08X r0=%08X r1=%08X r13=%08X\\n\", pc, r[0], r[1], r[13]); exit(4); } if(context) { context->pc=pc; context->n=n; context->z=z; context->c=c; context->v=v; context->ge=ge; if(!running && !thread_stopped_by_yield) context->active=0; if(!running && !thread_stopped_by_yield && context >= &guest_threads[0] && context < &guest_threads[GUEST_THREAD_STACK_SLOTS]) guest_stack_release((unsigned)(context - guest_threads)); } if(context) { uint64_t retired = running ? (steps ? steps - 1u : 0u) : steps; context->retired_steps += retired; perf_worker_retired += retired; } else { uint64_t retired = running ? (steps ? steps - 1u : 0u) : steps; perf_main_retired += retired; } }\n");
+    c.push_str("default: fprintf(stderr, \"translated PC escaped to %08X after %08X r0-r7=%08X/%08X/%08X/%08X/%08X/%08X/%08X/%08X lr=%08X sp=%08X\\n\", pc, previous_guest_pc, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[14], r[13]); exit(3); } } if(!context && bench_enabled && steps >= bench_step_limit) bench_report(steps, pc); if(steps>=1000000000000ull) { fprintf(stderr, \"guest instruction budget exhausted at pc=%08X r0=%08X r1=%08X r13=%08X\\n\", pc, r[0], r[1], r[13]); exit(4); } if(context) { context->pc=pc; context->n=n; context->z=z; context->c=c; context->v=v; context->ge=ge; if(!running && !thread_stopped_by_yield) context->active=0; if(!running && !thread_stopped_by_yield && context >= &guest_threads[0] && context < &guest_threads[GUEST_THREAD_STACK_SLOTS]) guest_stack_release((unsigned)(context - guest_threads)); } if(context) { uint64_t retired = running ? (steps ? steps - 1u : 0u) : steps; context->retired_steps += retired; perf_worker_retired += retired; dq8_det_fold_worker(retired); } else { uint64_t retired = running ? (steps ? steps - 1u : 0u) : steps; perf_main_retired += retired; } }\n");
     c.push_str(&format!(r#"int main(int argc, char **argv) {{
     (void)mem8; (void)mem16; (void)put8; (void)put16; (void)arm_shift; (void)arm_shift_carry; (void)arm_shift_imm; (void)arm_shift_imm_carry; (void)uqsub8; (void)qsub8; (void)qsub16; (void)par_op; (void)par_sel; (void)guest_udf; (void)guest_unsupported; (void)svc_create_address_arbiter; (void)dq8_pc_needs_boundary;
     (void)branch_indirect; (void)svc_break; (void)svc_arbitrate; (void)svc_send_sync; (void)svc_connect_to_port;
@@ -12630,6 +14285,28 @@ static void translated_from(uint32_t *r, uint32_t start_pc, GuestThread *context
        {{ const char *nosnap = getenv("DQ8_BENCH_NO_SNAPSHOT");
           if (nosnap && *nosnap && *nosnap != '0') bench_no_snapshot = 1; }}
        bench_t0_ns = host_monotonic_ns(); }}
+    /* DETERMINISTIC STEPPING (t_115d297c), OPT-IN.  DQ8_DETERMINISTIC=1
+       derives every guest-visible clock from retired guest instructions;
+       DQ8_DETERMINISTIC_NS_PER_STEP overrides the mapping (virtual ns per
+       retired instruction, default 400 = the measured headless-GL rate of
+       ~2.5 M instructions per second).  Unset keeps the frozen behaviour. */
+    {{ const char *det = getenv("DQ8_DETERMINISTIC");
+       if (det && *det && *det != '0') {{
+           const char *det_rate = getenv("DQ8_DETERMINISTIC_NS_PER_STEP");
+           dq8_det_mode = 1;
+           if (det_rate && *det_rate) {{
+               unsigned long long v = strtoull(det_rate, NULL, 0);
+               if (v) dq8_det_ns_per_step = (uint64_t)v;
+           }}
+           dq8_det_steps_total = 0; dq8_det_idle_ns = 0;
+           dq8_det_main_reported = 0; dq8_det_next_main_mark = 4096ull;
+           atexit(dq8_det_report);
+           fprintf(stderr,
+                   "DETERMINISTIC: on ns_per_step=%llu (1 vblank per %llu retired "
+                   "instructions; guest clock = base + instructions*ns_per_step)\n",
+                   (unsigned long long)dq8_det_ns_per_step,
+                   (unsigned long long)((GUEST_HOST_POLL_NS + dq8_det_ns_per_step - 1u) / dq8_det_ns_per_step));
+       }} }}
     /* S1_BLOCK_GATE */
     /* S1_CFG_GATE */
     host_display_init();
@@ -12644,12 +14321,19 @@ static void translated_from(uint32_t *r, uint32_t start_pc, GuestThread *context
         uint32_t restored_pc = ss_entry;
         if (savestate_cold_load(load_state, &restored_pc, r) == 0) {{
             ss_entry = restored_pc;
+            /* DETERMINISTIC (t_115d297c): the saved GuestThread array carries
+               absolute host-clock deadlines; rebase them onto the virtual
+               clock before the guest resumes. */
+            dq8_det_rebase_threads();
+            dsp_audio_det_reset_after_load();
         }} else {{
             fprintf(stderr, "SAVESTATE: startup restore failed — booting normally\n");
             memset(r, 0, sizeof r); r[13]=0x10000000u; r[14]=0xFFFFFFFFu;
         }}
     }}
+    PF_ENTER(PF_GUEST);
     translated_from(r, ss_entry, NULL);
+    PF_EXIT();
     printf("executed statically translated ARM function 0x{start:08X}; r0=0x%08X\n", r[0]);
     host_display_shutdown();
     return 0;
@@ -13349,7 +15033,7 @@ mod tests {
         // The reject must fire for THIS instruction's case (positive proof the
         // d16 out-of-bank path was taken instead of a silent load).
         assert!(generated.contains(
-            "case 0x00001000: { if (1) { guest_unsupported(0x00001000u, 0xEDDF0B00u, 0u); }"
+            "case 0x00001000: { guest_unsupported(0x00001000u, 0xEDDF0B00u, 0u);"
         ));
         // And that case must not also emit an fpr load/store (the silent path).
         let case_line = generated
@@ -13731,6 +15415,54 @@ mod tests {
     }
 
     #[test]
+    fn condition_wrap_drops_the_else_arm_only_for_a_statically_true_condition() {
+        // Unconditional (cond 14/15): body only -- no second `pc` store.
+        assert_eq!(condition_wrap("1", "r[0] = 1u;", "pc = 0x4;"), "r[0] = 1u;");
+        // Conditional: the failed-condition path must still continue at the
+        // fall-through address.
+        assert_eq!(
+            condition_wrap("z", "r[0] = 1u;", "pc = 0x4;"),
+            "if (z) { r[0] = 1u; } else { pc = 0x4; }"
+        );
+    }
+
+    #[test]
+    fn unconditionally_executed_instructions_are_not_wrapped_in_a_dead_else_arm() {
+        // MOV r0, #1  (0xE3A00001, AL) -- must be emitted unwrapped.
+        // MOVEQ r1,#2 (0x03A01002, EQ) -- must keep its condition wrapper.
+        // BX lr.
+        let stem = format!("dq8-uncond-no-wrapper-{}", process::id());
+        let input = std::env::temp_dir().join(format!("{stem}.bin"));
+        let output = std::env::temp_dir().join(format!("{stem}.c"));
+        let code = [0xE3A0_0001u32, 0x03A0_1002u32, 0xE12F_FF1Eu32]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        fs::write(&input, code).unwrap();
+        recompile_arm_function(&input, &output, 0x1000, 0x1000, &[]).unwrap();
+        let generated = fs::read_to_string(&output).unwrap();
+        assert!(!generated.contains("if (1)"), "{generated}");
+        let case_at = |pc: u32| {
+            generated
+                .lines()
+                .find(|l| l.contains(&format!("case 0x{pc:08X}:")))
+                .unwrap_or("")
+                .to_string()
+        };
+        let al = case_at(0x1000);
+        assert!(!al.contains("if ("), "unconditional case kept a wrapper: {al}");
+        assert!(al.contains("pc = 0x00001004;"), "lost the fall-through pc: {al}");
+        let eq = case_at(0x1004);
+        assert!(eq.contains("if (z) {"), "conditional case lost its guard: {eq}");
+        assert!(
+            eq.contains("else { pc = 0x00001008; }"),
+            "conditional case lost its fall-through arm: {eq}"
+        );
+        let _ = fs::remove_file(input);
+        let _ = fs::remove_file(output);
+    }
+
+    #[test]
     fn thumb_add_rd_pc_reads_pc_plus_four_unaligned() {
         // Thumb ADD Rd, PC (0x4400 group, Rm=15): the PC read is instr+4 and is
         // NOT aligned to 4 (Align(PC+4,4) applies only to LDR-literal/ADR).
@@ -13778,15 +15510,15 @@ mod tests {
         recompile_arm_function(&input, &output, 0x1000, 0x1001, &[]).unwrap();
         let generated = fs::read_to_string(&output).unwrap();
         // Thumb case (thumb bit set) only jumps into its A32 twin...
-        assert!(generated.contains("case 0x00001001: { if (1) { pc = 0x00001000; }"));
+        assert!(generated.contains("case 0x00001001: { pc = 0x00001000;"));
         // ...the twin lowers the actual VFP store with the A32 arm's semantics
         // (s0 -> fpr[0], sp-relative, no writeback) and falls through to the
         // sentinel address in A32 state...
         assert!(generated.contains(
-            "case 0x00001000: { if (1) { put32((r[13] + 8u), fpr[0]); pc = 0x00001004;"
+            "case 0x00001000: { put32((r[13] + 8u), fpr[0]); pc = 0x00001004;"
         ));
         // ...which returns to Thumb state at the address with the thumb bit set.
-        assert!(generated.contains("case 0x00001004: { if (1) { pc = 0x00001005u; }"));
+        assert!(generated.contains("case 0x00001004: { pc = 0x00001005u;"));
         // No reject was emitted for the delegated instruction.
         assert!(!generated.contains("guest_unsupported(0x00001000u, 0xED8D0A02u"));
         let _ = fs::remove_file(input);
@@ -13856,10 +15588,10 @@ mod tests {
         recompile_arm_function(&input, &output, 0x1000, 0x1000, &[]).unwrap();
         let generated = fs::read_to_string(&output).unwrap();
         assert!(
-            generated.contains("case 0x00001000: { if (1) { r[0] = svc_get_resource_values(r, 1);")
+            generated.contains("case 0x00001000: { r[0] = svc_get_resource_values(r, 1);")
         );
         assert!(
-            generated.contains("case 0x00001004: { if (1) { r[0] = svc_get_resource_values(r, 0);")
+            generated.contains("case 0x00001004: { r[0] = svc_get_resource_values(r, 0);")
         );
         let _ = fs::remove_file(input);
         let _ = fs::remove_file(output);

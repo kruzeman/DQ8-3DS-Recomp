@@ -15,7 +15,7 @@ import os
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EV = os.path.join(ROOT, "evidence", "t_3de68379", "static")
+EV = os.environ.get("S2_STATIC_DIR") or os.path.join(ROOT, "evidence", "t_3de68379", "static")
 
 
 def readppm(p):

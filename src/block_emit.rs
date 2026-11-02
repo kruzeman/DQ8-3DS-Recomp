@@ -400,7 +400,27 @@ pub fn emit_region(
         body.push_str(&edges);
     }
 
+    // S1b-prototype self-check: a REFERENCE function that replays the same
+    // per-instruction statements through a per-instruction switch — i.e. the
+    // dispatch path, minus the dispatcher's bookkeeping.  Both arms start from
+    // the same state and are compared (regs, flags, pc, running, exec count);
+    // it is emitted into every --s1-cfg build but only called when
+    // DQ8_S1_SELFCHECK is set, so the default generated C is unaffected.
+    let mut ref_body = String::new();
+    for block in &region.blocks {
+        for insn in &block.insns {
+            let stmt = emitted
+                .get(&insn.addr)
+                .expect("validated above: every region instruction has a case");
+            ref_body.push_str(&format!(
+                "        case 0x{:08X}u: {{ {stmt} }} ++exec; break;\n",
+                insn.addr
+            ));
+        }
+    }
+
     let entry = region.start;
+
     let end = region.end;
     let name = cfg_fn_name(entry);
     // Per-entry static names: a rollout build emits SEVERAL regions into one
@@ -409,6 +429,10 @@ pub fn emit_region(
     let s_insns = format!("dq8_s1_cfg_insns_{entry:08X}");
     let s_enabled = format!("dq8_s1_cfg_enabled_{entry:08X}");
     let s_report = format!("dq8_s1_cfg_report_{entry:08X}");
+    // S1b-prototype self-check state (per region, like the other statics).
+    let s_selfcheck = format!("dq8_s1_cfg_selfcheck_{entry:08X}");
+    let s_sc_ok = format!("dq8_s1_cfg_sc_ok_{entry:08X}");
+    let s_sc_bad = format!("dq8_s1_cfg_sc_bad_{entry:08X}");
     let block_count = region.blocks.len();
     let exits: String = region
         .blocks
@@ -428,10 +452,16 @@ pub fn emit_region(
          static unsigned long long {s_runs};\n\
          static unsigned long long {s_insns};\n\
          static int {s_enabled};\n\
+         static int {s_selfcheck};\n\
+         static unsigned long long {s_sc_ok};\n\
+         static unsigned long long {s_sc_bad};\n\
          static void {s_report}(void) {{\n\
          \x20   if ({s_enabled})\n\
          \x20       fprintf(stderr, \"S1_CFG entry=0x{entry:08X} runs=%llu insns=%llu\\n\",\n\
          \x20               {s_runs}, {s_insns});\n\
+         \x20   if ({s_selfcheck})\n\
+         \x20       fprintf(stderr, \"S1_SELFCHECK entry=0x{entry:08X} ok=%llu bad=%llu\\n\",\n\
+         \x20               {s_sc_ok}, {s_sc_bad});\n\
          }}\n\
          static unsigned long long {name}(uint32_t *r, uint32_t *pc_io, int *n_io, int *z_io,\n\
          \x20                              int *c_io, int *v_io, int *ge_io, int *running_io) {{\n\
@@ -455,17 +485,78 @@ pub fn emit_region(
         name = name,
         body = body,
     );
+    let ref_c = format!(
+        "/* S1b-prototype self-check reference for region 0x{entry:08X}: the same per-instruction\n\
+         \x20* statements, dispatched one by one (the instruction path) instead of chained through\n\
+         \x20* direct edges.  Called only when DQ8_S1_SELFCHECK is set; the dispatch hook runs it\n\
+         \x20* on the SAME saved input state and compares regs/flags/pc/exec with the region arm. */\n\
+         static unsigned long long {name}_ref(uint32_t *r, uint32_t *pc_io, int *n_io, int *z_io,\n\
+         \x20                                  int *c_io, int *v_io, int *ge_io, int *running_io) {{\n\
+         \x20   uint32_t pc = *pc_io;\n\
+         \x20   int n = *n_io, z = *z_io, c = *c_io, v = *v_io, ge = *ge_io, running = *running_io;\n\
+         \x20   (void)ge; (void)running;\n\
+         \x20   unsigned long long exec = 0;\n\
+         \x20   for (;;) {{\n\
+         \x20       switch (pc) {{\n\
+         {ref_body}\n\
+         \x20       default: goto L_REF_RET;\n\
+         \x20       }}\n\
+         \x20       if (pc < 0x{entry:08X}u || pc >= 0x{end:08X}u) break;\n\
+         \x20       if (!running) break;\n\
+         \x20   }}\n\
+         L_REF_RET:\n\
+         \x20   *pc_io = pc; *n_io = n; *z_io = z; *c_io = c; *v_io = v; *ge_io = ge; *running_io = running;\n\
+         \x20   return exec;\n\
+         }}\n",
+        entry = entry,
+        end = end,
+        name = name,
+        ref_body = ref_body,
+    );
+    let function_c = format!("{function_c}{ref_c}");
 
     // The dispatch loop retires one step per guest instruction; the region
     // function executes `exec` of them inside one iteration, so the hook adds
     // (exec - 1) on top of the loop's own ++.  `exec` is exact: each block
     // credits its static instruction count when it is entered.
     let hook_c = format!(
-        "        if ({s_enabled} && pc == 0x{entry:08X}u) {{ ++{s_runs}; \\\n\
-         \x20     unsigned long long s1_exec = {name}(r, &pc, &n, &z, &c, &v, &ge, &running); \\\n\
+        "        case 0x{entry:08X}u: {{ if (!{s_enabled}) break; ++{s_runs}; \\\n\
+         \x20     unsigned long long s1_exec; \\\n\
+         \x20     if ({s_selfcheck}) {{ \\\n\
+         \x20         uint32_t s1_sr[16], s1_nr[16], s1_spc = pc, s1_npc; \\\n\
+         \x20         int s1_sn = n, s1_sz = z, s1_sc = c, s1_sv = v, s1_sge = ge, s1_srun = running; \\\n\
+         \x20         int s1_nn, s1_nz, s1_nc, s1_nv, s1_nge, s1_nrun; \\\n\
+         \x20         memcpy(s1_sr, r, sizeof s1_sr); \\\n\
+         \x20         s1_exec = {name}(r, &pc, &n, &z, &c, &v, &ge, &running); \\\n\
+         \x20         memcpy(s1_nr, r, sizeof s1_nr); \\\n\
+         \x20         s1_npc = pc; s1_nn = n; s1_nz = z; s1_nc = c; s1_nv = v; s1_nge = ge; s1_nrun = running; \\\n\
+         \x20         memcpy(r, s1_sr, sizeof s1_sr); \\\n\
+         \x20         pc = s1_spc; n = s1_sn; z = s1_sz; c = s1_sc; v = s1_sv; ge = s1_sge; running = s1_srun; \\\n\
+         \x20         unsigned long long s1_rexec = {name}_ref(r, &pc, &n, &z, &c, &v, &ge, &running); \\\n\
+         \x20         int s1_diff = (pc != s1_npc) || (n != s1_nn) || (z != s1_nz) || (c != s1_nc) || \\\n\
+         \x20                       (v != s1_nv) || (ge != s1_nge) || (running != s1_nrun) || (s1_rexec != s1_exec); \\\n\
+         \x20         unsigned s1_reg = 16u, s1_rv = 0u; \\\n\
+         \x20         for (unsigned s1_i = 0; s1_i < 16u; ++s1_i) \\\n\
+         \x20             if (r[s1_i] != s1_nr[s1_i]) {{ if (!s1_diff) {{ s1_diff = 1; s1_reg = s1_i; s1_rv = r[s1_i]; }} }} \\\n\
+         \x20         if (s1_diff) {{ \\\n\
+         \x20             ++{s_sc_bad}; \\\n\
+         \x20             if ({s_sc_bad} <= 8u) \\\n\
+         \x20       fprintf(stderr, \"S1_SELFCHECK DIVERGENCE entry=0x{entry:08X} native_pc=%08X ref_pc=%08X native_exec=%llu ref_exec=%llu reg=r%u ref=%08X native=%08X nzcv=%d%d%d%d/%d%d%d%d running=%d/%d\\n\",\n\
+         \x20                         s1_npc, pc, s1_exec, s1_rexec, s1_reg, s1_rv, \\\n\
+         \x20                         (s1_reg < 16u ? s1_nr[s1_reg] : 0u), \\\n\
+         \x20                         s1_nn, s1_nz, s1_nc, s1_nv, n, z, c, v, s1_nrun, running); \\\n\
+         \x20         }} else ++{s_sc_ok}; \\\n\
+         \x20         memcpy(r, s1_nr, sizeof s1_nr); \\\n\
+         \x20         pc = s1_npc; n = s1_nn; z = s1_nz; c = s1_nc; v = s1_nv; ge = s1_nge; running = s1_nrun; \\\n\
+         \x20     }} else {{ \\\n\
+         \x20         s1_exec = {name}(r, &pc, &n, &z, &c, &v, &ge, &running); \\\n\
+         \x20     }} \\\n\
          \x20     {s_insns} += s1_exec; steps += s1_exec - 1ull; continue; }}\n",
         entry = entry,
         name = name,
+        s_selfcheck = s_selfcheck,
+        s_sc_ok = s_sc_ok,
+        s_sc_bad = s_sc_bad,
     );
 
     // Built without backslash-escaped quotes: `q` is a double quote, so the
@@ -476,6 +567,7 @@ pub fn emit_region(
     let q = '"';
     let gate_c = format!(
         "    {{ const char *s1_list = getenv({q}DQ8_S1_CFG{q});\n\
+         \x20     {{ const char *s1_sc = getenv({q}DQ8_S1_SELFCHECK{q}); {s_selfcheck} = (s1_sc && *s1_sc && *s1_sc != '0') ? 1 : 0; }}\n\
          \x20     if (s1_list && *s1_list) {{\n\
          \x20         int s1_hit = 0, s1_toks = 0;\n\
          \x20         const char *s1_p = s1_list;\n\
@@ -503,6 +595,7 @@ pub fn emit_region(
         q = q,
         s_enabled = s_enabled,
         s_report = s_report,
+        s_selfcheck = s_selfcheck,
     );
 
     Ok(EmittedRegion {

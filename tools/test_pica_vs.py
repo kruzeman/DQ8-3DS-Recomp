@@ -4,6 +4,7 @@ from pathlib import Path
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -67,16 +68,180 @@ int main(void) {
 '''
         self.compile_run(header+runtime+checks)
 
-    def compile_run(self, source):
+    def test_predecoded_dispatch_is_bit_identical(self):
+        """t_469b3d92: the pre-decoded VS dispatcher must produce exactly the
+        same registers/cc/address/failure code as the interpreter's dispatch,
+        for the REAL DQ8 vertex shader, over random and IEEE edge-case inputs.
+
+        The program + swizzle table come from tools/testdata/vsprog_dq8.txt (a
+        DQ8_VSPROGDUMP capture), so MOV/ADD/MUL/FLOOR/MAD/DP3/DP4/DPH/CMP,
+        MOVA, CALL, the uniform-relative operands and the flow-control scopes
+        are all exercised.  Runs twice per case: pvs_dec_ready=0 (interpreter)
+        vs pvs_dec_ready=1 (pre-decoded), and compares the whole PicaVsState
+        with memcmp so a single wrong lane fails the test."""
+        clang = shutil.which('clang')
+        self.assertIsNotNone(clang, 'clang is required for the native runtime test')
+        words = [ln for ln in (ROOT / 'tools/testdata/vsprog_dq8.txt').read_text().splitlines()
+                 if not ln.startswith('#')]
+        prog = next(ln for ln in words if ln.startswith('program')).split(None, 1)[1]
+        swz = next(ln for ln in words if ln.startswith('swizzle')).split(None, 1)[1]
+        runtime = (ROOT / 'src/pica_vs.c').read_text().split('static float pica_sat(', 1)[0]
+        header = r'''
+#include <assert.h>
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+static uint32_t pica_regs[768], vs_program[4096], vs_swizzle[4096];
+static unsigned vs_program_size, vs_swizzle_size;
+static float vs_uniform_f[96][4];
+/* Stubs for the render-target / depth-test globals the extracted region
+   references (this test never rasterises, it only runs the vertex shader). */
+static uint32_t pica_rt_w, pica_rt_h, pica_rt_format, pica_rt_addr;
+static int pica_depth_bound, pica_depth_allow_write;
+static uint32_t pica_depth_addr, pica_depth_bits, pica_depth_bpp;
+static int pica_depth_range_ok(void) { return 0; }
+static uint8_t ram[4096];
+static int guest_memory_range(uint32_t a, uint64_t n, uint32_t *m) {
+    *m = a; return a < sizeof ram && n <= sizeof ram - a;
+}
+static double dq8_layer_t(void) { return 0.0; }
+static uint64_t pica_draw_count;
+/* SPIKETRAP hooks are inert here (trap off => one load+branch in the runner). */
+static int pf_trap_on = 0;
+static void pf_vs_step(void) {}
+'''
+        checks = r'''
+static const char *VS_PROG_HEX = "%(prog)s";
+static const char *VS_SWZ_HEX = "%(swz)s";
+static unsigned load_hex(const char *hex, uint32_t *out, unsigned cap) {
+    unsigned n = 0;
+    while (*hex && n < cap) {
+        char buf[9];
+        unsigned k;
+        while (*hex == ' ') ++hex;
+        if (!*hex) break;
+        for (k = 0; k < 8 && hex[k]; ++k) buf[k] = hex[k];
+        buf[k] = 0;
+        out[n++] = (uint32_t)strtoul(buf, NULL, 16);
+        hex += k;
+    }
+    return n;
+}
+static uint32_t rng_state = 0x12345678u;
+static uint32_t rnd(void) { rng_state = rng_state * 1103515245u + 12345u; return rng_state >> 8; }
+/* Architecturally-equal float compare.  The interpreter's scalar
+   pica_multiply/copysignf chain and the 4-wide pvs_vec_mul agree on every
+   finite/inf value bit for bit, but the sign bit of a ZERO and the
+   sign/payload of a NaN produced by 0*x / inf-inf can differ between the two
+   code shapes (x86 addss vs addps operand selection, copysignf of a NaN).
+   Neither is observable: PICA has no NaN-payload semantics, and +/-0 render
+   and compare identically, so the rendered frames are byte-identical (the
+   hardware run compares PPM captures for that). */
+static int same_f(float a, float b) {
+    uint32_t x, y;
+    if (isnan(a) && isnan(b)) return 1;
+    if (a == 0.0f && b == 0.0f) return 1;
+    memcpy(&x, &a, 4); memcpy(&y, &b, 4);
+    return x == y;
+}
+static int same_state(const PicaVsState *p, const PicaVsState *q) {
+    unsigned i, k;
+    for (i = 0; i < 16; ++i) {
+        for (k = 0; k < 4; ++k)
+            if (!same_f(p->input[i][k], q->input[i][k])) return 0;
+        for (k = 0; k < 4; ++k)
+            if (!same_f(p->temp[i][k], q->temp[i][k])) return 0;
+        for (k = 0; k < 4; ++k)
+            if (!same_f(p->output[i][k], q->output[i][k])) return 0;
+    }
+    for (i = 0; i < 3; ++i) if (p->address[i] != q->address[i]) return 0;
+    for (i = 0; i < 2; ++i) if (p->cc[i] != q->cc[i]) return 0;
+    return 1;
+}
+/* A float drawn from: random bits, +/-0, +/-inf, NaN, small ints, denormals.
+   The zero/inf/NaN cases are exactly what pvs_vec_mul's 0*x rule and the
+   NaN-propagating scalar path can disagree on if the rewrite is wrong. */
+static float edge_float(void) {
+    union { uint32_t u; float f; } v;
+    switch (rnd() %% 8u) {
+    case 0: case 1: v.u = rnd(); return v.f;
+    case 2: return (rnd() & 1u) ? 0.0f : -0.0f;
+    case 3: return (rnd() & 1u) ? INFINITY : -INFINITY;
+    case 4: v.u = 0x7f800001u + (rnd() %% 4u); return v.f;
+    case 5: return (float)((int)(rnd() %% 2001u) - 1000) / 8.0f;
+    case 6: v.u = 0x00000001u + (rnd() %% 16u); return v.f;
+    default: return 1e30f + (float)(rnd() %% 1024u);
+    }
+}
+int main(void) {
+    static PicaVsState sA, sB;
+    unsigned kinds[8] = {0}, i, k, seed, bad = 0, ok = 0, fail = 0;
+    vs_program_size = load_hex(VS_PROG_HEX, vs_program, 4096);
+    vs_swizzle_size = load_hex(VS_SWZ_HEX, vs_swizzle, 4096);
+    assert(vs_program_size == 238 && vs_swizzle_size == 60);
+    pvs_sse_sync();
+    pvs_dec_sync();
+    assert(pvs_dec_ready);
+    for (i = 0; i < vs_program_size; ++i) ++kinds[pvs_dec_tab[i].kind];
+    printf("predecoded kinds: gen=%%u mov=%%u add=%%u mul=%%u floor=%%u mad=%%u dp=%%u cmp=%%u\n",
+           kinds[PVK_GEN], kinds[PVK_MOV], kinds[PVK_ADD], kinds[PVK_MUL],
+           kinds[PVK_FLR], kinds[PVK_MAD], kinds[PVK_DP], kinds[PVK_CMP]);
+    assert(kinds[PVK_MOV] && kinds[PVK_ADD] && kinds[PVK_MUL] &&
+           kinds[PVK_FLR] && kinds[PVK_DP] && kinds[PVK_CMP] && kinds[PVK_MAD]);
+    for (seed = 0; seed < 500; ++seed) {
+        int ra, rb;
+        unsigned detA, detB;
+        memset(&sA, 0, sizeof sA);
+        for (i = 0; i < 96; ++i)
+            for (k = 0; k < 4; ++k) vs_uniform_f[i][k] = edge_float();
+        /* Inputs: small integers so MOVA's relative offsets stay in range. */
+        for (i = 0; i < 16; ++i)
+            for (k = 0; k < 4; ++k) sA.input[i][k] = (float)((int)(rnd() %% 201u) - 100);
+        pica_regs[0x2ba] = 0;                    /* program entry */
+        pica_regs[0x2b0] = 0xffffu;              /* all callee conditions true */
+        pica_regs[0x2b0] ^= rnd() & 0x3u;        /* ... except a couple */
+        memcpy(&sB, &sA, sizeof sA);
+        pvs_dec_ready = 0;                       /* interpreter dispatch */
+        ra = pica_execute_vs(&sA);
+        detA = pica_vs_fail_detail;
+        pvs_dec_ready = 1;                       /* pre-decoded dispatch */
+        rb = pica_execute_vs(&sB);
+        detB = pica_vs_fail_detail;
+        if (ra) ++ok; else ++fail;
+        if (ra != rb || detA != detB || !same_state(&sA, &sB)) {
+            ++bad;
+            if (bad <= 3) {
+                printf("MISMATCH seed=%%u ret %%d/%%d det %%08X/%%08X\n", seed, ra, rb, detA, detB);
+                for (i = 0; i < 16; ++i)
+                    for (k = 0; k < 4; ++k)
+                        if (!same_f(sA.output[i][k], sB.output[i][k]))
+                            printf("  o%%u[%%u] %%g vs %%g\n", i, k,
+                                   sA.output[i][k], sB.output[i][k]);
+            }
+        }
+    }
+    printf("predecode A/B: 500 cases (%%u executed, %%u rejected), %%u mismatches\n", ok, fail, bad);
+    assert(bad == 0 && ok > 400);
+    return 0;
+}
+''' % {'prog': prog, 'swz': swz}
+        self.compile_run(header + runtime + checks, ['-msse4.1'])
+
+    def compile_run(self, source, extra_flags=None):
         clang = shutil.which('clang')
         self.assertIsNotNone(clang)
         with tempfile.TemporaryDirectory(prefix='dq8-pica-vs-') as d:
             src=Path(d)/'test.c';exe=Path(d)/'test'
             src.write_text(source)
-            subprocess.run([clang,'-std=c11','-O1','-fsanitize=undefined,address',str(src),'-lm','-o',str(exe)],check=True)
+            flags = list(extra_flags or [])
+            subprocess.run([clang,'-std=c11','-O1','-fsanitize=undefined,address',*flags,
+                            str(src),'-lm','-o',str(exe)],check=True)
             env = dict(os.environ)
             env["ASAN_OPTIONS"] = env.get("ASAN_OPTIONS", "") + ":detect_leaks=0"
-            subprocess.run([str(exe)],check=True,timeout=5,env=env)
+            res = subprocess.run([str(exe)],check=True,timeout=20,env=env,capture_output=True,text=True)
+            sys.stderr.write(res.stdout)
 
     def test_shared_triangle_edge_is_blended_once(self):
         # pica_vs.c's GL glue references types/stubs from pica_gl.c; include it

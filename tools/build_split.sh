@@ -31,6 +31,21 @@
 # the runtime TU defaults to -O2, which the audit measured at 3.48x on the
 # 100M-main-instruction modal budget (51.733 s -> 14.865 s).
 #
+# Two profiles share this script:
+#   development (default, this script): guest -O0, runtime -O2, ~2 min build.
+#   release (tools/build_release.sh):   guest -O1, runtime -O2, ~2 h build.
+# The -O1 guest profile was measured on the RX 580 (field scene, 3 runs each,
+# tools/profile.sh) at mean guest 18.85-19.00 -> 14.89-15.18 ms, p90 frame
+# 43.4 -> 37.2 ms, frames >33.4 ms 37.0-40.4 % -> 27.0-30.9 %, binary
+# 102 -> 41.6 MB. p50 does not improve; the gain is the tail. Use the release
+# profile for play/measurement runs, not for iteration.
+#
+# Both profiles compile into the same $SPLIT/obj cache and the flag set is part
+# of every per-TU cache key, so switching profile recompiles all 36 TUs (35
+# guest parts + the runtime) -- a switch is a full rebuild in both directions.
+# Never run two profiles concurrently in one worktree (shared .c and .o paths);
+# use separate worktrees or a separate SPLIT_DIR for parallel profiles.
+#
 # Knobs (all optional; DQ8_SPLIT_CFLAGS default reproduces the guest part of
 # the previous behaviour exactly):
 #   BUILD_JOBS=N            parallel clang pool size (default 6)
@@ -43,6 +58,21 @@
 #   DQ8_SPLIT_SKIP_REGEN=1  skip recompile-arm + split_dispatch and rebuild
 #                           only the C (compile + link) from the existing
 #                           $SPLIT/*.c — handy to iterate on compile flags
+#   DQ8_GUEST_PC_PROFILE_BUILD=1
+#                           INSTRUMENTATION SWITCH (tools/split_dispatch.py):
+#                           wraps every emitted guest instruction with guest-PC
+#                           counters, per 4 KB page and per instruction, plus
+#                           non-sequential-arrival counters for the call
+#                           profile, and prints a report (raw counters to
+#                           stderr) at a clean exit.  OFF by default: with the
+#                           switch unset the generated C — and therefore the
+#                           binary — is byte-identical to a build without it.
+#                           Runtime knobs (profiling build only):
+#                             DQ8_GUEST_PC_PROFILE=1            turn counters on
+#                             DQ8_GUEST_PC_PROFILE_SECS=<s>     print the report
+#                                                               after <s> and exit
+#                             DQ8_GUEST_PC_PROFILE_AFTER_MOVIE=1 keep the old
+#                                 gate (count only after the intro player)
 #   DQ8_S1_BLOCK=0xADDR     S1b: also emit the Block-IR straight-line block at
 #                           ADDR into the generated C (recompile-arm
 #                           --s1-block).  Unset: generated C is byte-identical
@@ -156,6 +186,14 @@ elif [[ "${DQ8_GL:-0}" == "1" ]]; then
   echo "DQ8_GL=1 requested but EGL development files not found (need pkg-config egl)" >&2
   exit 2
 fi
+# The 4-wide vertex-shader core (src/pica_vs.c) is written against SSE4.1
+# intrinsics and is guarded by __SSE4_1__; without the flag the guard removes
+# the helpers while the dispatcher that uses them stays compiled, so the build
+# breaks.  Every x86-64 CPU since 2008 has SSE4.1, and the guard keeps the
+# scalar path as the fallback for anything older (DQ8_VS_CORE=0 at runtime).
+if [[ "$(uname -m)" == "x86_64" ]] && ! printf '%s\n' "${rcflags[@]}" | grep -q -- '-msse4'; then
+  rcflags+=(-msse4.1)
+fi
 echo "== flags: guest   \"${cflags[*]}\""
 echo "== flags: runtime \"${rcflags[*]}\""
 mkdir -p "$SPLIT/obj"
@@ -179,6 +217,11 @@ done
 # Everything that must invalidate a cached .o is captured once here.
 CLANG_ID=$(clang --version)
 HDR_HASH=$(sha256sum "$SPLIT/dq8_rt.h" | cut -d' ' -f1)
+# t_f8f2c1da: dq8_main.c SPLICES src/pica_gl.c and src/pica_vs.c into itself,
+# so their contents must be part of the runtime TU's cache key.  Hashing only
+# the generated $SPLIT/dq8_main.c silently reused the old dq8_main.o after a
+# renderer edit (a stale-binary trap: the run then tests the previous code).
+REND_HASH=$(cat src/pica_gl.c src/pica_vs.c 2>/dev/null | sha256sum | cut -d' ' -f1)
 
 # compile_cached <source.c> <target.o> <flag-array-name>
 # Reuse <target.o> when its sidecar stamp still matches the current content
@@ -195,8 +238,8 @@ compile_cached() {
   local -a cmd=(clang "${flagset[@]}" -I"$SPLIT" -c "$src" -o "$obj")
   local base key
   base=$(basename "$obj")
-  key=$(printf 'cmd=%s\nclang=%s\nhdr=%s\nsrc=%s\n' \
-        "$(printf '%q ' "${cmd[@]}")" "$CLANG_ID" "$HDR_HASH" \
+  key=$(printf 'cmd=%s\nclang=%s\nhdr=%s\nrend=%s\nsrc=%s\n' \
+        "$(printf '%q ' "${cmd[@]}")" "$CLANG_ID" "$HDR_HASH" "$REND_HASH" \
         "$(sha256sum "$src" | cut -d' ' -f1)" | sha256sum | cut -d' ' -f1)
   if [[ -f "$obj" && -f "$obj.stamp" && "$(<"$obj.stamp")" == "$key" ]]; then
     echo "  reuse    $base"
