@@ -15,6 +15,49 @@ with an OpenGL backend — and runs the game as an ordinary desktop application.
 
 ---
 
+## About
+
+This is a **static recompilation** project, not an emulator. There is no 3DS CPU emulation loop at
+runtime: the game's ARM code is translated ahead of time into C, that C is compiled by the host
+toolchain with the host's own optimiser, and the result runs as an ordinary native program. What is
+still "emulated" is only the platform underneath the game — the system services it calls and the GPU
+it draws with.
+
+How the pipeline works:
+
+1. **Translation.** The recompiler driver walks the game's `code.bin` from a set of entry points,
+   follows the call graph (including indirect calls through a root list), decodes every reachable
+   ARM/Thumb instruction and emits equivalent C — one function per guest function, one label per
+   guest address.
+2. **Splitting and compiling.** The generated C (about 156 MB for this game, ~1.06 M translated
+   instructions) is split into 36 translation units and compiled by Clang. Unchanged units are
+   reused, so incremental builds take seconds.
+3. **Runtime.** A native runtime is linked with it: HLE implementations of the system services the
+   game actually uses — `fs:USER` (files, SDMC/ExtData), `cecd:u` (StreetPass), `y2r:u` (image
+   conversion), `dsp::DSP` (audio), `ptm:u` (time/power), `ndm:u`, `soc:U` — plus input, savestates
+   and the window/present path.
+4. **GPU.** The PICA200 is reimplemented from scratch: the vertex pipeline runs on a worker pool,
+   the TEV pipeline is translated into OpenGL 4.x shaders, and there is a software reference path
+   that draws the same command stream without a GPU, which is how rendering bugs are isolated.
+
+Why do it this way: the result is native code that the compiler can optimise and that a debugger can
+step through, with no interpreter overhead per guest instruction and no dependency on an emulator's
+timing heuristics. It is aimed at preservation and at research into how these games actually work.
+
+**What works today:** boot, the intro movie, the title screen, menus and character creation, the 3D
+field and towns, random encounters and turn-based battles, in-game dialogue, saving and loading, and
+savestates (F5/F9).
+
+**Known limitations:** the guest still costs about 13 ms of a 16.7 ms frame in the field, so the
+project is CPU-bound before it is GPU-bound; a few visual effects are approximated; the S1
+region-based code path is experimental and off by default; touch and motion input are mapped to the
+mouse only.
+
+**Not affiliated** with Square Enix, Armor Project, Bird Studio or Nintendo. No game code, assets or
+data are distributed here — see the legal note above.
+
+---
+
 ## Screenshots
 
 ![Title screen](docs/screenshots/title-screen.png)
@@ -31,6 +74,8 @@ with an OpenGL backend — and runs the game as an ordinary desktop application.
 
 ## Contents
 
+- [About](#about)
+- [Screenshots](#screenshots)
 - [What you need](#what-you-need)
 - [Preparing the game files](#preparing-the-game-files)
 - [Building](#building)
