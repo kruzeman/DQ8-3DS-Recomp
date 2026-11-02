@@ -20,8 +20,14 @@ with an OpenGL backend — and runs the game as an ordinary desktop application.
 ![Title screen](docs/screenshots/title-screen.png)
 *Title screen*
 
-![3D world — an encounter in the forest](docs/screenshots/encounter-ogre.png)
-*3D world — an encounter in the forest*
+![In-game dialogue — Yangus, in a stone village](docs/screenshots/dialogue-yangus.png)
+*In-game dialogue, rendered by the recompiled game code — the window title shows the real game frame rate*
+
+![Menu, party status and the cave area](docs/screenshots/menu-cave.png)
+*Menu and party status, with the 3D scene and the map underneath*
+
+![Farebury town map](docs/screenshots/town-map-farebury.png)
+*Farebury: the top screen holds the 3D world, the bottom screen the town map*
 
 ## Contents
 
