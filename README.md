@@ -44,10 +44,14 @@ with an OpenGL backend — and runs the game as an ordinary desktop application.
 
 ## What you need
 
-**Game files (yours, legally acquired):**
+**Game files (yours, legally acquired) — USA version only:**
 - `DQ8.code` — the game's `code.bin` (ARM executable) extracted from *Dragon Quest VIII — Journey of
-  the Cursed King* (3DS, USA version)
-- `dq8.romfs` — the game's RomFS image (the filesystem), extracted from the same dump
+  the Cursed King* (**3DS, USA**)
+- `dq8.romfs` — the game's RomFS image (the filesystem), extracted from the **same** dump
+
+> The recompiled code is generated against the USA executable's addresses and data layout, so the
+> USA dump is required. A European or Japanese copy will not run: the translation would have to be
+> regenerated from that region's `code.bin`, and the runtime would need the matching RomFS.
 
 **Build toolchain:**
 - Clang (C11)
@@ -63,7 +67,7 @@ with an OpenGL backend — and runs the game as an ordinary desktop application.
 
 ## Preparing the game files
 
-Extract from your own cartridge/dump (e.g. with GodMode9 on a 3DS, or `ctrtool`/`3dstool` on PC):
+Extract from your own **USA** cartridge/dump (e.g. with GodMode9 on a 3DS, or `ctrtool`/`3dstool` on PC):
 
 ```
 your-dump/
@@ -121,9 +125,47 @@ otherwise they will thrash each other's cache.
 
 ## Running
 
+The configuration the project is tested with, and the one to start from:
+
 ```sh
+# Rendering
+export DQ8_GL=1                   # OpenGL renderer (software path is the fallback)
+export DQ8_GL_TEXCACHE=1          # texture staging cache
+export DQ8_GL_FBFETCH=1           # framebuffer fetch (already default on verified drivers)
+export DQ8_GL_BLENDS=1            # fixed-function blending (default)
+export DQ8_GL_DEPTH_ATTACH=1      # hardware depth attachment — closes the polygon holes
+export DQ8_VSPAR=8                # vertex-transform workers (default 8)
+
+# Threading and pacing
+export DQ8_RUN_GUEST_THREADS=1    # guest threads as host threads
+export DQ8_SPLIT_GL=0             # keep GL on the main thread
+export DQ8_VBLANK_WALLCLOCK=1     # 60 Hz vblank from the wall clock, not from the render loop
+export DQ8_STACK_NO_RELOCATE=1    # do not relocate guest stacks (needed for stability today)
+
 ./target/dq8 /path/to/DQ8.code /path/to/dq8.romfs
 ```
+
+What each of them buys, and when to touch it:
+
+| Variable | What it does | Notes |
+|---|---|---|
+| `DQ8_GL=1` | selects the OpenGL renderer | `DQ8_GL=0` uses the slow software reference path — useful to tell a renderer bug from a game-side bug |
+| `DQ8_GL_TEXCACHE=1` | caches decoded textures by content identity | default on; `0` forces the legacy path when a texture looks stale |
+| `DQ8_GL_FBFETCH=1` | reads the live render target instead of copying it | default on for verified drivers (llvmpipe, softpipe, swrast, radeonsi); forcing it on an unverified driver can show through-blending artefacts |
+| `DQ8_GL_BLENDS=1` | fixed-function blending | default; `0` selects the shader blend path |
+| `DQ8_GL_DEPTH_ATTACH=1` | uses a hardware depth attachment (D32F) | this is what closes the holes in characters and terrain; falls back automatically if the driver rejects it |
+| `DQ8_VSPAR=8` | vertex-transform worker threads | default 8; lower it only to debug a suspect vertex race |
+| `DQ8_RUN_GUEST_THREADS=1` | runs the game's threads as host threads | needed for anything past the title screen |
+| `DQ8_SPLIT_GL=0` | keeps GL on the main thread | `1` moves GL to a worker thread: an experimental path, and combinations of it with the hardware depth attachment used to black-screen |
+| `DQ8_VBLANK_WALLCLOCK=1` | drives the vblank cadence from the wall clock | default off; on a slow GPU this is what keeps the guest clock honest |
+| `DQ8_STACK_NO_RELOCATE=1` | keeps guest thread stacks where the game put them | required today: relocation writes into memory the game itself uses and crashes it |
+
+`DQ8_FRAMEPROF=1` prints a per-frame breakdown (`total / guest / gl / present / audio / idle`) to
+stderr — the first thing to enable when something feels slow.
+
+`DQ8_S1_CFG=all` exists but is **experimental and off by default**: it compiles hot guest regions into
+straight-line native code. Measured on an RX 580 it is neutral on real gameplay, so it is not part of
+any recommended configuration.
 
 On Linux, if the window comes up black under Wayland, force X11:
 
@@ -133,6 +175,27 @@ SDL_VIDEODRIVER=x11 ./target/dq8 DQ8.code dq8.romfs
 
 First launch creates the game's ExtData when the game asks for it (answer the in-game prompts with
 **A**), then proceeds through the intro movie to the title screen.
+
+### Gamepads
+
+Any controller SDL recognises as a game controller works out of the box — Xbox pads, DualShock /
+DualSense, 8BitDo in XInput or Switch mode, and so on. No configuration files, no mapping step:
+plug it in before launch or hot-plug it while running (`host pad: opened '…'` is printed to stderr
+when it is picked up).
+
+| Pad | 3DS |
+|---|---|
+| left stick | circle pad |
+| A / B | A / B |
+| X / Y | X / Y |
+| D-pad | D-pad |
+| L1 / LB, R1 / RB | L, R |
+| Start / Options | Start |
+| Back / Share / Select | Select |
+
+The keyboard stays active next to the pad. `DQ8_GAMEPAD=0` disables controller handling entirely
+(useful when a pad's dead zone fights the stick). Not mapped: the second stick, triggers, motion and
+the touch screen — the game's touch usage is handled by the mouse.
 
 ---
 
