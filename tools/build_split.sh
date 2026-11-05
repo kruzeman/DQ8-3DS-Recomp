@@ -86,6 +86,15 @@
 #                           to a build without this knob.  The same env name
 #                           DQ8_S1_CFG=<entry> gates the hook at runtime.
 #
+#   DQ8_FN_EMIT=0xADDR + DQ8_FN_EMIT_END=0xADDR
+#                           FN_EMIT spike: emit the guest function [ADDR,
+#                           ADDR_END) as ONE native C function with r0..r14 as
+#                           C locals, direct intra-function gotos and a native
+#                           return (recompile-arm --fn-emit).  Unset: generated
+#                           C byte-identical.  The same env name
+#                           DQ8_FN_EMIT=<entry> gates the hook at runtime, so
+#                           one binary measures both arms.
+#
 # Both flag sets are part of the per-TU cache key (the exact clang command line
 # is hashed), so flipping either set rebuilds only the TUs it affects: going
 # O0 -> O2 on the runtime recompiles dq8_main.o alone and reuses all 37 guest
@@ -107,10 +116,16 @@ RFLAGS=${DQ8_SPLIT_RUNTIME_CFLAGS:--std=c11 -O2 -g0 -w}
 # src/pica_gl.c / -DDQ8_ENABLE_GL live on the renderer (Stage 2) branch only,
 # so the GL gate is intentionally NOT enabled here.
 cflags=($DFLAGS)    # guest dispatch parts  (dq8_part_NNN.c)
+fnflags=(${DQ8_FNSHARD_CFLAGS:-$DFLAGS})   # FN_EMIT bodies (dq8_fnshard_NNN.c)
 rcflags=($RFLAGS)   # native runtime TU      (dq8_main.c)
 CODE=${DQ8_CODE:-DQ8.code}
 if [[ ! -f $CODE ]]; then echo "missing $CODE" >&2; exit 2; fi
 ldflags=(-lm)
+# FREEZE WATCHDOG (t_4371e6ea): -rdynamic puts the runtime's global functions
+# in the dynamic symbol table, so backtrace_symbols_fd() names them (main,
+# pica_gl_*, ...) instead of printing only +0x offsets.  Link-line only: no
+# translation unit is recompiled and no code changes.
+ldflags+=(-rdynamic -ldl)
 if [[ -z "${DQ8_NO_SDL:-}" ]] && command -v sdl2-config >/dev/null 2>&1; then
   gate=(-DDQ8_ENABLE_SDL $(sdl2-config --cflags))
   cflags+=("${gate[@]}")
@@ -153,6 +168,20 @@ if [[ -z "${DQ8_SPLIT_SKIP_REGEN:-}" ]]; then
       args+=(--s1-cfg "${s1_entries[$s1_i]}" --s1-cfg-end "${s1_ends[$s1_i]}")
       echo "== S1c: emitting native CFG for region ${s1_entries[$s1_i]}..${s1_ends[$s1_i]} =="
     done
+  fi
+  # FN_EMIT pilot (t_8b9fda4c): emit the guest functions listed in
+  # DQ8_FN_EMIT_LIST (one `0xENTRY 0xEND` pair per line, as produced by
+  # tools/fn_pick.py) as real C functions with r0..r14 as locals, real C calls
+  # between them, one shard TU each.  Unset: the generated C (and every TU) is
+  # byte-identical to a build without this knob.  The legacy single-range form
+  # (DQ8_FN_EMIT=<entry> + DQ8_FN_EMIT_END=<end>, used by the spike's bench) is
+  # still accepted.  The runtime gate is DQ8_FN_EMIT (see src/fn_emit.rs).
+  if [[ -n "${DQ8_FN_EMIT_LIST:-}" ]]; then
+    args+=(--fn-emit-list "$DQ8_FN_EMIT_LIST")
+    echo "== FN_EMIT: emitting the functions listed in $DQ8_FN_EMIT_LIST =="
+  elif [[ -n "${DQ8_FN_EMIT:-}" ]]; then
+    args+=(--fn-emit "$DQ8_FN_EMIT" --fn-emit-end "${DQ8_FN_EMIT_END:?DQ8_FN_EMIT needs DQ8_FN_EMIT_END}")
+    echo "== FN_EMIT: emitting guest function $DQ8_FN_EMIT..$DQ8_FN_EMIT_END as native C =="
   fi
   cargo run --release --quiet -- recompile-arm "$CODE" 0x00100000 target/dq8-startup.c "${args[@]}"
   ls -l target/dq8-startup.c
@@ -204,7 +233,8 @@ STATS="$OBJDIR/.build-stats"
 # Drop cached objects whose source part no longer exists (stale leftovers
 # from a previous, larger manifest): they must not be compiled or linked.
 pruned=0
-for o in "$OBJDIR"/dq8_part_*.o "$OBJDIR"/dq8_part_*.o.stamp; do
+for o in "$OBJDIR"/dq8_part_*.o "$OBJDIR"/dq8_part_*.o.stamp \
+         "$OBJDIR"/dq8_fnshard_*.o "$OBJDIR"/dq8_fnshard_*.o.stamp; do
   [[ -e "$o" ]] || continue
   base=$(basename "$o"); base=${base%.stamp}; base=${base%.o}
   if [[ ! -f "$SPLIT/$base.c" ]]; then
@@ -259,9 +289,15 @@ compile_cached() {
 
 compile_cached "$SPLIT/dq8_main.c" "$OBJDIR/dq8_main.o" rcflags
 running=0
-for part in "$SPLIT"/dq8_part_*.c; do
+for part in "$SPLIT"/dq8_part_*.c "$SPLIT"/dq8_fnshard_*.c; do
+  [[ -e "$part" ]] || continue
   base=$(basename "$part" .c)
-  compile_cached "$part" "$OBJDIR/$base.o" cflags &
+  # FN_EMIT shards are ordinary C bodies with no dispatcher machinery, so they
+  # can take their own optimisation level (DQ8_FNSHARD_CFLAGS) without paying
+  # the dispatcher TUs' compile-time cost.  Unset = same flags as the parts.
+  fl=cflags
+  case "$base" in dq8_fnshard_*) if [[ -n "${DQ8_FNSHARD_CFLAGS:-}" ]]; then fl=fnflags; fi ;; esac
+  compile_cached "$part" "$OBJDIR/$base.o" "$fl" &
   running=$((running + 1))
   if (( running >= JOBS )); then wait -n || true; running=$((running - 1)); fi
 done

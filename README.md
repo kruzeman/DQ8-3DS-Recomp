@@ -9,6 +9,10 @@ with an OpenGL backend — and runs the game as an ordinary desktop application.
 > **Work in progress.** The game boots, the intro movie, menus, the 3D world and in-game dialogue all
 > render and run; performance and rendering-correctness work is ongoing.
 
+> **Performance today.** On an 8-core CPU class machine the field and the first town hold the game's
+> 30 fps target; the renderer also supports a 2x/3x/4x internal resolution scale that is presented at
+> the window's own resolution instead of being downscaled back to the 3DS framebuffer size.
+
 > **Legal note.** This repository contains **no game data whatsoever** — no ROM, no `code.bin`, no
 > `romfs`, no saves. You must supply files extracted from **your own legally acquired copy** of the
 > game. The project is intended for preservation and research.

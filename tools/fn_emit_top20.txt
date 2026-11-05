@@ -1,0 +1,40 @@
+#  1  0016A058..0016A13C     57 insns  32755392 steps   3.898%   0 calls (0 to selected)
+0x0016A058 0x0016A13C
+#  2  0016376C..00163948    119 insns  31456292 steps   3.743%   0 calls (0 to selected)
+0x0016376C 0x00163948
+#  3  0014A93C..0014A9A8     27 insns  15522267 steps   1.847%   0 calls (0 to selected)
+0x0014A93C 0x0014A9A8
+#  4  003028A0..003028EC     19 insns  9324188 steps   1.110%   0 calls (0 to selected)
+0x003028A0 0x003028EC
+#  5  00498D20..004990B0    228 insns  7708413 steps   0.917%   0 calls (0 to selected)
+0x00498D20 0x004990B0
+#  6  0049A5A8..0049A6F0     82 insns  4845815 steps   0.577%   0 calls (0 to selected)
+0x0049A5A8 0x0049A6F0
+#  7  00381288..003812C8     16 insns  3803776 steps   0.453%   0 calls (0 to selected)
+0x00381288 0x003812C8
+#  8  00130B4C..00130DD0    161 insns  3779052 steps   0.450%   0 calls (0 to selected)
+0x00130B4C 0x00130DD0
+#  9  0012C27C..0012C2B8     15 insns  3696870 steps   0.440%   0 calls (0 to selected)
+0x0012C27C 0x0012C2B8
+# 10  0014C9CC..0014C9D8      3 insns  3469035 steps   0.413%   0 calls (0 to selected)
+0x0014C9CC 0x0014C9D8
+# 11  0014CA70..0014CA7C      3 insns  3469035 steps   0.413%   0 calls (0 to selected)
+0x0014CA70 0x0014CA7C
+# 12  0049A70C..0049A848     79 insns  3402779 steps   0.405%   0 calls (0 to selected)
+0x0049A70C 0x0049A848
+# 13  0049A868..0049A9A4     79 insns  3391946 steps   0.404%   0 calls (0 to selected)
+0x0049A868 0x0049A9A4
+# 14  0012C2B8..0012C2F4     15 insns  2872926 steps   0.342%   0 calls (0 to selected)
+0x0012C2B8 0x0012C2F4
+# 15  00493114..00493224     68 insns  2660772 steps   0.317%   0 calls (0 to selected)
+0x00493114 0x00493224
+# 16  003BDBF4..003BDCCC     54 insns  2242188 steps   0.267%   0 calls (0 to selected)
+0x003BDBF4 0x003BDCCC
+# 17  00493224..004932C0     39 insns  2117973 steps   0.252%   0 calls (0 to selected)
+0x00493224 0x004932C0
+# 18  002FDA20..002FDA64     17 insns  1876256 steps   0.223%   0 calls (0 to selected)
+0x002FDA20 0x002FDA64
+# 19  0015786C..00157904     38 insns  1821991 steps   0.217%   8 calls (1 to selected)
+0x0015786C 0x00157904
+# 20  001578E4..00157904      8 insns  1821991 steps   0.217%   0 calls (0 to selected)
+0x001578E4 0x00157904

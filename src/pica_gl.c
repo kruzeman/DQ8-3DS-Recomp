@@ -42,7 +42,7 @@ typedef struct {
        e.g. the intro movie's quads landed on u=1.0 (black texture padding)
        and rendered black.  Keep the field; a _Static_assert in pica_vs.c
        guards the layout. */
-    float x, y, iw, zw, color[4], u, v, cx, cy, cz, cw;
+    float x, y, iw, zw, color[4], u, v, u1, v1, cx, cy, cz, cw;
 } PicaGlVertex; /* layout-compatible with the software path's PicaVertex */
 
 /* VBO payload (t_bc6b4eb7): ONE record per TRIANGLE, read by all 3 rendered
@@ -50,14 +50,15 @@ typedef struct {
    input of the fragment shader receives the full triangle exactly like the
    old layout where each vertex carried a 3x-expanded copy (38 floats =
    152 B/vertex -> 456 B/triangle).  Only the varyings the shader consumes
-   are kept: gNc needs (u, v) only — the old vec4 carried two always-zero
-   padding floats.  120 B/triangle, written once, uploaded once. */
+   are kept: gNc carries (u, v) for texture unit 0 and (u1, v1) for unit 1 —
+   the old vec4 carried two always-zero padding floats.  144 B/triangle,
+   written once, uploaded once. */
 typedef struct {
     float a[3][4]; /* gNa: (x, y, iw, zw) of triangle vertex 0/1/2 */
     float b[3][4]; /* gNb: color[4] of triangle vertex 0/1/2 */
-    float c[3][2]; /* gNc: (u, v) of triangle vertex 0/1/2 */
+    float c[3][4]; /* gNc: (u, v, u1, v1) of triangle vertex 0/1/2 */
 } PicaGlTriPayload;
-_Static_assert(sizeof(PicaGlTriPayload) == 120, "payload layout");
+_Static_assert(sizeof(PicaGlTriPayload) == 144, "payload layout");
 _Static_assert(offsetof(PicaGlTriPayload, b) == 48 &&
                offsetof(PicaGlTriPayload, c) == 96, "payload field offsets");
 
@@ -109,6 +110,33 @@ typedef struct {
        NEAREST-filtered staged texture, so u,v may leave [0,1] there
        (t_77ac52ce); mode 1 (border colour) still runs in software. */
     unsigned wrap_s, wrap_t;
+    /* t_dd830a74 item 2: texture unit 0 is the CURRENT render target sampled
+       at the internal scale.  tex_rgba is NULL and the draw binds
+       pgl_snap_tex (a full-resolution copy of the scaled backing) instead of
+       the staged native image; normalised UVs need no change. */
+    int tex_is_rt;
+    /* t_c043d7f7: guest texture filter bits (PARAM register 0x83):
+       bit1 mag_filter, bit2 min_filter, bit24 mip_filter (0=nearest,
+       1=linear) and the LOD word (0x84: bias bits 0-12, max_level 16-19,
+       min_level 24-27).  The GL path applies mag/min to the sampler; mip
+       levels are not uploaded (see pgl_tex_filter_apply), so a mip_filter
+       request degrades to bilinear instead of sampling an incomplete
+       texture (which would be black). */
+    unsigned mag_filter, min_filter, mip_filter;
+    unsigned lod_word;
+    /* t_e216fc37: texture unit 1 (TEV source 4).  Only filled in when the
+       TEV chain of this draw actually reads source 4 AND unit 1 is enabled
+       (GPUREG 0x80 bit 1); the staged image comes from pica_vs.c's unit-1
+       staging cache, which keys on the unit-1 registers
+       0x91/0x92/0x93/0x95/0x96.  tex1_gen/tex1_slot are the same
+       (slot,generation) identity the unit-0 upload cache uses. */
+    int tex1_en;
+    const unsigned char *tex1_rgba;
+    int tex1_w, tex1_h;
+    unsigned tex1_hash, tex1_slot;
+    unsigned long long tex1_gen;
+    unsigned wrap_s1, wrap_t1;
+    unsigned mag_filter1, min_filter1, mip_filter1;
     PicaTev tev;                 /* PICA_GL_TEV */
     /* Depth test/write (mirrors pica_depth_test_write/pica_fragment_depth):
        the fragment shader computes z/w interpolation exactly like the
@@ -170,6 +198,8 @@ static unsigned long long pica_pqt_now_ns(void) {
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
+#include <unistd.h>
+#include <sys/syscall.h>   /* FREEZE WATCHDOG (t_4371e6ea): hold owner tid */
 
 /* Mesa's surfaceless platform; not in the core egl.h on all distros. */
 #ifndef EGL_PLATFORM_SURFACELESS_MESA
@@ -189,6 +219,8 @@ typedef long PGsizeiptr;
 typedef unsigned char PGubyte;
 
 #define PGGL_COLOR_BUFFER_BIT     0x00004000u
+#define PGGL_READ_FRAMEBUFFER     0x8CA8u
+#define PGGL_DRAW_FRAMEBUFFER     0x8CA9u
 #define PGGL_TRIANGLES            0x0004u
 #define PGGL_UNSIGNED_BYTE        0x1401u
 #define PGGL_FLOAT                0x1406u
@@ -199,9 +231,11 @@ typedef unsigned char PGubyte;
 #define PGGL_TEXTURE0             0x84C0u
 #define PGGL_TEXTURE1             0x84C1u
 #define PGGL_TEXTURE2             0x84C2u
+#define PGGL_TEXTURE3             0x84C3u
 #define PGGL_TEXTURE_MIN_FILTER   0x2801u
 #define PGGL_TEXTURE_MAG_FILTER   0x2800u
 #define PGGL_NEAREST              0x2600u
+#define PGGL_LINEAR               0x2601u
 #define PGGL_TEXTURE_WRAP_S       0x2802u
 #define PGGL_TEXTURE_WRAP_T       0x2803u
 #define PGGL_CLAMP_TO_EDGE        0x812Fu
@@ -317,6 +351,7 @@ typedef void (*PFN_glBindTexture)(PGenum, PGuint);
 typedef void (*PFN_glTexImage2D)(PGenum, PGint, PGint, PGsizei, PGsizei, PGint, PGenum, PGenum, const void *);
 typedef void (*PFN_glTexSubImage2D)(PGenum, PGint, PGint, PGint, PGsizei, PGsizei, PGenum, PGenum, const void *);
 typedef void (*PFN_glCopyTexSubImage2D)(PGenum, PGint, PGint, PGint, PGint, PGint, PGsizei, PGsizei);
+typedef void (*PFN_glBlitFramebuffer)(PGint, PGint, PGint, PGint, PGint, PGint, PGint, PGint, unsigned, PGenum);
 typedef void (*PFN_glTexParameteri)(PGenum, PGenum, PGint);
 typedef void (*PFN_glActiveTexture)(PGenum);
 typedef void (*PFN_glDeleteTextures)(PGsizei, const PGuint *);
@@ -418,6 +453,7 @@ PGL_FN(glBindTexture);
 PGL_FN(glTexImage2D);
 PGL_FN(glTexSubImage2D);
 PGL_FN(glCopyTexSubImage2D);
+PGL_FN(glBlitFramebuffer);   /* t_dd830a74: soft-loaded, scaled-sample snapshot */
 PGL_FN(glTexParameteri);
 PGL_FN(glActiveTexture);
 PGL_FN(glDeleteTextures);
@@ -482,10 +518,341 @@ static int pgl_depth_test_applied = -1;   /* -1 unknown, 0 off, 1 on */
 static unsigned pgl_depth_func_applied;   /* GL enum, valid when 1 */
 static int pgl_depth_mask_applied = -1;
 static int pgl_rt_w, pgl_rt_h;
+/* ---- t_ab8159de: INTERNAL RENDER SCALE (DQ8_RENDER_SCALE=1..4) -----------
+   The render target, its depth mirror and the real depth attachment are
+   allocated at pgl_rt_w*f x pgl_rt_h*f and the fragment shader rasterises f*f
+   samples per guest pixel; the write-back box-averages them back to one
+   native texel per guest pixel.  pgl_rt_w/pgl_rt_h therefore keep their old
+   meaning — GUEST pixels — and every guest-space box (draw bounds, refresh
+   blocks, write-back boxes, pgl_shadow dims) is unchanged.  Everything that
+   is handed to GL (texture sizes, viewport, read-back windows, FBO copy
+   rectangles) goes through pgl_tgt_w/h and PGL_S() and is multiplied.
+   At scale 1 every expression below collapses to the previous code. */
+static int pgl_scale = 1;          /* DQ8_RENDER_SCALE: MAXIMUM internal scale, 1..4 */
+static int pgl_cur_scale = 1;      /* scale the attached FBO was actually built at */
+static int pgl_scale_init_done;
+static int pgl_tgt_w, pgl_tgt_h;   /* GL target dims = guest * pgl_cur_scale */
+static int pgl_rt_scale;           /* scale of the first ever FBO build (-1: none) */
+#define PGL_S(v) ((v) * pgl_cur_scale)
+static int pgl_scale_value(void) {
+    if (!pgl_scale_init_done) {
+        const char *e;
+        pgl_scale_init_done = 1;
+        e = getenv("DQ8_RENDER_SCALE");
+        if (e && e[0]) {
+            int v = atoi(e);
+            if (v >= 1 && v <= 4) pgl_scale = v;
+            else fprintf(stderr, "GL backend: DQ8_RENDER_SCALE=%s out of range "
+                                 "(1..4) — using 1\n", e);
+        }
+    }
+    return pgl_scale;
+}
+
+/* ---- t_dd830a74: AZAHAR SURFACE MODEL (DQ8_RENDER_SCALE_SAMPLED) ---------
+   Azahar backs every surface at `res_scale` and keeps a native copy only for
+   the guest-memory boundary (gl_texture_runtime.cpp:354-380, 436-505).  The
+   consequence is that "the guest samples this target" is NOT a reason to
+   render it native: the sample is taken from the scaled backing, and the only
+   downsample in the whole pipeline is the download into guest RAM.
+
+   This switch reproduces that rule.  Default ON (=1).  DQ8_RENDER_SCALE_SAMPLED=0
+   restores the stage-A behaviour byte for byte (a target the guest samples is
+   demoted to native for the rest of the run), which is the A/B reference. */
+static int pgl_scale_sampled_gate = -1;
+static int pgl_scale_sampled(void) {
+    if (pgl_scale_sampled_gate < 0) {
+        const char *e = getenv("DQ8_RENDER_SCALE_SAMPLED");
+        pgl_scale_sampled_gate = (e && e[0] == '0' && !e[1]) ? 0 : 1;
+    }
+    return pgl_scale_sampled_gate;
+}
+
+/* ================= STAGE A TARGET GATING (t_05281b89) =====================
+   A target is rendered at the internal scale only while NOTHING needs its
+   pixels at native resolution inside the episode.  The one consumer that
+   forces a target native in this stage is the guest sampling the target's
+   memory as a TEXTURE (fb-fetch): pica_vs.c's staging path detects the
+   overlap (pica_gl_pending() + region test at the texture staging sites),
+   publishes the episode and then reads the texels from guest memory.  From
+   that moment the same target must keep rendering natively, otherwise a
+   later draw would blend into supersampled content the guest never saw —
+   exactly the "no mixing" rule.
+
+   Everything else the guest does with a target is a PUBLISH, and a publish
+   is the down-sample point of this stage: the write-back hands guest memory
+   one box-filtered native texel per guest pixel, so scan-out, display
+   transfers, DMA, Y2R and host captures all keep operating on native-size
+   data by construction.  A publish does not, by itself, take the target out
+   of the scaled set — scale + down-sample reproduces the native image up to
+   the filter, which is exactly what stage A promises.
+
+   The marks are keyed on the guest target DIMENSIONS, not the address: two
+   targets with the same size in one frame are unusual, and marking both
+   native is the conservative direction (never incorrect). */
+#define PGL_NATIVE_MAX 8
+static struct { int w, h; } pgl_native_tgt[PGL_NATIVE_MAX];
+static int pgl_native_n;
+static unsigned long long pgl_gate_marks;   /* targets forced native, cumulative */
+static unsigned long long pgl_texread_events; /* guest texture reads of a target */
+static unsigned long long pgl_sampled_kept;   /* reads served without demoting */
+/* t_dd830a74 item 2: unit-0 samples of a target served from the scaled
+   backing (pica_gl_sample_scaled_target) and the cases that fell back to the
+   native staged image. */
+static unsigned long long pgl_snap_taken, pgl_snap_fallback;
+/* t_fdd26eba item A: display transfers served at the internal scale, and the
+   ones that had to keep the native path (with the reason counters). */
+static unsigned long long pgl_tr_taken, pgl_tr_fallback, pgl_tr_ns;
+static unsigned long long pgl_tr_fallback_mem, pgl_tr_fallback_gate;
+/* t_fdd26eba item A: the identity of the target whose (scaled) content the
+   attachment still holds AFTER the last publish.  The display transfer runs
+   after the guest already consumed the frame (the episode is flushed), so the
+   transfer has to be served from the *last published* episode, not only from
+   a pending one: the attachment keeps that content until another draw touches
+   it, which pgl_draws detects. */
+static int pgl_cap_valid;
+static uint32_t pgl_cap_addr;
+static int pgl_cap_w, pgl_cap_h, pgl_cap_f;
+static unsigned long long pgl_cap_draws, pgl_cap_flushes;
+static int pgl_keep_marks;          /* the next flush is a guest texture read */
+static unsigned long long pgl_flushseq;       /* publishes (flushes) so far */
+
+/* Guest-space coverage accounting (stage A item 5).  A coarse cell grid over
+   the frame's LARGEST target — in DQ8's field frame that is the 512x400
+   presentation target every 3D+UI draw renders into, so the grid answers
+   "how much of the top screen was drawn at the scaled size".  Cells are 8x8
+   guest pixels: bit0 = touched by a scaled draw, bit1 = by a native one.
+   Bounding boxes, not exact rasterisation — the GL path never sees the
+   covered pixels on the CPU — so a draw's whole box counts as covered
+   (documented in the report).  The grid is NOT cleared during the run: each
+   cell keeps its LAST touch, so the report answers "of the pixels the final
+   frame shows, how many were produced by a scaled draw". */
+#define PGL_COV_CELL 8
+#define PGL_COV_MAXW 128
+static unsigned char *pgl_cov;
+static int pgl_cov_w, pgl_cov_h;    /* cells across/down */
+static int pgl_cov_gw, pgl_cov_gh;  /* guest dims the grid describes */
+static unsigned long long pgl_cov_draws_scaled, pgl_cov_draws_native;
+static unsigned long long pgl_cov_px_scaled, pgl_cov_px_native;
+/* Per-target draw tally: which target rendered at which scale, and how many
+   draws it took.  This is the "share of draws" half of the coverage answer. */
+#define PGL_TGTSTAT_MAX 8
+static struct { int w, h, scale; unsigned long long draws, native; } pgl_tgtstat[PGL_TGTSTAT_MAX];
+static int pgl_tgtstat_n;
+
+static void pgl_tgtstat_add(int w, int h, int scale) {
+    int i;
+    for (i = 0; i < pgl_tgtstat_n; ++i)
+        if (pgl_tgtstat[i].w == w && pgl_tgtstat[i].h == h) break;
+    if (i == pgl_tgtstat_n) {
+        if (pgl_tgtstat_n >= PGL_TGTSTAT_MAX) return;
+        pgl_tgtstat[i].w = w;
+        pgl_tgtstat[i].h = h;
+        pgl_tgtstat[i].draws = 0;
+        ++pgl_tgtstat_n;
+    }
+    pgl_tgtstat[i].scale = scale;
+    ++pgl_tgtstat[i].draws;
+    if (scale <= 1) ++pgl_tgtstat[i].native;
+}
+
+static int pgl_target_native(int w, int h) {
+    int i;
+    for (i = 0; i < pgl_native_n; ++i)
+        if (pgl_native_tgt[i].w == w && pgl_native_tgt[i].h == h) return 1;
+    return 0;
+}
+
+/* Called by pica_vs.c right before it publishes the episode to sample the
+   target as a texture: this target must render natively from now on.  The
+   mark is STICKY FOR THE RUN (conservative by design: once the guest has
+   depended on a target's native pixels, that size never renders scaled again
+   in this session; a run that wants the scale back is restarted). */
+void pica_gl_note_target_sampled(unsigned w, unsigned h) {
+    if (pgl_scale_value() <= 1) return;
+    ++pgl_texread_events;
+    /* The flush that follows this call must not clear the mark: it is the
+       publish the guest is about to sample from. */
+    pgl_keep_marks = 1;
+    if (pgl_scale_sampled()) {
+        /* t_dd830a74 (Azahar surface model): the surface KEEPS its scaled
+           backing.  The guest's sample is served either from the scaled
+           texture (pica_gl_snapshot_target / pgl_snap_tex, item 2) or, when
+           that path does not apply, from the box-filtered download the caller
+           is about to perform (item 3).  Either way the target is never
+           demoted to native, so a "sampled => NATIVE from now on" line can
+           never be printed again. */
+        ++pgl_sampled_kept;
+        if (pgl_texread_events <= 8u || (pgl_texread_events % 100u) == 0u)
+            fprintf(stderr, "GL backend: render scale: guest texture read #%llu "
+                            "of the current target %ux%u (after %llu publishes) "
+                            "— target STAYS x%d, sampled from the scaled backing\n",
+                    pgl_texread_events, w, h, pgl_flushseq, pgl_scale_value());
+        return;
+    }
+    if (pgl_texread_events <= 8u || (pgl_texread_events % 100u) == 0u)
+        fprintf(stderr, "GL backend: render scale: guest texture read #%llu of "
+                        "the current target %ux%u (after %llu publishes)\n",
+                pgl_texread_events, w, h, pgl_flushseq);
+    if (pgl_target_native((int)w, (int)h)) return;
+    if (pgl_native_n < PGL_NATIVE_MAX) {
+        pgl_native_tgt[pgl_native_n].w = (int)w;
+        pgl_native_tgt[pgl_native_n].h = (int)h;
+        ++pgl_native_n;
+        ++pgl_gate_marks;
+        fprintf(stderr, "GL backend: render scale: target %ux%u is sampled as a "
+                        "texture by the guest — rendering it NATIVE from now on "
+                        "(mark #%d, stage B territory)\n",
+                w, h, pgl_native_n);
+    }
+}
+
+/* The scale the FBO for a guest target of this size must be built at.
+   t_dd830a74: with the Azahar surface model the answer is ALWAYS f — a target
+   is never demoted because the guest samples it.  The stage-A demotion stays
+   reachable through DQ8_RENDER_SCALE_SAMPLED=0 for A/B runs only. */
+static int pgl_scale_for(int w, int h) {
+    int f = pgl_scale_value();
+    if (f <= 1) return 1;
+    if (pgl_scale_sampled()) return f;
+    return pgl_target_native(w, h) ? 1 : f;
+}
+
+/* One line per SURFACE (guest w,h) the first time it is created with a scaled
+   backing, so a log shows what is scaled without one line per FBO rebuild. */
+#define PGL_SURF_MAX 12
+static struct { int w, h, f; } pgl_surf_seen[PGL_SURF_MAX];
+static int pgl_surf_seen_n;
+static void pgl_surface_created_scaled(int w, int h, int f) {
+    int i;
+    if (f <= 1) return;
+    for (i = 0; i < pgl_surf_seen_n; ++i)
+        if (pgl_surf_seen[i].w == w && pgl_surf_seen[i].h == h &&
+            pgl_surf_seen[i].f == f)
+            return;
+    if (pgl_surf_seen_n >= PGL_SURF_MAX) return;
+    pgl_surf_seen[pgl_surf_seen_n].w = w;
+    pgl_surf_seen[pgl_surf_seen_n].h = h;
+    pgl_surf_seen[pgl_surf_seen_n].f = f;
+    ++pgl_surf_seen_n;
+    fprintf(stderr, "GL backend: render scale: surface %dx%d created scaled "
+                    "x%d (%dx%d colour backing + R32F depth mirror)\n",
+            w, h, f, w * f, h * f);
+}
+
+/* Point the coverage grid at a target of these guest dims (only if it is at
+   least as large as the one it describes — the presentation target wins). */
+static void pgl_cov_track(int gw, int gh) {
+    int cw, ch;
+    if (gw <= 0 || gh <= 0) return;
+    if (pgl_cov && gw * gh < pgl_cov_gw * pgl_cov_gh) return;
+    cw = (gw + PGL_COV_CELL - 1) / PGL_COV_CELL;
+    ch = (gh + PGL_COV_CELL - 1) / PGL_COV_CELL;
+    if (cw == pgl_cov_w && ch == pgl_cov_h && gw == pgl_cov_gw && gh == pgl_cov_gh)
+        return;                     /* same target: keep the tallies */
+    if (cw != pgl_cov_w || ch != pgl_cov_h) {
+        unsigned char *n = (unsigned char *)realloc(pgl_cov,
+                                                    (size_t)cw * (size_t)ch);
+        if (!n) return;
+        pgl_cov = n;
+        pgl_cov_w = cw;
+        pgl_cov_h = ch;
+    }
+    pgl_cov_gw = gw;
+    pgl_cov_gh = gh;
+    memset(pgl_cov, 0, (size_t)cw * (size_t)ch);
+}
+
+static void pgl_cov_mark(int gw, int gh, int x0, int y0, int x1, int y1,
+                         int scaled) {
+    unsigned char kind = scaled ? 1u : 2u;
+    int cx, cy;
+    if (!pgl_cov || pgl_cov_w <= 0 || pgl_cov_h <= 0) return;
+    if (gw != pgl_cov_gw || gh != pgl_cov_gh) return;   /* smaller target */
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > pgl_cov_w * PGL_COV_CELL - 1) x1 = pgl_cov_w * PGL_COV_CELL - 1;
+    if (y1 > pgl_cov_h * PGL_COV_CELL - 1) y1 = pgl_cov_h * PGL_COV_CELL - 1;
+    if (x1 < x0 || y1 < y0) return;
+    /* LAST touch wins: the reported share is "of the pixels the final frame
+       shows, how many were produced by a scaled draw". */
+    for (cy = y0 / PGL_COV_CELL; cy <= y1 / PGL_COV_CELL; ++cy)
+        for (cx = x0 / PGL_COV_CELL; cx <= x1 / PGL_COV_CELL; ++cx)
+            pgl_cov[cy * pgl_cov_w + cx] = kind;
+}
+
+static void pgl_cov_report(void) {
+    unsigned long long s = 0, nv = 0, t = 0;
+    int i, n;
+    if (!pgl_cov) return;
+    n = pgl_cov_w * pgl_cov_h;
+    for (i = 0; i < n; ++i) {
+        if (pgl_cov[i] == 1u) ++s;
+        else if (pgl_cov[i] == 2u) ++nv;
+        if (pgl_cov[i]) ++t;
+    }
+    fprintf(stderr, "GL backend: render scale coverage (target %dx%d guest, last "
+                    "touch over the run): %llu/%llu 8x8 cells last drawn at the "
+                    "scaled size (%llu.%01llu%%), %llu last drawn native "
+                    "(%llu.%01llu%%), %llu untouched\n",
+            pgl_cov_gw, pgl_cov_gh, s, (unsigned long long)n,
+            n ? s * 1000ull / (unsigned long long)n / 10ull : 0ull,
+            n ? s * 1000ull / (unsigned long long)n % 10ull : 0ull,
+            nv,
+            n ? nv * 1000ull / (unsigned long long)n / 10ull : 0ull,
+            n ? nv * 1000ull / (unsigned long long)n % 10ull : 0ull,
+            (unsigned long long)(n - t));
+    fprintf(stderr, "GL backend: render scale coverage (draws): scaled %llu, "
+                    "native %llu (%.2f%% of %llu scaled); box pixels scaled "
+                    "%llu, native %llu; targets forced native %d (marks %llu)\n",
+            pgl_cov_draws_scaled, pgl_cov_draws_native,
+            (pgl_cov_draws_scaled + pgl_cov_draws_native)
+                ? 100.0 * (double)pgl_cov_draws_scaled /
+                  (double)(pgl_cov_draws_scaled + pgl_cov_draws_native) : 100.0,
+            pgl_cov_draws_scaled + pgl_cov_draws_native,
+            pgl_cov_px_scaled, pgl_cov_px_native, pgl_native_n, pgl_gate_marks);
+    fprintf(stderr, "GL backend: render scale coverage (gating): guest texture "
+                    "reads of a render target %llu, targets forced native %d, "
+                    "reads served with the target kept scaled %llu (model=%s)\n",
+            pgl_texread_events, pgl_native_n, pgl_sampled_kept,
+            pgl_scale_sampled() ? "azahar-scaled" : "stage-A-demote");
+    fprintf(stderr, "GL backend: render scale coverage (scaled samples): "
+                    "unit-0 samples of the current target served from the "
+                    "scaled backing %llu, fallbacks to the native staged image "
+                    "%llu\n", pgl_snap_taken, pgl_snap_fallback);
+    if (getenv("DQ8_RS_COVMAP")) {
+        /* Which part of the target was last drawn at the scaled size:
+           '#' scaled, '.' native, ' ' untouched.  One char per 8x8 cell. */
+        int cy;
+        fprintf(stderr, "GL backend: render scale coverage map (%dx%d cells, "
+                        "'#'=scaled, '.'=native, ' '=untouched):\n",
+                pgl_cov_w, pgl_cov_h);
+        for (cy = 0; cy < pgl_cov_h; ++cy) {
+            char line[PGL_COV_MAXW + 3];
+            int cx, n2 = pgl_cov_w > PGL_COV_MAXW ? PGL_COV_MAXW : pgl_cov_w;
+            for (cx = 0; cx < n2; ++cx)
+                line[cx] = pgl_cov[cy * pgl_cov_w + cx] == 1u ? '#'
+                         : pgl_cov[cy * pgl_cov_w + cx] == 2u ? '.' : ' ';
+            line[n2] = 0;
+            fprintf(stderr, "GLCOVMAP %s\n", line);
+        }
+    }
+    {
+        int i;
+        for (i = 0; i < pgl_tgtstat_n; ++i)
+            fprintf(stderr, "GL backend: render scale coverage (target %dx%d): "
+                            "%llu draws, %llu of them at x%d, %llu native\n",
+                    pgl_tgtstat[i].w, pgl_tgtstat[i].h,
+                    pgl_tgtstat[i].draws,
+                    (unsigned long long)(pgl_tgtstat[i].draws - pgl_tgtstat[i].native),
+                    pgl_tgtstat[i].scale, pgl_tgtstat[i].native);
+    }
+}
 static PGint pgl_u_rt, pgl_u_mode, pgl_u_tex, pgl_u_alpha_test,
              pgl_u_alpha_func, pgl_u_alpha_ref, pgl_u_tex_en, pgl_u_dst,
+             pgl_u_tex1, pgl_u_tex1_en,
              pgl_u_dst_off, pgl_u_zdst, pgl_u_dst_used, pgl_u_zdst_used,
-             pgl_u_dstimg, pgl_u_zimg;
+             pgl_u_dstimg, pgl_u_zimg, pgl_u_iscale;
 static PGint pgl_u_src_c, pgl_u_mod_c, pgl_u_src_a, pgl_u_mod_a, pgl_u_cop,
              pgl_u_aop, pgl_u_scale_c, pgl_u_scale_a, pgl_u_const_c,
              pgl_u_buf_init, pgl_u_buf_upd_c, pgl_u_buf_upd_a;
@@ -565,6 +932,61 @@ static unsigned long long pgl_tex_hits, pgl_tex_misses;
 static unsigned long long pgl_tex_gen_hits;  /* (slot,gen) identity hits */
 static unsigned long long pgl_tex_subuploads; /* same-size re-spec via SubImage */
 
+/* t_e216fc37: staged-image upload cache for PICA TEXTURE UNIT 1 (TEV source 4).
+   One GL texture object per unit-1 staging slot (pica_vs.c's
+   pica_gl_stage_texture1), keyed on the same (slot, generation) identity: a
+   generation bump means the staged bytes changed and the image is re-uploaded
+   exactly once.  Unit 1 is sampled from GL texture unit 3 (0/1/2 are the
+   staged image, the blend source and the depth source). */
+#define PGL_TEX1_SLOTS 4
+typedef struct {
+    PGuint tex;
+    const unsigned char *ptr;
+    int w, h;
+    unsigned long long gen;   /* staging-slot generation of the uploaded image */
+    int used;
+} PglTex1Slot;
+static PglTex1Slot pgl_tex1[PGL_TEX1_SLOTS];
+static unsigned long long pgl_tex1_uploads;
+
+/* PICA wrap code -> GL sampler wrap enum (codes 0/2/3; anything else falls
+   back to CLAMP_TO_EDGE, which is what the unit-0 path does too). */
+static PGenum pgl_wrap_enum(unsigned w) {
+    if (w == 2u) return PGGL_REPEAT;
+    if (w == 3u) return PGGL_MIRRORED_REPEAT;
+    return PGGL_CLAMP_TO_EDGE;
+}
+
+/* t_c043d7f7: DQ8_TEX_FILTER (default on) gates texture filtering in BOTH
+   backends, so the before/after A/B uses one binary.  The GL sampler takes
+   the guest's mag/min bits.  Only level 0 is staged, so the min filter is
+   never a mipmap enum: a mip_filter=linear request (param bit24; 6 of 1442
+   draws in the reference scene) degrades to plain bilinear rather than
+   leaving the texture incomplete (which would sample black). */
+static int pgl_tex_filter_on = -1;
+static int pgl_tex_filter_enabled(void) {
+    if (pgl_tex_filter_on < 0) {
+        const char *e = getenv("DQ8_TEX_FILTER");
+        pgl_tex_filter_on = !(e && e[0] == '0');
+    }
+    return pgl_tex_filter_on;
+}
+static void pgl_tex_filter_apply(const PicaGlState *st, int unit1) {
+    PGint mag, minf;
+    if (!pgl_tex_filter_enabled()) {
+        mag = PGGL_NEAREST;
+        minf = PGGL_NEAREST;
+    } else if (unit1) {
+        mag = st->mag_filter1 ? PGGL_LINEAR : PGGL_NEAREST;
+        minf = st->min_filter1 ? PGGL_LINEAR : PGGL_NEAREST;
+    } else {
+        mag = st->mag_filter ? PGGL_LINEAR : PGGL_NEAREST;
+        minf = st->min_filter ? PGGL_LINEAR : PGGL_NEAREST;
+    }
+    pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_MAG_FILTER, mag);
+    pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_MIN_FILTER, minf);
+}
+
 /* ---- context hold (t_86b8f1f9) ------------------------------------------
    The pre-change wrapper displaced the foreign (SDL) context around EVERY
    draw — 2 eglMakeCurrent per hardware draw (displacements == draws).  When
@@ -578,6 +1000,19 @@ static int pgl_hold_on = 1;
 static int pgl_hold_active;
 static PglSavedCtx pgl_held;
 static unsigned long long pgl_hold_releases, pgl_hold_mid;
+/* FREEZE WATCHDOG (t_4371e6ea): which host thread owns the active hold.  A
+   freeze while the hold is set means our GL context was left current while
+   the owner blocked inside a GL/EGL call; the dump prints this tid so the
+   backtrace can be matched to it.  Plain long writes, read only for display. */
+static long pgl_hold_owner_tid;
+static int pica_gl_hold_state(const void **owner, unsigned long long *releases,
+                              unsigned long long *mid) {
+    if (owner) *owner = pgl_hold_active ? pgl_thread_id : NULL;
+    if (releases) *releases = pgl_hold_releases;
+    if (mid) *mid = pgl_hold_mid;
+    return pgl_hold_active;
+}
+static long pica_gl_hold_tid(void) { return pgl_hold_owner_tid; }
 
 /* ---- batched readback state (see docs/ogl-backend.md) ------------------
    The FBO holds the render target across draws ("episode").  pgl_shadow is
@@ -779,7 +1214,7 @@ static void pgl_depth_attachment_clear(float v) {
         pgl_glCheckFramebufferStatus(PGGL_FRAMEBUFFER) == PGGL_FRAMEBUFFER_COMPLETE) {
         float got = -1.0f;
         ++pgl_dclear_checks;
-        pgl_glReadPixels(pgl_rt_w / 2, pgl_rt_h / 2, 1, 1, PGGL_DEPTH_COMPONENT,
+        pgl_glReadPixels(pgl_tgt_w / 2, pgl_tgt_h / 2, 1, 1, PGGL_DEPTH_COMPONENT,
                          PGGL_FLOAT, &got);
         if (pgl_drain_errors("dc-clear-check", NULL) == 0 &&
             (got < v - 1e-3f || got > v + 1e-3f)) {
@@ -788,7 +1223,7 @@ static void pgl_depth_attachment_clear(float v) {
                             "(%d,%d): cleared to %.8f, reads %.8f (check #%u) — "
                             "the depth attachment is stale, every fragment will "
                             "fail the depth test\n",
-                    pgl_rt_w / 2, pgl_rt_h / 2, (double)v, (double)got,
+                    pgl_tgt_w / 2, pgl_tgt_h / 2, (double)v, (double)got,
                     pgl_dclear_checks);
             pgl_depth_fallback("the depth attachment clear did not take effect");
         }
@@ -975,6 +1410,14 @@ static unsigned long long pgl_tp_n, pgl_tp_rel_ns, pgl_tp_take_ns, pgl_tp_lock_n
 static int pgl_wb_fast_on = -1;
 static int pgl_wb_verify;
 static unsigned long long pgl_wb_fast;
+
+/* t_dd830a74 item 3: the ONE downsample of the whole pipeline is the download
+   into guest RAM (pica_vs.c pica_gl_flush_guest_rt -> pica_gl_flush: GL
+   submit + glReadPixels of the f x f block + box filter + guest write).  It is
+   inside gl_ms, so these counters exist to report it on its own instead of
+   assuming a share.  Accumulated by the flush, printed once at shutdown. */
+static unsigned long long pgl_dl_ns, pgl_dl_calls;
+
 /* t_8c05fac8: dst vs zdst copy split + copy counts (which side drains). */
 static unsigned long long pgl_ph_dst_ns, pgl_ph_zdst_ns;
 /* t_8c05fac8 round 2: draw_ms sub-split (uniforms+tex / vbo+attribs / submit). */
@@ -1298,6 +1741,8 @@ static const char pgl_fs_src[] =
     "#version 330 core\n"
     "flat in vec4 g0a, g0b, g0c, g1a, g1b, g1c, g2a, g2b, g2c;\n"
     "uniform sampler2D u_tex;\n"
+    "uniform sampler2D u_tex1;\n"
+    "uniform int u_tex1_en;\n"
     "uniform sampler2D u_dst;\n"
     "uniform sampler2D u_zdst;\n"
     "uniform int u_dst_used;\n"
@@ -1311,6 +1756,7 @@ static const char pgl_fs_src[] =
     "uniform int u_mode;\n"        /* 0 = passthrough (solid), 1 = full TEV */
     "uniform int u_tex_en;\n"
     "uniform vec2 u_dst_off;\n"
+    "uniform float u_iscale;\n"      /* t_ab8159de: 1/internal render scale */
     "uniform int u_alpha_test;\n"
     "uniform int u_alpha_func;\n"
     "uniform float u_alpha_ref;\n"
@@ -1353,9 +1799,10 @@ static const char pgl_fs_src[] =
     "vec2 sat(vec2 v) { return clamp(v, 0.0, 1.0); }\n"
     "vec3 sat(vec3 v) { return clamp(v, 0.0, 1.0); }\n"
     "vec4 sat(vec4 v) { return clamp(v, 0.0, 1.0); }\n"
-    "vec4 sel_src(int s, vec4 prim, vec4 tex, vec4 prev, vec4 buf, vec4 cst) {\n"
+    "vec4 sel_src(int s, vec4 prim, vec4 tex, vec4 tex1, vec4 prev, vec4 buf, vec4 cst) {\n"
     "    if (s == 0) return prim;\n"
     "    if (s == 3) return tex;\n"
+    "    if (s == 4) return tex1;\n"
     "    if (s == 13) return buf;\n"
     "    if (s == 14) return cst;\n"
     "    if (s == 15) return prev;\n"
@@ -1383,7 +1830,7 @@ static const char pgl_fs_src[] =
     "    if (op == 9) return min(a + b, 1.0) * c;\n"
     "    return 0.0;\n"
     "}\n"
-    "vec4 run_tev(vec4 prim, vec4 tex) {\n"
+    "vec4 run_tev(vec4 prim, vec4 tex, vec4 tex1) {\n"
     "    vec4 previous = prim;\n"
     "    vec4 buffer = u_buf_init;\n"
     "    vec4 pending = buffer;\n"
@@ -1392,9 +1839,9 @@ static const char pgl_fs_src[] =
     "        vec3 col[3];\n"
     "        float alpha[3];\n"
     "        for (int i = 0; i < 3; ++i) {\n"
-    "            vec4 v = sel_src(u_src_c[s*3+i], prim, tex, previous, buffer, cst);\n"
+    "            vec4 v = sel_src(u_src_c[s*3+i], prim, tex, tex1, previous, buffer, cst);\n"
     "            col[i] = mod_color(u_mod_c[s*3+i], v);\n"
-    "            v = sel_src(u_src_a[s*3+i], prim, tex, previous, buffer, cst);\n"
+    "            v = sel_src(u_src_a[s*3+i], prim, tex, tex1, previous, buffer, cst);\n"
     "            alpha[i] = mod_alpha(u_mod_a[s*3+i], v);\n"
     "        }\n"
     "        int cop = u_cop[s];\n"
@@ -1446,7 +1893,8 @@ static const char pgl_fs_src[] =
     "    return flip ? -e : e;\n"
     "}\n"
     "void main() {\n"
-    "    vec2 px = gl_FragCoord.xy;\n" /* (x+0.5, y+0.5), same as software */
+    "    vec2 pxs = gl_FragCoord.xy;\n"   /* supersampled target coords */
+    "    vec2 px = pxs * u_iscale;\n"     /* guest-space subpixel coords */ /* (x+0.5, y+0.5), same as software */
     /* Interpolation with the software rasterizer's exact expressions
        (pica_raster_triangle: canonical shared edges, perspective-correct
        color/uv weights, LINEAR z/w and 1/w for depth). */
@@ -1472,7 +1920,12 @@ static const char pgl_fs_src[] =
     "    float tu = w0 * g0c[0] + w1 * g1c[0] + w2 * g2c[0];\n"
     "    float tv = w0 * g0c[1] + w1 * g1c[1] + w2 * g2c[1];\n"
     "    vec4 texel = (u_tex_en != 0) ? texture(u_tex, vec2(tu, tv)) : vec4(0.0);\n"
-    "    vec4 source = (u_mode == 1) ? run_tev(prim, texel) : clamp(g0b, 0.0, 1.0);\n"
+    /* t_e216fc37: texture unit 1 (TEV source 4) uses texcoord1, same
+       perspective-correct weights as texcoord0. */
+    "    float tu1 = w0 * g0c[2] + w1 * g1c[2] + w2 * g2c[2];\n"
+    "    float tv1 = w0 * g0c[3] + w1 * g1c[3] + w2 * g2c[3];\n"
+    "    vec4 texel1 = (u_tex1_en != 0) ? texture(u_tex1, vec2(tu1, tv1)) : vec4(0.0);\n"
+    "    vec4 source = (u_mode == 1) ? run_tev(prim, texel, texel1) : clamp(g0b, 0.0, 1.0);\n"
     "    if (u_alpha_test != 0) {\n"
     "        float a = floor(source[3] * 255.0 + 0.5);\n"
     "        bool pass = false;\n"
@@ -1511,9 +1964,9 @@ static const char pgl_fs_src[] =
     "            float oldz;\n"
     "            if (u_zdst_used != 0) {\n"
     "#if DQ8_FBFETCH\n"
-    "                oldz = imageLoad(u_zimg, ivec2(px)).r;\n"
+    "                oldz = imageLoad(u_zimg, ivec2(pxs)).r;\n"
     "#else\n"
-    "                oldz = texelFetch(u_zdst, ivec2(px) - ivec2(u_dst_off), 0).r;\n"
+    "                oldz = texelFetch(u_zdst, ivec2(pxs) - ivec2(u_dst_off), 0).r;\n"
     "#endif\n"
     "            } else { oldz = 0.0; }\n"
     "            if (u_depth_test != 0) {\n"
@@ -1541,9 +1994,9 @@ static const char pgl_fs_src[] =
     "    vec4 value = source;\n"
     "    if (u_blend_en != 0) {\n"
     "#if DQ8_FBFETCH\n"
-    "        vec4 dest = (u_dst_used != 0) ? imageLoad(u_dstimg, ivec2(px)) : vec4(0.0);\n"
+    "        vec4 dest = (u_dst_used != 0) ? imageLoad(u_dstimg, ivec2(pxs)) : vec4(0.0);\n"
     "#else\n"
-    "        vec4 dest = (u_dst_used != 0) ? texelFetch(u_dst, ivec2(px) - ivec2(u_dst_off), 0) : vec4(0.0);\n"
+    "        vec4 dest = (u_dst_used != 0) ? texelFetch(u_dst, ivec2(pxs) - ivec2(u_dst_off), 0) : vec4(0.0);\n"
     "#endif\n"
     "        for (int k = 0; k < 4; ++k) {\n"
     "            int eq = (k == 3) ? u_eq_a : u_eq_rgb;\n"
@@ -1607,6 +2060,10 @@ static int pgl_load(PicaGlGetProc getproc) {
     PGL_LOAD(glTexImage2D);
     PGL_LOAD(glTexSubImage2D);
     PGL_LOAD(glCopyTexSubImage2D);
+    pgl_glBlitFramebuffer = (PFN_glBlitFramebuffer)getproc("glBlitFramebuffer");
+    if (!pgl_glBlitFramebuffer)
+        fprintf(stderr, "GL backend: glBlitFramebuffer unavailable — a sampled "
+                        "target falls back to the native staged image\n");
     PGL_LOAD(glTexParameteri);
     PGL_LOAD(glActiveTexture);
     PGL_LOAD(glDeleteTextures);
@@ -1774,6 +2231,7 @@ static void pgl_src_str(char *dst, size_t n, int src, int s) {
     switch (src) {
     case 0:  snprintf(dst, n, "prim"); break;
     case 3:  snprintf(dst, n, "texel"); break;
+    case 4:  snprintf(dst, n, "texel1"); break;
     case 13: snprintf(dst, n, "buffer"); break;
     case 14: snprintf(dst, n, "u_const_c[%d]", s); break;
     case 15: snprintf(dst, n, "previous"); break;
@@ -1898,6 +2356,8 @@ static unsigned long long pgl_spec_key(const PicaGlState *st, int gl_blend,
     /* t_d8e5ab8c x t_5ddc492f: the depth path is baked into the generated
        source, so the two variants must never share a cache entry. */
     h = pgl_key_u(h, pgl_depth_hw ? 1u : 0u);
+    /* t_ab8159de: u_iscale is a uniform (1/scale), so the generated source does
+       NOT depend on the scale and one program serves every target. */
     return h ? h : 1ull;   /* 0 is reserved for the generic program */
 }
 
@@ -1910,6 +2370,7 @@ static char *pgl_spec_src(const PicaGlState *st, int gl_blend, int dst_used,
     int tex_en = tev && t->tex_en;
     int blend_en = (!gl_blend && st->blend) ? 1 : 0;
     int need_texel = 0, need_buffer = 0, need_const = 0, need_bconst = 0;
+    int need_tex1 = 0;
     int depth_on = st->depth_on;
     int use_dst = blend_en && dst_used;
     int use_zdst = depth_on && zdst_used;
@@ -1921,6 +2382,7 @@ static char *pgl_spec_src(const PicaGlState *st, int gl_blend, int dst_used,
         for (i = 0; i < 18; ++i) {
             unsigned sc = t->src_c[i] & 15u, sa = t->src_a[i] & 15u;
             if (sc == 3u || sa == 3u) need_texel = 1;
+            if (sc == 4u || sa == 4u) need_tex1 = 1;
             if (sc == 13u || sa == 13u) need_buffer = 1;
             if (sc == 14u || sa == 14u) need_const = 1;
         }
@@ -1937,7 +2399,10 @@ static char *pgl_spec_src(const PicaGlState *st, int gl_blend, int dst_used,
     if (pgl_fbfetch && (use_dst || use_zdst))
         pgl_sb_add(&sb, "#extension GL_ARB_shader_image_load_store : require\n");
     pgl_sb_add(&sb, "flat in vec4 g0a, g0b, g0c, g1a, g1b, g1c, g2a, g2b, g2c;\n");
+    pgl_sb_add(&sb, "uniform float u_iscale;\n");
     if (tex_en) pgl_sb_add(&sb, "uniform sampler2D u_tex;\n");
+    if (need_tex1)
+        pgl_sb_add(&sb, "uniform sampler2D u_tex1;\nuniform int u_tex1_en;\n");
     if (pgl_fbfetch) {
         if (use_dst)
             pgl_sb_add(&sb, "layout(rgba8) uniform readonly image2D u_dstimg;\n");
@@ -1970,7 +2435,8 @@ static char *pgl_spec_src(const PicaGlState *st, int gl_blend, int dst_used,
                     "    return flip ? -e : e;\n"
                     "}\n");
     pgl_sb_add(&sb, "void main() {\n");
-    pgl_sb_add(&sb, "    vec2 px = gl_FragCoord.xy;\n");
+    pgl_sb_add(&sb, "    vec2 pxs = gl_FragCoord.xy;\n");
+    pgl_sb_add(&sb, "    vec2 px = pxs * u_iscale;\n");
     /* identical interpolation to the generic shader */
     pgl_sb_add(&sb, "    float e0 = edge_canon(g1a.xy, g2a.xy, px);\n"
                     "    float e1 = edge_canon(g2a.xy, g0a.xy, px);\n"
@@ -1994,6 +2460,10 @@ static char *pgl_spec_src(const PicaGlState *st, int gl_blend, int dst_used,
         } else if (need_texel) {
             pgl_sb_add(&sb, "    vec4 texel = vec4(0.0);\n");
         }
+        if (need_tex1)
+            pgl_sb_add(&sb, "    float tu1 = w0 * g0c[2] + w1 * g1c[2] + w2 * g2c[2];\n"
+                            "    float tv1 = w0 * g0c[3] + w1 * g1c[3] + w2 * g2c[3];\n"
+                            "    vec4 texel1 = (u_tex1_en != 0) ? texture(u_tex1, vec2(tu1, tv1)) : vec4(0.0);\n");
         if (need_buffer)
             pgl_sb_add(&sb, "    vec4 buffer = u_buf_init;\n"
                             "    vec4 pending = buffer;\n");
@@ -2109,9 +2579,9 @@ static char *pgl_spec_src(const PicaGlState *st, int gl_blend, int dst_used,
         } else {
         if (use_zdst) {
             if (pgl_fbfetch)
-                pgl_sb_add(&sb, "    float oldz = imageLoad(u_zimg, ivec2(px)).r;\n");
+                pgl_sb_add(&sb, "    float oldz = imageLoad(u_zimg, ivec2(pxs)).r;\n");
             else
-                pgl_sb_add(&sb, "    float oldz = texelFetch(u_zdst, ivec2(px) - ivec2(u_dst_off), 0).r;\n");
+                pgl_sb_add(&sb, "    float oldz = texelFetch(u_zdst, ivec2(pxs) - ivec2(u_dst_off), 0).r;\n");
         } else {
             pgl_sb_add(&sb, "    float oldz = 0.0;\n");
         }
@@ -2139,9 +2609,9 @@ static char *pgl_spec_src(const PicaGlState *st, int gl_blend, int dst_used,
     if (blend_en) {
         if (dst_used) {
             if (pgl_fbfetch)
-                pgl_sb_add(&sb, "    vec4 dest = imageLoad(u_dstimg, ivec2(px));\n");
+                pgl_sb_add(&sb, "    vec4 dest = imageLoad(u_dstimg, ivec2(pxs));\n");
             else
-                pgl_sb_add(&sb, "    vec4 dest = texelFetch(u_dst, ivec2(px) - ivec2(u_dst_off), 0);\n");
+                pgl_sb_add(&sb, "    vec4 dest = texelFetch(u_dst, ivec2(pxs) - ivec2(u_dst_off), 0);\n");
         } else {
             pgl_sb_add(&sb, "    vec4 dest = vec4(0.0);\n");
         }
@@ -2186,6 +2656,7 @@ static char *pgl_spec_src(const PicaGlState *st, int gl_blend, int dst_used,
 /* ---- program cache ------------------------------------------------------ */
 typedef struct {
     PGint rt, mode, tex, alpha_test, alpha_func, alpha_ref, tex_en, dst,
+          tex1, tex1_en,
           dst_off, zdst, dst_used, zdst_used, dstimg, zimg,
           src_c, mod_c, src_a, mod_a, cop, aop, scale_c, scale_a, const_c,
           const_c_e[6],
@@ -2193,7 +2664,7 @@ typedef struct {
           blend_en, eq_rgb, eq_a, f_src_rgb, f_dst_rgb, f_src_a, f_dst_a,
           blend_const,
           depth_on, depth_test, depth_write, depth_func, depth_zbuf,
-          depth_scale, depth_offset, depth_zmax, depth_hw;
+          depth_scale, depth_offset, depth_zmax, depth_hw, iscale;
 } PglULoc;
 
 #define PGL_SPEC_MAX 40
@@ -2240,8 +2711,11 @@ static void pgl_query_locs(PGuint prog, PglULoc *l) {
     PGL_LOC(alpha_func, "u_alpha_func");
     PGL_LOC(alpha_ref, "u_alpha_ref");
     PGL_LOC(tex_en, "u_tex_en");
+    PGL_LOC(tex1, "u_tex1");
+    PGL_LOC(tex1_en, "u_tex1_en");
     PGL_LOC(dst, "u_dst");
     PGL_LOC(dst_off, "u_dst_off");
+    PGL_LOC(iscale, "u_iscale");
     PGL_LOC(dst_used, "u_dst_used");
     PGL_LOC(zdst_used, "u_zdst_used");
     PGL_LOC(src_c, "u_src_c");
@@ -2312,7 +2786,9 @@ static void pgl_prog_use(PglProgSpec *e) {
     pgl_u_rt = l->rt; pgl_u_mode = l->mode; pgl_u_tex = l->tex;
     pgl_u_alpha_test = l->alpha_test; pgl_u_alpha_func = l->alpha_func;
     pgl_u_alpha_ref = l->alpha_ref; pgl_u_tex_en = l->tex_en;
+    pgl_u_tex1 = l->tex1; pgl_u_tex1_en = l->tex1_en;
     pgl_u_dst = l->dst; pgl_u_dst_off = l->dst_off; pgl_u_zdst = l->zdst;
+    pgl_u_iscale = l->iscale;
     pgl_u_dst_used = l->dst_used; pgl_u_zdst_used = l->zdst_used;
     pgl_u_dstimg = l->dstimg; pgl_u_zimg = l->zimg;
     pgl_u_src_c = l->src_c; pgl_u_mod_c = l->mod_c;
@@ -2553,8 +3029,12 @@ static void pgl_set_uniforms(const PicaGlState *st, int gl_blend,
         pgl_glUniform1i(pgl_u_alpha_func, (PGint)st->alpha_func);
     if (pgl_u_alpha_ref >= 0)
         pgl_glUniform1f(pgl_u_alpha_ref, st->alpha_ref);
+    if (pgl_u_iscale >= 0)
+        pgl_glUniform1f(pgl_u_iscale, 1.0f / (PGfloat)pgl_cur_scale);
     if (pgl_u_dst_off >= 0)
-        pgl_glUniform2f(pgl_u_dst_off, (PGfloat)bx0, (PGfloat)by0);
+        /* t_ab8159de: the u_dst/u_zdst copies are SUPERSAMPLED copies of the
+           draw box, so their origin is the box origin in target texels. */
+        pgl_glUniform2f(pgl_u_dst_off, (PGfloat)PGL_S(bx0), (PGfloat)PGL_S(by0));
     if (pgl_u_dst >= 0) pgl_glUniform1i(pgl_u_dst, 1);
     if (pgl_u_zdst >= 0) pgl_glUniform1i(pgl_u_zdst, 2);
     if (pgl_u_dst_used >= 0)
@@ -2658,6 +3138,10 @@ static void pgl_set_uniforms(const PicaGlState *st, int gl_blend,
         pgl_glUniform1i(pgl_u_tex_en, 0);
     }
     if (pgl_u_tex >= 0) pgl_glUniform1i(pgl_u_tex, 0);
+    /* t_e216fc37: texture unit 1 lives on GL texture unit 3 (0/1/2 are the
+       staged image / blend source / depth source). */
+    if (pgl_u_tex1 >= 0) pgl_glUniform1i(pgl_u_tex1, 3);
+    if (pgl_u_tex1_en >= 0) pgl_glUniform1i(pgl_u_tex1_en, st->tex1_en ? 1 : 0);
 }
 
 /* ---- t_5ddc492f shape histogram (baseline classification) ----------------
@@ -3126,7 +3610,10 @@ static int pgl_depth_selftest_pipeline(void) {
         "void main() { gl_FragDepth = clamp(v_z, 0.0, 1.0);\n"
         "              o_col = vec4(v_col, 1.0);\n"
         "              o_z = vec4(v_z * 16777216.0, 0.0, 0.0, 1.0); }\n";
-    enum { N = 16 };
+    /* t_ab8159de: the depth self-test runs at the INTERNAL scale (a scaled
+       target is where the depth path has to work, so 4x must be exercised at
+       4x, not at 16x16). */
+    const int N = 16 * pgl_scale;
     PGuint fbo = 0, ctex = 0, ztex = 0, dtex = 0, vao = 0, vbo = 0, vs = 0, fs = 0, prog = 0;
     PGenum status, bufs[2] = { PGGL_COLOR_ATTACHMENT0, PGGL_COLOR_ATTACHMENT1 };
     float v[18];              /* 3 verts x (x,y,z,r,g,b) — unused placeholder */
@@ -3355,6 +3842,9 @@ done:
 
 static int pgl_setup(PicaGlGetProc getproc) {
     if (!pgl_load(getproc)) return 0;
+    /* t_ab8159de: internal render scale (DQ8_RENDER_SCALE) — read before
+       anything sizes a target, so the first FBO is built at the right size. */
+    pgl_scale_value();
     {
         const char *r = (const char *)pgl_glGetString(PGGL_RENDERER);
         const char *v = (const char *)pgl_glGetString(PGGL_VERSION);
@@ -3377,6 +3867,26 @@ static int pgl_setup(PicaGlGetProc getproc) {
             fprintf(stderr, "GL backend: WARNING: software GL rasterizer; "
                     "no GPU acceleration on this machine\n");
     }
+    /* t_ab8159de/t_05281b89: what the internal scale costs, printed once,
+       together with the actual target sizes it produces. */
+    if (pgl_scale > 1)
+        fprintf(stderr, "GL backend: internal render scale x%d (DQ8_RENDER_SCALE) "
+                "— 512x400 -> %dx%d, 400x240 -> %dx%d, 320x240 -> %dx%d, "
+                "128x128 -> %dx%d targets; %.1f MB per 512x400 target (RGBA8 "
+                "colour + R32F z mirror + D32F depth), %.1f MB at native; "
+                "sampled-target model = %s (DQ8_RENDER_SCALE_SAMPLED)\n",
+                pgl_scale, 512 * pgl_scale, 400 * pgl_scale,
+                400 * pgl_scale, 240 * pgl_scale,
+                320 * pgl_scale, 240 * pgl_scale,
+                128 * pgl_scale, 128 * pgl_scale,
+                3.0 * 512.0 * 400.0 * (double)pgl_scale * (double)pgl_scale /
+                    1048576.0,
+                3.0 * 512.0 * 400.0 / 1048576.0,
+                pgl_scale_sampled() ? "scaled (Azahar)" : "stage-A demote");
+    else
+        fprintf(stderr, "GL backend: internal render scale x1 (DQ8_RENDER_SCALE "
+                        "unset) — native targets, guest framebuffer passes "
+                        "through unchanged\n");
     /* ---- t_8c05fac8: framebuffer-fetch mode decision (context is current).
        DQ8_GL_FBFETCH=0 forces the legacy per-draw copy path; DQ8_GL_DSTALWAYS=1
        (legacy reference mode) also forces copies.  The extension + entry
@@ -3803,7 +4313,17 @@ static int pica_gl_init(void) {
     if (pgl_tried) return pgl_ready;
     pgl_tried = 1;
     env = getenv("DQ8_GL");
-    if (!env || !env[0] || env[0] == '0') return 0;
+    if (!env || !env[0] || env[0] == '0') {
+        /* t_ab8159de: the software rasteriser has no supersampled path — say so
+           once instead of letting the knob look like it did something. */
+        int f = pgl_scale_value();
+        if (f > 1)
+            fprintf(stderr, "software rasterizer: DQ8_RENDER_SCALE=%d ignored — "
+                            "the software path always renders at the native "
+                            "guest resolution (DQ8_GL=1 enables the internal "
+                            "render scale)\n", f);
+        return 0;
+    }
     env = getenv("DQ8_GL_DEBUG");
     pgl_debug = env && env[0] && env[0] != '0';
     env = getenv("DQ8_GL_RECT_TRACE");
@@ -3846,6 +4366,9 @@ static void pica_gl_spec_set(int on) { pgl_spec_on = on ? 1 : 0; }
 
 static void pica_gl_shutdown(void) {
     unsigned i;
+    /* t_05281b89: stage A coverage — how much of the scene this scale
+       actually buys.  Printed for every scale (at 1x it reports 0 scaled). */
+    pgl_cov_report();
     /* t_f8f2c1da: the stale-specialised-program tripwire.  A clean run prints
        violations=0 and (outside the replay harness) depth_mode_changes=0. */
     fprintf(stderr, "GL SPEC MODECHECK: violations=%llu depth_mode_changes=%u "
@@ -3902,6 +4425,20 @@ static void pica_gl_shutdown(void) {
             "object rebuilds=%llu)\n",
             pgl_draws, pgl_flushes, pgl_refills, pgl_cleared,
             pgl_displaces, pgl_rebuilds);
+    /* t_dd830a74 item 3/4: the download boundary, measured on its own. */
+    fprintf(stderr, "GL backend: download boundary (scaled -> native guest "
+            "bytes, the only downsample in the pipeline): %llu flushes, "
+            "%.1f ms total, %.0f us each%s\n",
+            pgl_dl_calls, (double)pgl_dl_ns / 1e6,
+            pgl_dl_calls ? (double)pgl_dl_ns / 1e3 / (double)pgl_dl_calls : 0.0,
+            pgl_dl_calls ? "" : " (no readback this run)");
+    /* t_fdd26eba item A: the display transfer at the internal scale. */
+    fprintf(stderr, "GL backend: display transfer at scale: %llu taken "
+            "(%.1f ms total, %.2f ms each), %llu fell back to native "
+            "(%llu gate, %llu allocation/GL error)\n",
+            pgl_tr_taken, (double)pgl_tr_ns / 1e6,
+            pgl_tr_taken ? (double)pgl_tr_ns / 1e6 / (double)pgl_tr_taken : 0.0,
+            pgl_tr_fallback, pgl_tr_fallback_gate, pgl_tr_fallback_mem);
     fprintf(stderr, "GL context hold: releases=%llu mid-hold retakes=%llu\n",
             pgl_hold_releases, pgl_hold_mid);
     fprintf(stderr, "GL texture uploads: count=%llu bytes=%llu "
@@ -3910,6 +4447,8 @@ static void pica_gl_shutdown(void) {
     fprintf(stderr, "GL texture uploads detail: generation_hits=%llu "
             "subimage_updates=%llu slots=%d\n",
             pgl_tex_gen_hits, pgl_tex_subuploads, PGL_UP_SLOTS);
+    fprintf(stderr, "GL texture uploads unit1: count=%llu slots=%d\n",
+            pgl_tex1_uploads, PGL_TEX1_SLOTS);
     pica_stage_stats_dump();
     for (i = 0; i < PGL_UP_SLOTS; ++i) {
         free(pgl_up[i].copy);
@@ -3974,6 +4513,7 @@ static int pgl_context_take(PglSavedCtx *s) {
         }
         pgl_held = *s;
         pgl_hold_active = 1;
+        pgl_hold_owner_tid = (long)syscall(SYS_gettid);
         s->ctx = pgl_ctx; /* caller's put() is a no-op: ours stays current */
     }
     return 1;
@@ -4002,6 +4542,7 @@ static void pica_gl_context_release(void) {
     if (!pgl_hold_active) return;
     if (pgl_tid() != pgl_thread_id) return;
     pgl_hold_active = 0;
+    pgl_hold_owner_tid = 0;
     pgl_context_put(&pgl_held);
     ++pgl_hold_releases;
 }
@@ -4040,6 +4581,17 @@ static int pgl_ensure_objects(void) {
             pgl_up[i].used = 0;
             pgl_up[i].ptr = NULL;
             lost |= 32u;
+        }
+        /* t_e216fc37: same for the unit-1 staged textures. */
+        for (i = 0; i < PGL_TEX1_SLOTS; ++i) {
+            if (!pgl_tex1[i].used || !pgl_tex1[i].tex ||
+                pgl_glIsTexture(pgl_tex1[i].tex))
+                continue;
+            pgl_tex1[i].tex = 0;
+            pgl_tex1[i].used = 0;
+            pgl_tex1[i].ptr = NULL;
+            pgl_tex1[i].gen = 0;
+            lost |= 4096u;
         }
     }
     if ((used & 64u) && !pgl_glIsTexture(pgl_dst_tex)) {
@@ -4116,19 +4668,47 @@ static void pgl_depth_fallback(const char *why) {
     pgl_drain_errors("depth-fallback", NULL);
 }
 
-/* Ensure FBO color attachment matches the render-target size. */
+/* Ensure FBO color attachment matches the render-target size.
+   t_05281b89: the attachment is sized guest * pgl_cur_scale, where the scale
+   is decided PER TARGET by pgl_scale_for() (stage A gating).  A target whose
+   scale changes is re-specified and its guest content is force-re-uploaded:
+   the flip only ever happens right after the episode was published, so guest
+   memory holds exactly the native pixels the guest is about to sample. */
 static int pgl_ensure_rt(int w, int h) {
+    int f;
     if (pgl_fbo == 0 || w <= 0 || h <= 0) return 0;
-    if (pgl_rt_tex == 0 || pgl_rt_w != w || pgl_rt_h != h) {
+    f = pgl_scale_for(w, h);
+    if (pgl_rt_tex == 0 || pgl_rt_w != w || pgl_rt_h != h ||
+        pgl_rt_scale != f) {
         PGenum fb_status;
+        int scale_moved = (pgl_rt_scale != f && pgl_rt_tex != 0);
         pgl_rt_w = w;
         pgl_rt_h = h;
+        pgl_rt_scale = f;
+        pgl_cur_scale = f;
+        pgl_tgt_w = PGL_S(w);
+        pgl_tgt_h = PGL_S(h);
+        pgl_cov_track(w, h);
+        /* A scale change resizes the attachments: their content is gone, so
+           the next refresh must re-upload the whole target from guest memory
+           (which is native and current, because every publish downsamples). */
+        if (scale_moved) {
+            if (pgl_split_cur) pgl_request_resync();
+            else { pgl_force_full = 1; pgl_zforce_full = 1; }
+        }
+        if (pgl_debug && scale_moved)
+            fprintf(stderr, "GL backend: render scale: target %dx%d now x%d "
+                            "(%dx%d texels), re-uploading from guest memory\n",
+                    w, h, f, pgl_tgt_w, pgl_tgt_h);
+        /* t_dd830a74: one line per SURFACE the first time it is built scaled
+           (never one per FBO rebuild). */
+        pgl_surface_created_scaled(w, h, f);
         pgl_glBindTexture(PGGL_TEXTURE_2D, pgl_rt_tex);
         pgl_obj_used |= 16u;
         pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_MIN_FILTER, PGGL_NEAREST);
         pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_MAG_FILTER, PGGL_NEAREST);
-        pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_RGBA8, w, h, 0, PGGL_RGBA,
-                         PGGL_UNSIGNED_BYTE, NULL);
+        pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_RGBA8, pgl_tgt_w, pgl_tgt_h, 0,
+                         PGGL_RGBA, PGGL_UNSIGNED_BYTE, NULL);
         /* Depth attachment: R32F storing integer z values (exact).  This is the
            GUEST-VISIBLE depth mirror (t_a22413f1: it is no longer the source of
            the depth test — the real depth attachment below does that — but it
@@ -4138,8 +4718,8 @@ static int pgl_ensure_rt(int w, int h) {
         pgl_obj_used |= 128u;
         pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_MIN_FILTER, PGGL_NEAREST);
         pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_MAG_FILTER, PGGL_NEAREST);
-        pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_R32F, w, h, 0, PGGL_RED,
-                         PGGL_FLOAT, NULL);
+        pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_R32F, pgl_tgt_w, pgl_tgt_h, 0,
+                         PGGL_RED, PGGL_FLOAT, NULL);
         /* t_a22413f1: real depth attachment the rasterizer tests/writes, so
            fragments of ONE draw depth-test each other in raster order.  Only
            built in HARDWARE mode (run3: opt-in, off by default). */
@@ -4148,10 +4728,10 @@ static int pgl_ensure_rt(int w, int h) {
             pgl_obj_used |= 512u;
             pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_MIN_FILTER, PGGL_NEAREST);
             pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_MAG_FILTER, PGGL_NEAREST);
-            pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_DEPTH_COMPONENT32F, w, h, 0,
-                             PGGL_DEPTH_COMPONENT, PGGL_FLOAT, NULL);
-            pgl_dt_w = w;
-            pgl_dt_h = h;
+            pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_DEPTH_COMPONENT32F, pgl_tgt_w,
+                             pgl_tgt_h, 0, PGGL_DEPTH_COMPONENT, PGGL_FLOAT, NULL);
+            pgl_dt_w = pgl_tgt_w;
+            pgl_dt_h = pgl_tgt_h;
         }
         pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_fbo);
         pgl_obj_used |= 8u;
@@ -4172,9 +4752,10 @@ static int pgl_ensure_rt(int w, int h) {
         /* t_a22413f1 run3: ALWAYS report the build (a diagnostic run needs the
            status of the working case, not only the failure). */
         ++pgl_depth_fbo_builds;
-        fprintf(stderr, "GL backend: FBO build #%u %dx%d depth_attach=%s "
+        fprintf(stderr, "GL backend: FBO build #%u %dx%d (guest %dx%d scale x%d) "
+                        "depth_attach=%s "
                         "status=0x%04X (complete=0x%04X) draw=%llu\n",
-                pgl_depth_fbo_builds, w, h,
+                pgl_depth_fbo_builds, pgl_tgt_w, pgl_tgt_h, w, h, pgl_cur_scale,
                 pgl_depth_hw ? "D32F" : "none",
                 (unsigned)fb_status, (unsigned)PGGL_FRAMEBUFFER_COMPLETE,
                 (unsigned long long)pgl_draws);
@@ -4224,6 +4805,535 @@ static int pgl_ensure_rt(int w, int h) {
     }
     pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_fbo);
     pgl_obj_used |= 8u;
+    return 1;
+}
+
+/* ---- t_dd830a74 item 2: SAMPLE THE SCALED BACKING ------------------------
+   The guest's post-process pass samples the very target the 3D pass rendered
+   into.  Azahar samples the scaled texture directly (normalised UVs, no
+   downsample, gl_texture_runtime.cpp's textures[1]); a GL shader cannot sample
+   the texture it is rendering into (feedback loop, GL 4.5 §9.3), so this
+   backend first copies the scaled backing into pgl_snap_tex and the draw binds
+   THAT for unit 0.  The copy is at f x f: nothing is downsampled, so the
+   composite is built from supersampled content.
+
+   The guest-memory publish still happens at the call site (item 3), so every
+   other consumer (display transfer, DMA, Y2R, savestate) is unchanged.
+   Returns 1 when unit 0 must be bound to pgl_snap_tex, 0 to fall back to the
+   native staged path. */
+static PGuint pgl_snap_tex;
+static PGuint pgl_snap_fbo;   /* destination of the snapshot blit */
+static int pgl_snap_w, pgl_snap_h;
+
+/* ---- t_dd830a74 item 2 (round 3): ONE PLACEMENT TRANSFORM FOR BOTH PATHS --
+   The native path does not "place" anything: pica_vs.c's
+   pica_gl_stage_texture decodes the WHOLE DECLARED texture out of guest
+   memory, so a target that the guest samples through a larger declared
+   texture (DQ8: the 512x400 field target, declared 512x512 at the same base
+   address) lands at rows [decl_h - tgt_h, decl_h) of the staged image with the
+   target's FBO row k at row k of that image.  That is MEASURED, not assumed —
+   tools/dt_stage.py against the GL target reports "identity, yoff=112,
+   mean|d| 3.1", i.e. no x flip, no y flip, offset = decl_h - tgt_h.
+
+   The snapshot must reproduce exactly that at scale.  So there is one
+   transform, expressed in NATIVE units here and multiplied by f at the single
+   call site (glBlitFramebuffer), and the log line below prints both vectors so
+   the sharing is visible rather than claimed.  Round 2's copy had a y flip
+   here (`dst_lo..dst_hi` reversed); that flip is the whole difference between
+   the snapshot path and the native one. */
+static void pgl_snap_place_native(int decl_w, int decl_h, int tgt_nw, int tgt_nh,
+                                  int *xoff, int *yoff, int *w, int *h)
+{
+    (void)decl_w;
+    *xoff = 0;                       /* target column 0 = texture column 0 */
+    *yoff = decl_h - tgt_nh;         /* bottom-aligned inside the declared height */
+    if (*yoff < 0) *yoff = 0;
+    *w = tgt_nw;
+    *h = tgt_nh;
+}
+
+/* Printed once: the same transform at 1x and at f.  The f x row is exactly f
+   times the native row (offsets and extents), which is the property the
+   composite's window depends on. */
+static int pgl_snap_place_logged;
+
+/* Diagnosis only (DQ8_RS_SNAP_DUMP=<dir>, default off): write the first four
+   snapshots AND the target they were blitted from as raw RGBA, plus a dims
+   line, so the x/y convention of the copy is MEASURED instead of guessed
+   (tools/dt_snap.py).  Both files come from glReadPixels, so they share one
+   row order (GL: row 0 = bottom); only the blit's own transform is left. */
+static void pgl_snap_diag(int tw, int th) {
+    const char *dd = getenv("DQ8_RS_SNAP_DUMP");
+    static unsigned n;
+    char path[768];
+    FILE *f;
+    unsigned char *buf;
+    unsigned long long len;
+    if (!dd || !dd[0] || n >= 8u) return;
+    ++n;
+    len = (unsigned long long)pgl_snap_w * (unsigned long long)pgl_snap_h * 4ull;
+    buf = (unsigned char *)malloc((size_t)len ? (size_t)len : 1u);
+    if (buf) {
+        pgl_glBindFramebuffer(PGGL_READ_FRAMEBUFFER, pgl_snap_fbo);
+        pgl_glReadPixels(0, 0, pgl_snap_w, pgl_snap_h, PGGL_RGBA,
+                         PGGL_UNSIGNED_BYTE, buf);
+        snprintf(path, sizeof path, "%s/snap_%u.raw", dd, n);
+        f = fopen(path, "wb");
+        if (f) { fwrite(buf, 1, (size_t)len, f); fclose(f); }
+        free(buf);
+    }
+    len = (unsigned long long)pgl_tgt_w * (unsigned long long)pgl_tgt_h * 4ull;
+    buf = (unsigned char *)malloc((size_t)len ? (size_t)len : 1u);
+    if (buf) {
+        pgl_glBindFramebuffer(PGGL_READ_FRAMEBUFFER, pgl_fbo);
+        pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
+        pgl_glReadPixels(0, 0, pgl_tgt_w, pgl_tgt_h, PGGL_RGBA,
+                         PGGL_UNSIGNED_BYTE, buf);
+        snprintf(path, sizeof path, "%s/fbo_%u.raw", dd, n);
+        f = fopen(path, "wb");
+        if (f) { fwrite(buf, 1, (size_t)len, f); fclose(f); }
+        free(buf);
+    }
+    snprintf(path, sizeof path, "%s/dims_%u.txt", dd, n);
+    f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "snap %d %d tgt %d %d declared %dx%d scale %d\n",
+                pgl_snap_w, pgl_snap_h, pgl_tgt_w, pgl_tgt_h, tw, th,
+                pgl_cur_scale);
+        fclose(f);
+    }
+    pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_fbo);
+    fprintf(stderr, "GL diag: snapshot %u (%dx%d) + target (%dx%d) written to %s\n",
+            n, pgl_snap_w, pgl_snap_h, pgl_tgt_w, pgl_tgt_h, dd);
+}
+
+/* Diagnosis only (DQ8_RS_SNAP_DUMP=<dir>): the same measurement for the
+   NATIVE path — dump the staged RGBA image the draw is about to upload for a
+   draw that samples the current target, plus the target as GL sees it, so
+   "staged image == target" can be compared instead of assumed.  Armed by the
+   alias site in pica_vs.c (pgl_diag_stage_want). */
+static int pgl_diag_stage_want;
+
+/* Diagnosis only: the target as GL leaves it right AFTER the draw that
+   sampled it — the "composite output" side of the input/output pair. */
+static int pgl_diag_post_want;
+
+static void pgl_diag_post_dump(void) {
+    const char *dd = getenv("DQ8_RS_SNAP_DUMP");
+    static unsigned n;
+    char path[768];
+    FILE *f;
+    unsigned char *buf;
+    unsigned long long len;
+    if (!dd || !dd[0] || n >= 8u) return;
+    ++n;
+    len = (unsigned long long)pgl_tgt_w * (unsigned long long)pgl_tgt_h * 4ull;
+    buf = (unsigned char *)malloc((size_t)len ? (size_t)len : 1u);
+    if (!buf) return;
+    pgl_glBindFramebuffer(PGGL_READ_FRAMEBUFFER, pgl_fbo);
+    pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
+    pgl_glReadPixels(0, 0, pgl_tgt_w, pgl_tgt_h, PGGL_RGBA,
+                     PGGL_UNSIGNED_BYTE, buf);
+    snprintf(path, sizeof path, "%s/post_%u.raw", dd, n);
+    f = fopen(path, "wb");
+    if (f) { fwrite(buf, 1, (size_t)len, f); fclose(f); }
+    free(buf);
+    pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_fbo);
+    fprintf(stderr, "GL diag: post-draw target %u (%dx%d) written to %s\n",
+            n, pgl_tgt_w, pgl_tgt_h, dd);
+}
+
+
+static void pgl_diag_stage_dump(const unsigned char *rgba, int w, int h) {
+    const char *dd = getenv("DQ8_RS_SNAP_DUMP");
+    static unsigned n;
+    char path[768];
+    FILE *f;
+    unsigned char *buf;
+    unsigned long long len;
+    if (!dd || !dd[0] || !rgba || n >= 8u) return;
+    ++n;
+    snprintf(path, sizeof path, "%s/staged_%u.raw", dd, n);
+    f = fopen(path, "wb");
+    if (f) { fwrite(rgba, 1, (size_t)w * (size_t)h * 4u, f); fclose(f); }
+    len = (unsigned long long)pgl_tgt_w * (unsigned long long)pgl_tgt_h * 4ull;
+    buf = (unsigned char *)malloc((size_t)len ? (size_t)len : 1u);
+    if (buf) {
+        pgl_glBindFramebuffer(PGGL_READ_FRAMEBUFFER, pgl_fbo);
+        pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
+        pgl_glReadPixels(0, 0, pgl_tgt_w, pgl_tgt_h, PGGL_RGBA,
+                         PGGL_UNSIGNED_BYTE, buf);
+        snprintf(path, sizeof path, "%s/sfbo_%u.raw", dd, n);
+        f = fopen(path, "wb");
+        if (f) { fwrite(buf, 1, (size_t)len, f); fclose(f); }
+        free(buf);
+    }
+    snprintf(path, sizeof path, "%s/sdims_%u.txt", dd, n);
+    f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "staged %d %d tgt %d %d scale %d\n",
+                w, h, pgl_tgt_w, pgl_tgt_h, pgl_cur_scale);
+        fclose(f);
+    }
+    pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_fbo);
+    fprintf(stderr, "GL diag: staged image %u (%dx%d) + target (%dx%d) written to %s\n",
+            n, w, h, pgl_tgt_w, pgl_tgt_h, dd);
+}
+
+int pica_gl_sample_scaled_target(unsigned tw, unsigned th, unsigned tfmt,
+                                 unsigned taddr) {
+    static int on = -1;
+    if (on < 0) {
+        /* t_dd830a74 item 2: DEFAULT ON since round 3.  The placement fix
+           below made the composite pixel-identical to the 1x reference
+           (tools/dt_orient.py: identity mean|d| 1.65, the stage-A AA residual,
+           against 16.11 for mirror-x), so sampling the scaled backing is the
+           normal path.  DQ8_RS_SAMPLE_SCALED=0 restores the stage-A behaviour
+           (sample the native downloaded image) for A/B runs. */
+        const char *e = getenv("DQ8_RS_SAMPLE_SCALED");
+        on = (e && e[0] == '0' && !e[1]) ? 0 : 1;
+        if (on) fprintf(stderr, "GL backend: render scale: a render target the "
+                       "guest samples is served from its scaled backing "
+                       "(Azahar textures[1]; DQ8_RS_SAMPLE_SCALED=0 disables)\n");
+        else fprintf(stderr, "GL backend: render scale: scaled sample DISABLED "
+                        "(DQ8_RS_SAMPLE_SCALED=0) — targets are still scaled, "
+                        "samples use the native download\n");
+    }
+    if (!on) return 0;
+    if (!pgl_ready) return 0;
+    if (!pgl_scale_sampled() || pgl_cur_scale <= 1) return 0;
+    /* DQ8_SPLIT_GL runs the GL calls on a worker context; the snapshot would
+       have to be created there.  Until that is plumbed through, the split
+       keeps the native staged path (item 3's download). */
+    if (pgl_split_on) { ++pgl_snap_fallback; return 0; }
+    /* Exact alias (the sampled texture IS the current target), plus the common
+       PICA shape where the guest declares a texture at least as large as the
+       target it was rendered into (DQ8: the 512x400 field target is sampled as
+       a 512x512 texture at the same address).  The sampled texture keeps its
+       DECLARED size — the UVs are unchanged — while the content inside the
+       target's own rect comes from the scaled backing.  Texture rows past the
+       target's height are not defined by the guest render either; the snapshot
+       leaves them untouched (documented in reports/RENDER_SCALE_AZAHAR.md). */
+    if ((int)tw < pgl_rt_w || (int)th < pgl_rt_h ||
+        taddr != pica_rt_addr || tfmt != pica_rt_format ||
+        pica_rt_format != 0u /* RGBA8 */ || pgl_rt_tex == 0) {
+        ++pgl_snap_fallback;
+        if (pgl_snap_fallback <= 8u)
+            fprintf(stderr, "GL backend: render scale: scaled sample not taken "
+                            "(tex %ux%u fmt=%u addr=%08X vs target %dx%d fmt=%u "
+                            "addr=%08X tex=%u scaled=%d)\n",
+                    tw, th, tfmt, taddr, pgl_rt_w, pgl_rt_h, pica_rt_format,
+                    pica_rt_addr, (unsigned)pgl_rt_tex, pgl_cur_scale);
+        return 0;
+    }
+    if (!pgl_ensure_rt(pgl_rt_w, pgl_rt_h)) {
+        ++pgl_snap_fallback;
+        fprintf(stderr, "GL backend: render scale: scaled sample fallback (ensure_rt)\n");
+        return 0;
+    }
+    if (pgl_cur_scale <= 1) {
+        ++pgl_snap_fallback;
+        fprintf(stderr, "GL backend: render scale: scaled sample fallback (cur_scale=%d)\n", pgl_cur_scale);
+        return 0;
+    }
+    if (!pgl_snap_tex || !pgl_glIsTexture(pgl_snap_tex)) {
+        pgl_snap_tex = 0;
+        pgl_glGenTextures(1, &pgl_snap_tex);
+        pgl_snap_w = pgl_snap_h = 0;
+        if (!pgl_snap_tex) {
+            ++pgl_snap_fallback;
+            fprintf(stderr, "GL backend: render scale: scaled sample fallback (glGenTextures)\n");
+            return 0;
+        }
+    }
+    /* The FBO's read buffer is ATT0 (the colour attachment) — same source the
+       write-back reads. */
+    pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_fbo);
+    pgl_obj_used |= 8u;
+    pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
+    /* The guest's PICA sampler flips t (pica_vs.c: ty = h-1-wrap(t)), so the
+       staged image the native path would build has memory row m at staged row
+       (texture_h - 1 - m): the target's rect lands in the LAST tgt_h rows of
+       the declared texture, mirrored vertically.  DQ8's post-process confirms
+       it — it samples v in [0.21875 .. 1.0] = exactly rows (th-tgt_h)..th-1 of
+       a 512x512 texture over a 512x400 target.  Reproduce that placement with
+       one GPU blit: scaled f x f, no downsample. */
+    if (pgl_snap_w != (int)tw * pgl_cur_scale ||
+        pgl_snap_h != (int)th * pgl_cur_scale) {
+        pgl_glActiveTexture(PGGL_TEXTURE0);
+        pgl_glBindTexture(PGGL_TEXTURE_2D, pgl_snap_tex);
+        pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_MIN_FILTER, PGGL_NEAREST);
+        pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_MAG_FILTER, PGGL_NEAREST);
+        pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_WRAP_S, PGGL_CLAMP_TO_EDGE);
+        pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_WRAP_T, PGGL_CLAMP_TO_EDGE);
+        pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_RGBA8, (PGsizei)tw * pgl_cur_scale,
+                         (PGsizei)th * pgl_cur_scale, 0, PGGL_RGBA,
+                         PGGL_UNSIGNED_BYTE, NULL);
+        pgl_snap_w = (int)tw * pgl_cur_scale;
+        pgl_snap_h = (int)th * pgl_cur_scale;
+    }
+    if (!pgl_glBlitFramebuffer || !pgl_snap_tex) { ++pgl_snap_fallback; return 0; }
+    if (!pgl_snap_fbo || !pgl_glIsFramebuffer(pgl_snap_fbo)) {
+        pgl_snap_fbo = 0;
+        pgl_glGenFramebuffers(1, &pgl_snap_fbo);
+        if (!pgl_snap_fbo) { ++pgl_snap_fallback; return 0; }
+        pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_snap_fbo);
+        pgl_glFramebufferTexture2D(PGGL_FRAMEBUFFER, PGGL_COLOR_ATTACHMENT0,
+                                   PGGL_TEXTURE_2D, pgl_snap_tex, 0);
+        {   PGenum att = PGGL_COLOR_ATTACHMENT0;
+            pgl_glDrawBuffers(1, &att); }
+    } else {
+        pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_snap_fbo);
+        pgl_glFramebufferTexture2D(PGGL_FRAMEBUFFER, PGGL_COLOR_ATTACHMENT0,
+                                   PGGL_TEXTURE_2D, pgl_snap_tex, 0);
+    }
+    {
+        /* ONE transform, native units, multiplied by f — the same placement the
+           native stager produces (pgl_snap_place_native).  No flip: measurement
+           B of round 2 (tools/dt_stage.py) says the native image holds the
+           target identity + yoff=112, so a row-reversed copy is what made the
+           composite differ. */
+        int xo_n, yo_n, wn, hn, f = pgl_cur_scale;
+        pgl_snap_place_native((int)tw, (int)th, pgl_tgt_w / f, pgl_tgt_h / f,
+                              &xo_n, &yo_n, &wn, &hn);
+        if (!pgl_snap_place_logged) {
+            pgl_snap_place_logged = 1;
+            fprintf(stderr,
+                    "GL backend: render scale: target-sample placement — "
+                    "declared %dx%d, target %dx%d: native off=(%d,%d) extent "
+                    "%dx%d flip=(0,0); x%d off=(%d,%d) extent %dx%d = native*%d "
+                    "(shared stager transform: bottom-aligned, no flip)\n",
+                    (int)tw, (int)th, pgl_tgt_w / f, pgl_tgt_h / f,
+                    xo_n, yo_n, wn, hn, f,
+                    xo_n * f, yo_n * f, wn * f, hn * f, f);
+        }
+        /* Source = the live target, GL rows 0..th_s-1 (GL row j = guest
+           framebuffer row j).  Destination = the same rows at f x, offset and
+           extent multiplied by f, so normalised guest UVs sample the same
+           content at every scale. */
+        pgl_glBindFramebuffer(PGGL_READ_FRAMEBUFFER, pgl_fbo);
+        pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
+        pgl_glBindFramebuffer(PGGL_DRAW_FRAMEBUFFER, pgl_snap_fbo);
+        pgl_glBlitFramebuffer(0, 0, wn * f, hn * f,
+                              xo_n * f, yo_n * f, (xo_n + wn) * f,
+                              (yo_n + hn) * f,
+                              PGGL_COLOR_BUFFER_BIT, PGGL_NEAREST);
+        pgl_obj_used |= 8u;
+        pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_fbo);
+    }
+    if (pgl_drain_errors("scaled-sample-snapshot", NULL) != 0) {
+        ++pgl_snap_fallback;
+        fprintf(stderr, "GL backend: render scale: scaled sample fallback (GL error during snapshot %dx%d)\n",
+                pgl_tgt_w, pgl_tgt_h);
+        return 0;
+    }
+    ++pgl_snap_taken;
+    if (pgl_snap_taken <= 8u) pgl_snap_diag((int)tw, (int)th);
+    /* t_dd830a74 control experiment (DQ8_RS_SNAP_ONLY=1): take the snapshot
+       but still hand the draw the native staged image, so "the copy's side
+       effects" and "the bound texture" can be told apart. */
+    {
+        const char *so = getenv("DQ8_RS_SNAP_ONLY");
+        if (so && so[0] == '1' && !so[1]) {
+            if (pgl_snap_taken <= 8u)
+                fprintf(stderr, "GL backend: render scale: snapshot #%llu taken, "
+                                "draw keeps the native staged image "
+                                "(DQ8_RS_SNAP_ONLY)\n",
+                        pgl_snap_taken);
+            return 0;
+        }
+    }
+    if (pgl_snap_taken <= 8u)
+        fprintf(stderr, "GL backend: render scale: target %ux%u sampled as a "
+                        "texture at x%d — bound the %dx%d scaled backing "
+                        "(snapshot #%llu, no downsample)\n",
+                tw, th, pgl_cur_scale, pgl_tgt_w, pgl_tgt_h, pgl_snap_taken);
+    return 1;
+}
+
+/* ============ t_fdd26eba item A: DISPLAY TRANSFER INHERITS f ==============
+
+   Azahar `rasterizer_cache/rasterizer_cache.h:289-352`
+   (AccelerateDisplayTransfer) never gives the guest's display transfer a
+   native-sized destination: the destination surface INHERITS the source's
+   res_scale (`dst_params.res_scale = src_surface.res_scale`, line 324), its
+   DECLARED width/height stay the guest's logical ones (halved by the scaling
+   mode, lines 303-307), and the transfer itself is a GPU BlitTextures from the
+   SCALED source rect into the SCALED destination rect (lines 343-347).  The
+   destination therefore holds `declared * f` texels of real detail; the only
+   thing that is ever downsampled is the download into guest memory.
+
+   This function produces that scaled destination for one transfer:
+     source   the attached colour backing of the current render target
+              (GL row j == guest memory row pgl_tgt_h-1-j at scale 1, which is
+              pgl_tgt_h-1-j*f .. in scaled texels), cropped to the guest's
+              source rect (0,0,crop_w,crop_h) and taken at scale;
+     blit     glBlitFramebuffer, GL_LINEAR on an axis whose rect shrinks
+              (exactly Azahar's CopyTextures filter: a 2:1 axis averages the
+              two scaled texels a destination texel covers);
+     readback the scaled destination in GUEST MEMORY ROW ORDER (row 0 = the
+              destination's first memory row), RGBA8, caller frees it.
+
+   The guest's own bytes are NOT produced here: they still come from the
+   download boundary (t_dd830a74 item 3, box-filtered), so every guest reader
+   (DMA, Y2R, savestate, scan-out capture) keeps seeing native data.
+
+   Returns 1 on success; every gate that cannot serve the transfer returns 0
+   and is counted in pgl_tr_fallback together with the reason, so a run reports
+   how many transfers kept the native-only path and why. */
+static PGuint pgl_tr_tex, pgl_tr_fbo;
+static int pgl_tr_w, pgl_tr_h;
+
+static int pgl_tr_no(const char *why) {
+    ++pgl_tr_fallback;
+    ++pgl_tr_fallback_gate;
+    if (pgl_tr_fallback <= 8u)
+        fprintf(stderr, "GL backend: render scale: display transfer stays "
+                        "NATIVE — %s (fallback #%llu)\n", why, pgl_tr_fallback);
+    return 0;
+}
+
+static int pica_gl_transfer_scaled_capture(unsigned src_addr,
+                                           unsigned src_w, unsigned src_h,
+                                           unsigned crop_w, unsigned crop_h,
+                                           unsigned dst_w, unsigned dst_h,
+                                           int vflip, unsigned h_scale,
+                                           unsigned v_scale,
+                                           unsigned char **out, unsigned *ow,
+                                           unsigned *oh, int *oscale) {
+    const int f = pgl_cur_scale;
+    int dw, dh, sy0, ratio, neary;
+    unsigned long long t0 = 0;
+    unsigned char *raw = NULL, *img = NULL;
+    PglSavedCtx prev;
+    unsigned y;
+    if (out) *out = NULL;
+    if (!out || !ow || !oh || !oscale) return 0;
+    if (!pgl_ready) return pgl_tr_no("GL backend not active");
+    if (pgl_split_on)
+        return pgl_tr_no("DQ8_SPLIT_GL runs GL on the worker context");
+    if (f <= 1) return pgl_tr_no("internal scale is 1 (nothing to inherit)");
+    if (pgl_rt_tex == 0) return pgl_tr_no("no colour attachment yet");
+    if (pgl_pending) {
+        if (src_addr != pica_rt_addr || src_w != (unsigned)pgl_rt_w ||
+            src_h != (unsigned)pgl_rt_h)
+            return pgl_tr_no("the pending episode is a different target");
+    } else {
+        /* Published already: the attachment still holds the last episode's
+           content, but only while nothing has drawn into it since. */
+        if (!pgl_cap_valid || src_addr != pgl_cap_addr ||
+            src_w != (unsigned)pgl_cap_w || src_h != (unsigned)pgl_cap_h ||
+            f != pgl_cap_f || pgl_draws != pgl_cap_draws ||
+            pgl_rt_w != pgl_cap_w || pgl_rt_h != pgl_cap_h)
+            return pgl_tr_no("the attachment no longer holds the published "
+                             "target's content");
+    }
+    if (!crop_w || !crop_h || crop_w > (unsigned)pgl_rt_w ||
+        crop_h > (unsigned)pgl_rt_h)
+        return pgl_tr_no("transfer crop lies outside the render target");
+    if (dst_w != (crop_w >> h_scale) || dst_h != (crop_h >> v_scale))
+        return pgl_tr_no("destination is not crop >> scaling mode");
+    dw = (int)dst_w * f;
+    dh = (int)dst_h * f;
+    if (dw <= 0 || dh <= 0 || dw > 4096 || dh > 4096)
+        return pgl_tr_no("scaled destination out of range");
+    ratio = (int)(crop_w / dst_w);          /* 1 or 2 (scaling mode 0..2) */
+    neary = (int)(crop_h / dst_h);
+    if (ratio != (int)(1u << h_scale) || neary != (int)(1u << v_scale))
+        return pgl_tr_no("scaling ratio is not 2^mode");
+    if (!pgl_glBlitFramebuffer) return pgl_tr_no("glBlitFramebuffer unavailable");
+    t0 = pica_pqt_now_ns();
+    memset(&prev, 0, sizeof prev);
+    if (!pgl_context_take(&prev))
+        return pgl_tr_no("GL context could not be made current");
+    if (!pgl_tr_tex || !pgl_glIsTexture(pgl_tr_tex)) {
+        pgl_tr_tex = 0;
+        pgl_glGenTextures(1, &pgl_tr_tex);
+        pgl_tr_w = pgl_tr_h = 0;
+    }
+    if (!pgl_tr_fbo || !pgl_glIsFramebuffer(pgl_tr_fbo)) {
+        pgl_tr_fbo = 0;
+        pgl_glGenFramebuffers(1, &pgl_tr_fbo);
+    }
+    if (!pgl_tr_tex || !pgl_tr_fbo) {
+        pgl_context_put(&prev);
+        return pgl_tr_no("staging texture/framebuffer allocation failed");
+    }
+    pgl_glActiveTexture(PGGL_TEXTURE0);
+    pgl_glBindTexture(PGGL_TEXTURE_2D, pgl_tr_tex);
+    pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_MIN_FILTER, PGGL_NEAREST);
+    pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_MAG_FILTER, PGGL_NEAREST);
+    pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_WRAP_S, PGGL_CLAMP_TO_EDGE);
+    pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_WRAP_T, PGGL_CLAMP_TO_EDGE);
+    if (pgl_tr_w != dw || pgl_tr_h != dh) {
+        pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_RGBA8, (PGsizei)dw,
+                         (PGsizei)dh, 0, PGGL_RGBA, PGGL_UNSIGNED_BYTE, NULL);
+        pgl_tr_w = dw;
+        pgl_tr_h = dh;
+    }
+    pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_tr_fbo);
+    pgl_glFramebufferTexture2D(PGGL_FRAMEBUFFER, PGGL_COLOR_ATTACHMENT0,
+                               PGGL_TEXTURE_2D, pgl_tr_tex, 0);
+    {   PGenum att = PGGL_COLOR_ATTACHMENT0;
+        pgl_glDrawBuffers(1, &att); }
+    /* Guest memory rows [0,crop_h) of the target are the TOP crop_h*f GL rows
+       of the attachment (GL row j == raster row j, memory row m == raster row
+       rt_h-1-m), so the source rect starts at pgl_tgt_h - crop_h*f. */
+    sy0 = pgl_tgt_h - (int)crop_h * f;
+    pgl_glBindFramebuffer(PGGL_READ_FRAMEBUFFER, pgl_fbo);
+    pgl_obj_used |= 8u;
+    pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
+    pgl_glBindFramebuffer(PGGL_DRAW_FRAMEBUFFER, pgl_tr_fbo);
+    pgl_glBlitFramebuffer(0, sy0, (PGint)(crop_w * (unsigned)f),
+                          sy0 + (int)crop_h * f, 0, 0, dw, dh,
+                          PGGL_COLOR_BUFFER_BIT,
+                          (ratio > 1 || neary > 1) ? PGGL_LINEAR : PGGL_NEAREST);
+    pgl_glBindFramebuffer(PGGL_READ_FRAMEBUFFER, pgl_tr_fbo);
+    pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
+    raw = (unsigned char *)malloc((size_t)dw * (size_t)dh * 4u);
+    if (raw)
+        pgl_glReadPixels(0, 0, (PGsizei)dw, (PGsizei)dh, PGGL_RGBA,
+                         PGGL_UNSIGNED_BYTE, raw);
+    pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_fbo);
+    pgl_obj_used |= 8u;
+    if (!raw || pgl_drain_errors("transfer-scaled-capture", NULL) != 0) {
+        free(raw);
+        pgl_context_put(&prev);
+        pgl_tr_ns += pica_pqt_now_ns() - t0;
+        ++pgl_tr_fallback;
+        ++pgl_tr_fallback_mem;
+        return 0;
+    }
+    pgl_context_put(&prev);
+    pgl_tr_ns += pica_pqt_now_ns() - t0;
+    /* glReadPixels returns bottom-up, i.e. destination memory row dh-1 first;
+       reverse into memory order, and reverse the whole thing when the guest
+       asked for flip_vertically (the native loop reads
+       sy = input_h-1-(y<<v_scale), a mirror of the unflipped box average). */
+    img = (unsigned char *)malloc((size_t)dw * (size_t)dh * 4u);
+    if (!img) {
+        free(raw);
+        ++pgl_tr_fallback;
+        ++pgl_tr_fallback_mem;
+        return 0;
+    }
+    for (y = 0; y < (unsigned)dh; ++y) {
+        const unsigned char *srcrow = vflip ? raw + (size_t)y * dw * 4u
+                                            : raw + (size_t)(dh - 1 - (int)y) * dw * 4u;
+        memcpy(img + (size_t)y * dw * 4u, srcrow, (size_t)dw * 4u);
+    }
+    free(raw);
+    ++pgl_tr_taken;
+    *out = img;
+    *ow = (unsigned)dw;
+    *oh = (unsigned)dh;
+    *oscale = f;
+    if (pgl_tr_taken <= 4u)
+        fprintf(stderr, "GL backend: render scale: display transfer at x%d — "
+                        "source %ux%u crop %ux%u -> scaled destination %dx%d "
+                        "(GL_LINEAR %d:%d), #%llu\n",
+                f, src_w, src_h, crop_w, crop_h, dw, dh, ratio, neary,
+                pgl_tr_taken);
     return 1;
 }
 
@@ -4653,6 +5763,219 @@ static int pgl_refr_needed(const PicaGlState *st, const PicaGlHost *host,
     return 0;
 }
 
+
+/* ================= t_ab8159de: INTERNAL RENDER SCALE =======================
+   Everything the guest hands this backend is NATIVE resolution data, and
+   everything the guest consumes (framebuffer, depth, display transfers,
+   captures) must stay native too.  Only the GL render targets grow:
+
+     guest pixel (x,y)  ->  target texels [x*f .. x*f+f-1] x [y*f .. y*f+f-1]
+
+   * guest -> target uploads replicate each native texel f times in x and y
+     (nearest).  The write-back box average of an untouched f x f block is
+     therefore exactly the original texel, so guest content round-trips
+     bit-exactly; anything rasterised on top gets f x f coverage samples.
+   * the fragment shader computes its barycentrics from
+     px = gl_FragCoord.xy / f, i.e. at the f x f sub-pixel positions inside the
+     guest pixel, and every render-target texel fetch uses the supersampled
+     coordinate gl_FragCoord.xy (safe: the target IS f x f bigger), while the
+     u_dst/u_zdst copies are supersampled copies of the draw box.
+   * the write-back reads the f x f box and box-averages it back down.
+
+   At f == 1 every helper below is the identity and the code is byte-for-byte
+   the previous behaviour (the upscale returns the caller's pointer). */
+static unsigned char *pgl_up_rgba;
+static size_t pgl_up_rgba_cap;
+static float *pgl_up_z;
+static size_t pgl_up_z_cap;
+
+static const unsigned char *pgl_upscale_rgba(const unsigned char *rgba,
+                                             int gw, int gh) {
+    const int f = pgl_cur_scale;
+    size_t stride, need;
+    unsigned char *dst;
+    int y, x, d, k;
+    if (!rgba || f <= 1) return rgba;              /* scale 1: no copy at all */
+    stride = (size_t)gw * (size_t)f * 4u;
+    need = stride * (size_t)gh * (size_t)f;
+    if (pgl_up_rgba_cap < need) {
+        unsigned char *n = (unsigned char *)realloc(pgl_up_rgba, need);
+        if (!n) return NULL;
+        pgl_up_rgba = n;
+        pgl_up_rgba_cap = need;
+    }
+    dst = pgl_up_rgba;
+    for (y = 0; y < gh; ++y) {
+        unsigned char *row = dst + (size_t)y * (size_t)f * stride;
+        const unsigned char *src = rgba + (size_t)y * (size_t)gw * 4u;
+        for (x = 0; x < gw; ++x) {
+            const unsigned char *sp = src + (size_t)x * 4u;
+            unsigned char *dp = row + (size_t)x * (size_t)f * 4u;
+            for (d = 0; d < f; ++d) {
+                for (k = 0; k < 4; ++k) dp[k] = sp[k];
+                dp += 4;
+            }
+        }
+        for (d = 1; d < f; ++d)
+            memcpy(row + (size_t)d * stride, row, stride);
+    }
+    return dst;
+}
+
+static const float *pgl_upscale_z(const float *z, int gw, int gh) {
+    const int f = pgl_cur_scale;
+    size_t stride, need;
+    float *dst;
+    int y, x, d;
+    if (!z || f <= 1) return z;
+    stride = (size_t)gw * (size_t)f;
+    need = stride * (size_t)gh * (size_t)f;
+    if (pgl_up_z_cap < need) {
+        float *n = (float *)realloc(pgl_up_z, need * sizeof(float));
+        if (!n) return NULL;
+        pgl_up_z = n;
+        pgl_up_z_cap = need;
+    }
+    dst = pgl_up_z;
+    for (y = 0; y < gh; ++y) {
+        float *row = dst + (size_t)y * (size_t)f * stride;
+        const float *src = z + (size_t)y * (size_t)gw;
+        for (x = 0; x < gw; ++x) {
+            float v = src[x];
+            float *dp = row + (size_t)x * (size_t)f;
+            for (d = 0; d < f; ++d) dp[d] = v;
+        }
+        for (d = 1; d < f; ++d)
+            memcpy(row + (size_t)d * stride, row, stride * sizeof(float));
+    }
+    return dst;
+}
+
+/* Upload a native RGBA8 box at guest (gx,gy) into the colour attachment. */
+static int pgl_upload_rgba(int gx, int gy, int gw, int gh,
+                           const unsigned char *rgba) {
+    const unsigned char *src;
+    if (gw <= 0 || gh <= 0 || !rgba) return 0;
+    src = pgl_upscale_rgba(rgba, gw, gh);
+    if (!src) return 0;
+    pgl_glBindTexture(PGGL_TEXTURE_2D, pgl_rt_tex);
+    pgl_obj_used |= 16u;
+    pgl_glTexSubImage2D(PGGL_TEXTURE_2D, 0, PGL_S(gx), PGL_S(gy),
+                        PGL_S(gw), PGL_S(gh), PGGL_RGBA, PGGL_UNSIGNED_BYTE,
+                        src);
+    return 1;
+}
+
+/* (Re)specify the whole colour attachment from a native RGBA8 image
+   (NULL = allocate only, contents undefined). */
+static int pgl_specify_rgba(int gw, int gh, const unsigned char *rgba) {
+    const unsigned char *src = pgl_upscale_rgba(rgba, gw, gh);
+    if (rgba && !src) return 0;
+    pgl_glBindTexture(PGGL_TEXTURE_2D, pgl_rt_tex);
+    pgl_obj_used |= 16u;
+    pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_RGBA8, PGL_S(gw), PGL_S(gh), 0,
+                     PGGL_RGBA, PGGL_UNSIGNED_BYTE, src);
+    return 1;
+}
+
+/* (Re)specify the integer-z mirror (R32F) from a native float image. */
+static int pgl_specify_r32f(int gw, int gh, const float *z_native) {
+    const float *src = pgl_upscale_z(z_native, gw, gh);
+    if (z_native && !src) return 0;
+    pgl_glBindTexture(PGGL_TEXTURE_2D, pgl_z_tex);
+    pgl_obj_used |= 128u;
+    pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_R32F, PGL_S(gw), PGL_S(gh), 0,
+                     PGGL_RED, PGGL_FLOAT, src);
+    return 1;
+}
+
+/* (Re)specify the real depth attachment (D32F) from a native float image. */
+static int pgl_specify_d32f(int gw, int gh, const float *z_native) {
+    const float *src = pgl_upscale_z(z_native, gw, gh);
+    if (z_native && !src) return 0;
+    pgl_glBindTexture(PGGL_TEXTURE_2D, pgl_dtex);
+    pgl_obj_used |= 512u;
+    pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_DEPTH_COMPONENT32F,
+                     PGL_S(gw), PGL_S(gh), 0, PGGL_DEPTH_COMPONENT, PGGL_FLOAT,
+                     src);
+    return 1;
+}
+
+/* ---- write-back read-back: supersampled box -> native texels -------------
+   Colour and alpha are BOX FILTERED: each native texel is the rounded mean of
+   its f x f target texels (sum + n/2) / n, per channel, alpha included.  That
+   is what makes an edge that splits the pixel become a proportional blend,
+   and it is the identity at f == 1.
+   Depth is NOT averaged (a mean of z values is a depth no fragment ever had,
+   and it would break the integer compare in the in-shader path): the value of
+   the sub-sample nearest the NATIVE pixel centre is taken (ties go to the
+   higher sub-sample).  That keeps "the frontmost surface at this pixel" —
+   the same answer a native render gives — while the colour keeps the extra
+   coverage information. */
+static unsigned char *pgl_rb_color_native(int x0, int y0, int x1, int y1) {
+    const int f = pgl_cur_scale;
+    unsigned w = (unsigned)(x1 - x0 + 1), h = (unsigned)(y1 - y0 + 1);
+    unsigned char *out = (unsigned char *)malloc((size_t)w * (size_t)h * 4u);
+    unsigned x, y, sx, sy, n = (unsigned)(f * f);
+    if (!out) return NULL;
+    if (f <= 1) {
+        pgl_glReadPixels(x0, y0, (PGsizei)w, (PGsizei)h, PGGL_RGBA,
+                         PGGL_UNSIGNED_BYTE, out);
+        return out;
+    }
+    {
+        unsigned sw = w * (unsigned)f, sh = h * (unsigned)f;
+        unsigned char *big = (unsigned char *)malloc((size_t)sw * sh * 4u);
+        if (!big) { free(out); return NULL; }
+        pgl_glReadPixels(x0 * f, y0 * f, (PGsizei)sw, (PGsizei)sh, PGGL_RGBA,
+                         PGGL_UNSIGNED_BYTE, big);
+        for (y = 0; y < h; ++y)
+            for (x = 0; x < w; ++x) {
+                unsigned acc[4] = { 0, 0, 0, 0 };
+                int k;
+                for (sy = 0; sy < (unsigned)f; ++sy) {
+                    const unsigned char *row = big +
+                        (((size_t)(y * f + sy) * sw + (size_t)x * f) * 4u);
+                    for (sx = 0; sx < (unsigned)f; ++sx, row += 4u)
+                        for (k = 0; k < 4; ++k) acc[k] += row[k];
+                }
+                for (k = 0; k < 4; ++k)
+                    out[((size_t)y * w + x) * 4u + (size_t)k] =
+                        (unsigned char)((acc[k] + n / 2u) / n);
+            }
+        free(big);
+    }
+    return out;
+}
+
+static float *pgl_rb_depth_native(int x0, int y0, int x1, int y1) {
+    const int f = pgl_cur_scale;
+    unsigned w = (unsigned)(x1 - x0 + 1), h = (unsigned)(y1 - y0 + 1);
+    float *out = (float *)malloc((size_t)w * (size_t)h * sizeof(float));
+    if (!out) return NULL;
+    if (f <= 1) {
+        pgl_glReadPixels(x0, y0, (PGsizei)w, (PGsizei)h, PGGL_RED,
+                         PGGL_FLOAT, out);
+        return out;
+    }
+    {
+        unsigned sw = w * (unsigned)f, sh = h * (unsigned)f;
+        float *big = (float *)malloc((size_t)sw * sh * sizeof(float));
+        unsigned x, y;
+        int k = f / 2;              /* sub-sample nearest the native centre */
+        if (!big) { free(out); return NULL; }
+        pgl_glReadPixels(x0 * f, y0 * f, (PGsizei)sw, (PGsizei)sh, PGGL_RED,
+                         PGGL_FLOAT, big);
+        for (y = 0; y < h; ++y)
+            for (x = 0; x < w; ++x)
+                out[(size_t)y * w + x] =
+                    big[((size_t)(y * f + (unsigned)k)) * sw +
+                        (size_t)(x * f + (unsigned)k)];
+        free(big);
+    }
+    return out;
+}
+
 static int pgl_refresh(const PicaGlState *st, const PicaGlHost *host,
                        const unsigned char *raw, unsigned len) {
     unsigned char *pixels;
@@ -4711,11 +6034,7 @@ static int pgl_refresh(const PicaGlState *st, const PicaGlHost *host,
                         r = host->rt_px_off(host->user, (int)x, (int)y) % L;
                         memcpy(pixels + ((size_t)y * st->rt_w + x) * 4u, col[r], 4);
                     }
-                pgl_glBindTexture(PGGL_TEXTURE_2D, pgl_rt_tex);
-                pgl_obj_used |= 16u;
-                pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_RGBA8, (PGsizei)st->rt_w,
-                                 (PGsizei)st->rt_h, 0, PGGL_RGBA, PGGL_UNSIGNED_BYTE,
-                                 pixels);
+                pgl_specify_rgba((int)st->rt_w, (int)st->rt_h, pixels);
                 free(pixels);
                 pgl_drain_errors("rt-upload", NULL);
                 memcpy(pgl_shadow, raw, len);
@@ -4781,12 +6100,8 @@ static int pgl_refresh(const PicaGlState *st, const PicaGlHost *host,
                             }
                         }
                     }
-                    pgl_glBindTexture(PGGL_TEXTURE_2D, pgl_rt_tex);
-                    pgl_obj_used |= 16u;
-                    pgl_glTexSubImage2D(PGGL_TEXTURE_2D, 0,
-                                        (PGint)(run_bx * 8u), (PGint)y0,
-                                        (PGsizei)(run_n * 8u), 8,
-                                        PGGL_RGBA, PGGL_UNSIGNED_BYTE, buf);
+                    pgl_upload_rgba((int)(run_bx * 8u), y0,
+                                    (int)(run_n * 8u), 8, buf);
                     ++buffers;
                     if (refver && buffers <= 64u) {
                         unsigned char *ref = (unsigned char *)malloc(
@@ -4858,10 +6173,7 @@ static int pgl_refresh(const PicaGlState *st, const PicaGlHost *host,
                         memset(rgba, 0, 4);
                     memcpy(pixels + ((size_t)row * 8u + ci) * 4u, rgba, 4);
                 }
-            pgl_glBindTexture(PGGL_TEXTURE_2D, pgl_rt_tex);
-            pgl_obj_used |= 16u;
-            pgl_glTexSubImage2D(PGGL_TEXTURE_2D, 0, (PGint)(bx * 8u), (PGint)y0,
-                                8, 8, PGGL_RGBA, PGGL_UNSIGNED_BYTE, pixels);
+            pgl_upload_rgba((int)(bx * 8u), y0, 8, 8, pixels);
             }
         }
         pgl_drain_errors("rt-subupload", NULL);
@@ -4875,10 +6187,7 @@ static int pgl_refresh(const PicaGlState *st, const PicaGlHost *host,
                     memset(rgba, 0, 4);
                 memcpy(img + ((size_t)y * st->rt_w + x) * 4u, rgba, 4);
             }
-        pgl_glBindTexture(PGGL_TEXTURE_2D, pgl_rt_tex);
-        pgl_obj_used |= 16u;
-        pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_RGBA8, (PGsizei)st->rt_w,
-                         (PGsizei)st->rt_h, 0, PGGL_RGBA, PGGL_UNSIGNED_BYTE, img);
+        pgl_specify_rgba((int)st->rt_w, (int)st->rt_h, img);
         free(img);
         pgl_drain_errors("rt-upload", NULL);
     }
@@ -5003,21 +6312,20 @@ static int pgl_refresh_depth(const PicaGlState *st, const PicaGlHost *host,
                     z = 0;
                 img[(size_t)y * st->rt_w + x] = (float)z;
             }
-        pgl_glBindTexture(PGGL_TEXTURE_2D, pgl_z_tex);
-        pgl_obj_used |= 128u;
-        pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_R32F, (PGsizei)st->rt_w,
-                         (PGsizei)st->rt_h, 0, PGGL_RED, PGGL_FLOAT, img);
+        if (!pgl_specify_r32f((int)st->rt_w, (int)st->rt_h, img)) {
+            free(img);
+            return 0;
+        }
         /* t_a22413f1: the same values, scaled into [0,1] with an exact
            power-of-two factor, become the real depth attachment the
            rasterizer tests against (zf ordering == float ordering). */
         if (pgl_depth_hw) {
             size_t n = (size_t)st->rt_w * st->rt_h, k;
             for (k = 0; k < n; ++k) img[k] *= (1.0f / 16777216.0f);
-            pgl_glBindTexture(PGGL_TEXTURE_2D, pgl_dtex);
-            pgl_obj_used |= 512u;
-            pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_DEPTH_COMPONENT32F,
-                             (PGsizei)st->rt_w, (PGsizei)st->rt_h, 0,
-                             PGGL_DEPTH_COMPONENT, PGGL_FLOAT, img);
+            if (!pgl_specify_d32f((int)st->rt_w, (int)st->rt_h, img)) {
+                free(img);
+                return 0;
+            }
         }
         free(img);
         pgl_drain_errors("z-upload", NULL);
@@ -5498,13 +6806,15 @@ static void pgl_wb_depth(const PicaGlHost *host, int have_raw,
    NULL on failure (the FBO content is then marked untrustworthy). */
 static float *pgl_rb_depth(int x0, int y0, int x1, int y1) {
     unsigned w = (unsigned)(x1 - x0 + 1), h = (unsigned)(y1 - y0 + 1);
-    float *buf = (float *)malloc((size_t)w * h * sizeof(float));
-    if (!buf) return NULL;
+    float *buf;
     pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_fbo);
     pgl_obj_used |= 8u;
     pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT1);
-    pgl_glReadPixels(x0, y0, (PGsizei)w, (PGsizei)h, PGGL_RED, PGGL_FLOAT, buf);
+    /* t_ab8159de: reads the f x f attachment box and reduces it to the value
+       of the sub-sample nearest each native pixel centre. */
+    buf = pgl_rb_depth_native(x0, y0, x1, y1);
     pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
+    if (!buf) { pgl_request_resync(); return NULL; }
     if (pgl_drain_errors("z-readback", NULL) != 0) {
         free(buf);
         pgl_request_resync();
@@ -5844,6 +7154,19 @@ static void pgl_depth_dump(int x0, int y0, int x1, int y1) {
         pgl_depth_dump_on = (e && e[0] && e[0] != '0') ? 1 : 0;
     }
     if (!pgl_depth_dump_on || pgl_fbo == 0 || pgl_rt_w < 8 || pgl_rt_h < 8) return;
+    /* t_05281b89: the dump is written in NATIVE guest pixels; a supersampled
+       attachment would silently produce f x f times the rows.  Skip with one
+       notice instead of writing a file nobody can compare. */
+    if (pgl_cur_scale > 1) {
+        static int once;
+        if (!once) {
+            once = 1;
+            fprintf(stderr, "GL backend: depth dump skipped — the target is "
+                            "rendered at x%d (DQ8_RENDER_SCALE), dump needs "
+                            "native pixels\n", pgl_cur_scale);
+        }
+        return;
+    }
     dir = getenv("DQ8_GL_DEPTH_DUMP");
     if (!dir || !dir[0]) return;
     w = (unsigned)pgl_rt_w;
@@ -5995,7 +7318,7 @@ static void pgl_frame_guard(const unsigned char *px, unsigned w, unsigned h) {
     ++pgl_black_frames;
     pgl_dark_draws += pgl_frame_depth_draws;
     flat = (pgl_frame_guard_probes < 24u)
-         ? pgl_depth_box_flat(0, 0, (int)pgl_rt_w - 1, (int)pgl_rt_h - 1) : -2;
+         ? pgl_depth_box_flat(0, 0, (int)pgl_tgt_w - 1, (int)pgl_tgt_h - 1) : -2;
     pgl_guard_sample_flat = flat;
     if (flat == 1 || flat == -1) ++pgl_dark_frames;
     else if (flat == 0) pgl_dark_frames = 0;  /* something wrote depth */
@@ -6632,8 +7955,11 @@ static void pica_gl_flush_locked(const PicaGlHost *host, int have_raw) {
     pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_fbo);
     pgl_obj_used |= 8u;
     pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
-    pgl_glReadPixels(x0, y0, (PGsizei)w, (PGsizei)h, PGGL_RGBA,
-                     PGGL_UNSIGNED_BYTE, pixels);
+    {   /* t_ab8159de: read the f x f box and box-average it down to one texel
+           per guest pixel (identity at scale 1). */
+        unsigned char *red = pgl_rb_color_native(x0, y0, x1, y1);
+        if (red) { memcpy(pixels, red, (size_t)w * h * 4u); free(red); }
+    }
     {
         PGenum rb_err = 0;
         if (pgl_drain_errors("readback", &rb_err) != 0) {
@@ -6788,6 +8114,17 @@ static void pica_gl_flush_locked(const PicaGlHost *host, int have_raw) {
         fprintf(stderr, "GL debug: flush #%llu box=%d,%d..%d,%d rt=%ux%u\n",
                 (unsigned long long)pgl_flushes, x0, y0, x1, y1, pgl_rt_w, pgl_rt_h);
     pgl_reset_drawn();
+    /* t_fdd26eba item A: remember whose scaled content the attachment now
+       holds, so a display transfer that follows this publish can inherit the
+       scale (the guest publishes through the transfer AFTER it consumed the
+       frame, i.e. after the flush). */
+    pgl_cap_valid = 1;
+    pgl_cap_addr = pica_rt_addr;
+    pgl_cap_w = (int)pgl_rt_w;
+    pgl_cap_h = (int)pgl_rt_h;
+    pgl_cap_f = pgl_cur_scale;
+    pgl_cap_draws = pgl_draws;
+    pgl_cap_flushes = pgl_flushes;
     if (pgl_rect_trace)
         fprintf(stderr, "GLRECT flush#%llu box=%d,%d..%d,%d rt=%ux%u\n",
                 (unsigned long long)pgl_flushes, x0, y0, x1, y1, pgl_rt_w, pgl_rt_h);
@@ -6800,6 +8137,13 @@ static int pica_gl_pending(void) { return pgl_ready && pgl_pending; }
    transfer, capture, scan-out) or before a software-path draw. */
 static void pica_gl_flush(const PicaGlHost *host) {
     PglSavedCtx prev;
+    /* t_05281b89 stage A: a publish is the frame's content boundary — the
+       target the guest just consumed (sampled as a texture) has seen its
+       native pixels, so the next render into it may be scaled again.  The
+       flush that a texture read triggers is exempt (pgl_keep_marks). */
+    if (!pgl_keep_marks && pgl_native_n) pgl_native_n = 0;
+    pgl_keep_marks = 0;
+    ++pgl_flushseq;
     /* t_2d934e23: where does the deferred write-back's wall time go?  The
        EGL context is dropped at the start of every flush and re-taken below
        (pgl_context_take -> eglMakeCurrent), so measure release / take /
@@ -6908,6 +8252,8 @@ static void pgl_pack_tri(const PicaGlVertex *verts, unsigned nverts,
             memcpy(pay->b[k], v->color, sizeof pay->b[k]);
             pay->c[k][0] = v->u;
             pay->c[k][1] = v->v;
+            pay->c[k][2] = v->u1;
+            pay->c[k][3] = v->v1;
         }
     }
 }
@@ -6937,7 +8283,7 @@ static unsigned pica_gl_draw_locked(const PicaGlVertex *verts, unsigned nverts,
         const char *e = getenv("DQ8_GL_DEPTHLOG");
         pgl_dlog_on = (e && e[0] && e[0] != '0') ? 1 : 0;
     }
-    if (st->mode == PICA_GL_TEV && st->tev.tex_en &&
+    if (st->mode == PICA_GL_TEV && st->tev.tex_en && !st->tex_is_rt &&
         (!st->tex_rgba || st->tex_w <= 0 || st->tex_h <= 0)) return 0;
     /* t_05a3190d: deterministic draw-stream replay A/B — record this draw. */
     if (pgl_rep_env < 0) pgl_rep_setup();
@@ -7152,7 +8498,10 @@ static unsigned pica_gl_draw_locked(const PicaGlVertex *verts, unsigned nverts,
 
     pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_fbo);
     pgl_obj_used |= 8u;
-    pgl_glViewport(0, 0, (PGsizei)st->rt_w, (PGsizei)st->rt_h);
+    /* t_ab8159de: the supersampled target.  The vertex shader keeps mapping
+       guest coordinates through u_rt (guest dims), so guest pixel p lands at
+       target texel p*f — the mapping is exact for every scale. */
+    pgl_glViewport(0, 0, (PGsizei)pgl_tgt_w, (PGsizei)pgl_tgt_h);
     /* t_993e6fb6: colour mask on ATT0 only; ATT1 (depth mirror) follows
        depth_on, never the PICA colour mask. */
     pgl_apply_color_mask(st);
@@ -7290,19 +8639,22 @@ static unsigned pica_gl_draw_locked(const PicaGlVertex *verts, unsigned nverts,
         pgl_glActiveTexture(PGGL_TEXTURE1);
         pgl_glBindTexture(PGGL_TEXTURE_2D, pgl_dst_tex);
         pgl_obj_used |= 64u;
-        if (pgl_dst_w != (int)st->rt_w || pgl_dst_h != (int)st->rt_h) {
-            pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_RGBA8, (PGsizei)st->rt_w,
-                             (PGsizei)st->rt_h, 0, PGGL_RGBA, PGGL_UNSIGNED_BYTE,
+        if (pgl_dst_w != pgl_tgt_w || pgl_dst_h != pgl_tgt_h) {
+            /* t_ab8159de: same-size-as-the-target copy; the shader samples it
+               at the supersampled coordinate minus the scaled box origin. */
+            pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_RGBA8, pgl_tgt_w,
+                             pgl_tgt_h, 0, PGGL_RGBA, PGGL_UNSIGNED_BYTE,
                              NULL);
-            pgl_dst_w = (int)st->rt_w;
-            pgl_dst_h = (int)st->rt_h;
+            pgl_dst_w = pgl_tgt_w;
+            pgl_dst_h = pgl_tgt_h;
             pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_MIN_FILTER, PGGL_NEAREST);
             pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_MAG_FILTER, PGGL_NEAREST);
             pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_WRAP_S, PGGL_CLAMP_TO_EDGE);
             pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_WRAP_T, PGGL_CLAMP_TO_EDGE);
         }
-        pgl_glCopyTexSubImage2D(PGGL_TEXTURE_2D, 0, 0, 0, (PGint)bx0, (PGint)by0,
-                                (PGsizei)bw, (PGsizei)bh);
+        pgl_glCopyTexSubImage2D(PGGL_TEXTURE_2D, 0, 0, 0,
+                                (PGint)PGL_S(bx0), (PGint)PGL_S(by0),
+                                (PGsizei)PGL_S(bw), (PGsizei)PGL_S(bh));
         ++pgl_dst_copies;
     }
     pgl_ph_dst_ns += pica_pqt_now_ns() - ct0;
@@ -7313,18 +8665,18 @@ static unsigned pica_gl_draw_locked(const PicaGlVertex *verts, unsigned nverts,
             pgl_glActiveTexture(PGGL_TEXTURE2);
             pgl_glBindTexture(PGGL_TEXTURE_2D, pgl_zdst_tex);
             pgl_obj_used |= 256u;
-            if (pgl_zdst_w != (int)st->rt_w || pgl_zdst_h != (int)st->rt_h) {
-                pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_R32F, (PGsizei)st->rt_w,
-                                 (PGsizei)st->rt_h, 0, PGGL_RED, PGGL_FLOAT,
-                                 NULL);
-                pgl_zdst_w = (int)st->rt_w;
-                pgl_zdst_h = (int)st->rt_h;
+            if (pgl_zdst_w != pgl_tgt_w || pgl_zdst_h != pgl_tgt_h) {
+                pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_R32F, pgl_tgt_w,
+                                 pgl_tgt_h, 0, PGGL_RED, PGGL_FLOAT, NULL);
+                pgl_zdst_w = pgl_tgt_w;
+                pgl_zdst_h = pgl_tgt_h;
                 pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_MIN_FILTER, PGGL_NEAREST);
                 pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_MAG_FILTER, PGGL_NEAREST);
             }
             pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT1);
-            pgl_glCopyTexSubImage2D(PGGL_TEXTURE_2D, 0, 0, 0, (PGint)bx0,
-                                    (PGint)by0, (PGsizei)bw, (PGsizei)bh);
+            pgl_glCopyTexSubImage2D(PGGL_TEXTURE_2D, 0, 0, 0,
+                                    (PGint)PGL_S(bx0), (PGint)PGL_S(by0),
+                                    (PGsizei)PGL_S(bw), (PGsizei)PGL_S(bh));
             pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
             ++pgl_zdst_copies;
         }
@@ -7359,7 +8711,47 @@ static unsigned pica_gl_draw_locked(const PicaGlVertex *verts, unsigned nverts,
         pgl_set_uniforms(st, gl_blend, dst_used, zdst_used, (PGint)bx0,
                          (PGint)by0);    }
     pgl_drain_errors("use-program", NULL);
-    if (st->mode == PICA_GL_TEV && st->tev.tex_en) {
+    if (st->mode == PICA_GL_TEV && st->tev.tex_en && st->tex_is_rt &&
+        pgl_snap_tex) {
+        /* t_dd830a74 item 2: unit 0 is the current render target sampled at the
+           internal scale — bind the full-resolution snapshot (pica_gl.c
+           pica_gl_sample_scaled_target) instead of a staged native image.
+           Normalised UVs are unchanged, so the guest's texture coordinates
+           need no scaling; the wrap/filter state is the guest's, exactly like
+           the staged path. */
+        pgl_glActiveTexture(PGGL_TEXTURE0);
+        pgl_glBindTexture(PGGL_TEXTURE_2D, pgl_snap_tex);
+        pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_WRAP_S,
+                            (PGint)pgl_wrap_enum(st->wrap_s));
+        pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_WRAP_T,
+                            (PGint)pgl_wrap_enum(st->wrap_t));
+        pgl_tex_filter_apply(st, 0);
+        pgl_glUniform1i(pgl_u_tex, 0);
+        pgl_diag_post_want = 1;   /* diagnosis only; 0 unless DQ8_RS_SNAP_DUMP */
+        if (pgl_debug) {
+            float u0 = 1e9f, u1 = -1e9f, v0 = 1e9f, v1 = -1e9f;
+            unsigned k;
+            for (k = 0; k < nverts; ++k) {
+                if (verts[k].u < u0) u0 = verts[k].u;
+                if (verts[k].u > u1) u1 = verts[k].u;
+                if (verts[k].v < v0) v0 = verts[k].v;
+                if (verts[k].v > v1) v1 = verts[k].v;
+            }
+            fprintf(stderr, "GL debug: target-sample draw #%llu uv=[%.4f..%.4f]x"
+                            "[%.4f..%.4f] tex=%ux%u snap=%dx%d target=%ux%u\n",
+                    (unsigned long long)pgl_draws, u0, u1, v0, v1,
+                    st->tex_w, st->tex_h, pgl_snap_w, pgl_snap_h,
+                    pgl_tgt_w, pgl_tgt_h);
+            for (k = 0; k < nverts && k < 6u; ++k)
+                fprintf(stderr, "GL debug:   v%u xy=(%.1f,%.1f) uv=(%.4f,%.4f)\n",
+                        k, verts[k].x, verts[k].y, verts[k].u, verts[k].v);
+        }
+    } else if (st->mode == PICA_GL_TEV && st->tev.tex_en) {
+        if (pgl_diag_stage_want) {
+            pgl_diag_stage_want = 0;
+            pgl_diag_stage_dump(st->tex_rgba, st->tex_w, st->tex_h);
+            pgl_diag_post_want = 1;
+        }
         /* Upload cache.  Two identities are recognised:
            (a) t_66c89cf2 primary path — the staging cache handed us a slot id
                plus a generation counter, both bumped only when that slot is
@@ -7495,7 +8887,51 @@ static unsigned pica_gl_draw_locked(const PicaGlVertex *verts, unsigned nverts,
             if (i == sizeof wrap_map / sizeof wrap_map[0]) s = PGGL_CLAMP_TO_EDGE;
             pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_WRAP_T, (PGint)s);
         }
+        /* t_c043d7f7: filter state is per draw (the upload cache is keyed on
+           the image, not on the sampler bits), so it is applied on every
+           bind, after the wrap parameters. */
+        pgl_tex_filter_apply(st, 0);
         pgl_glUniform1i(pgl_u_tex, 0);
+    }
+    /* t_e216fc37: upload + bind PICA texture unit 1 when this draw's TEV chain
+       reads it (pica_gl_st.tex1_* is filled by the unit-1 staging cache). */
+    if (st->mode == PICA_GL_TEV && st->tex1_en && st->tex1_rgba &&
+        st->tex1_w > 0 && st->tex1_h > 0) {
+        unsigned si = (st->tex1_slot < (unsigned)PGL_TEX1_SLOTS)
+                          ? st->tex1_slot : 0u;
+        PglTex1Slot *s1 = &pgl_tex1[si];
+        if (!s1->tex) pgl_glGenTextures(1, &s1->tex);
+        s1->used = 1;
+        pgl_glActiveTexture(PGGL_TEXTURE3);
+        pgl_glBindTexture(PGGL_TEXTURE_2D, s1->tex);
+        pgl_obj_used |= 4096u;
+        if (s1->gen != st->tex1_gen || s1->ptr != st->tex1_rgba ||
+            s1->w != st->tex1_w || s1->h != st->tex1_h) {
+            pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_MIN_FILTER, PGGL_NEAREST);
+            pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_MAG_FILTER, PGGL_NEAREST);
+            if (s1->gen && s1->w == st->tex1_w && s1->h == st->tex1_h &&
+                s1->ptr == st->tex1_rgba) {
+                pgl_glTexSubImage2D(PGGL_TEXTURE_2D, 0, 0, 0, st->tex1_w,
+                                    st->tex1_h, PGGL_RGBA, PGGL_UNSIGNED_BYTE,
+                                    st->tex1_rgba);
+            } else {
+                pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_RGBA8, st->tex1_w,
+                                 st->tex1_h, 0, PGGL_RGBA, PGGL_UNSIGNED_BYTE,
+                                 st->tex1_rgba);
+            }
+            s1->ptr = st->tex1_rgba;
+            s1->w = st->tex1_w;
+            s1->h = st->tex1_h;
+            s1->gen = st->tex1_gen;
+            ++pgl_tex1_uploads;
+        }
+        pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_WRAP_S,
+                            (PGint)pgl_wrap_enum(st->wrap_s1));
+        pgl_glTexParameteri(PGGL_TEXTURE_2D, PGGL_TEXTURE_WRAP_T,
+                            (PGint)pgl_wrap_enum(st->wrap_t1));
+        pgl_tex_filter_apply(st, 1);
+        pgl_glActiveTexture(PGGL_TEXTURE0);
+        if (pgl_u_tex1 >= 0) pgl_glUniform1i(pgl_u_tex1, 3);
     }
     pgl_drain_errors("tex-upload", NULL);
     ph_t3 = pica_pqt_now_ns(); /* t_8c05fac8: uniforms+tex done */
@@ -7561,9 +8997,9 @@ static unsigned pica_gl_draw_locked(const PicaGlVertex *verts, unsigned nverts,
                                       (const void *)(base + 48u + (size_t)i * 16u));
             pgl_glVertexAttribDivisor(2 + 3u * i, 1);
             pgl_glEnableVertexAttribArray(3 + 3u * i);
-            pgl_glVertexAttribPointer(3 + 3u * i, 2, PGGL_FLOAT, 0,
+            pgl_glVertexAttribPointer(3 + 3u * i, 4, PGGL_FLOAT, 0,
                                       sizeof(PicaGlTriPayload),
-                                      (const void *)(base + 96u + (size_t)i * 8u));
+                                      (const void *)(base + 96u + (size_t)i * 16u));
             pgl_glVertexAttribDivisor(3 + 3u * i, 1);
         }
         ph_t4 = pica_pqt_now_ns(); /* t_8c05fac8: before the draw submit */
@@ -7598,7 +9034,19 @@ static unsigned pica_gl_draw_locked(const PicaGlVertex *verts, unsigned nverts,
             }
         }
         if (!(pgl_skip_mask & PGL_SK_GEO)) {
+            /* t_150574cd face culling: NO glEnable(GL_CULL_FACE) here, by
+               design.  This backend is not a fixed-function triangle
+               rasteriser: every instance is ONE PICA triangle whose vertices
+               are placed at their real screen positions (VS: ndc = p/u_rt*2-1)
+               and the fragment shader does the PICA edge tests itself, so a
+               GL front-face test would be a second, differently-defined
+               winding test on the same geometry.  The guest's GPUREG 0x40
+               mode is instead applied once, in pica_vs.c pica_queue_triangle()
+               (pica_cull_keep()), on the triangles both backends consume, so
+               `ntri` here is already the guest's kept-face set and the
+               hardware and software paths cannot disagree. */
             pgl_glDrawArraysInstanced(PGGL_TRIANGLES, 0, 3, (PGsizei)ntri);
+            if (pgl_diag_post_want) { pgl_diag_post_want = 0; pgl_diag_post_dump(); }
             /* t_fa78ea1f: per-draw render-target census (DQ8_GL_DRAWDUMP).
                Reads the whole attachment back after each draw of the window
                and prints the dark share of the image plus a 4x4 grid, so a
@@ -7842,6 +9290,18 @@ static unsigned pica_gl_draw_locked(const PicaGlVertex *verts, unsigned nverts,
     if (st->depth_on && !pgl_split_cur) {
         pgl_zdirty = 1;
         if (st->depth_write) pgl_zwrote = 1;
+    }
+
+    /* t_05281b89: stage A coverage accounting (see pgl_cov_mark). */
+    pgl_tgtstat_add((int)st->rt_w, (int)st->rt_h, pgl_cur_scale);
+    pgl_cov_mark((int)st->rt_w, (int)st->rt_h, bx0, by0, bx1, by1,
+                 pgl_cur_scale > 1);
+    if (pgl_cur_scale > 1) {
+        ++pgl_cov_draws_scaled;
+        if (bw && bh) pgl_cov_px_scaled += (unsigned long long)bw * bh;
+    } else {
+        ++pgl_cov_draws_native;
+        if (bw && bh) pgl_cov_px_native += (unsigned long long)bw * bh;
     }
 
     if (bw && bh && !pgl_split_cur) {
@@ -8227,19 +9687,14 @@ static int pgl_split_apply_refresh(const PicaGlState *st) {
             unsigned bi = op->ref_blocks[i];
             unsigned bx = bi % blocks_x, by = bi / blocks_x;
             int y0 = (int)st->rt_h - 1 - (int)(by * 8u + 7u);
-            pgl_glTexSubImage2D(PGGL_TEXTURE_2D, 0, (PGint)(bx * 8u), (PGint)y0,
-                                8, 8, PGGL_RGBA, PGGL_UNSIGNED_BYTE,
-                                op->ref_blob + (size_t)i * 256u);
+            pgl_upload_rgba((int)(bx * 8u), y0, 8, 8,
+                            op->ref_blob + (size_t)i * 256u);
         }
         pgl_drain_errors("rt-subupload", NULL);
         break;
     }
     case PGL_REF_FULL:
-        pgl_glBindTexture(PGGL_TEXTURE_2D, pgl_rt_tex);
-        pgl_obj_used |= 16u;
-        pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_RGBA8, (PGsizei)st->rt_w,
-                         (PGsizei)st->rt_h, 0, PGGL_RGBA, PGGL_UNSIGNED_BYTE,
-                         op->ref_full);
+        pgl_specify_rgba((int)st->rt_w, (int)st->rt_h, op->ref_full);
         pgl_drain_errors("rt-upload", NULL);
         break;
     }
@@ -8276,22 +9731,14 @@ static int pgl_split_apply_refresh(const PicaGlState *st) {
         }
         break;
     case PGL_ZREF_FULL:
-        pgl_glBindTexture(PGGL_TEXTURE_2D, pgl_z_tex);
-        pgl_obj_used |= 128u;
-        pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_R32F, (PGsizei)st->rt_w,
-                         (PGsizei)st->rt_h, 0, PGGL_RED, PGGL_FLOAT,
-                         op->zref_full);
+        pgl_specify_r32f((int)st->rt_w, (int)st->rt_h, op->zref_full);
         /* t_a22413f1: mirror into the real depth attachment (scaled). */
         if (pgl_depth_hw && op->zref_full) {
             size_t n = (size_t)st->rt_w * st->rt_h, k;
             float *scaled = (float *)malloc(n * sizeof(float));
             if (!scaled) { pgl_request_resync(); break; }
             for (k = 0; k < n; ++k) scaled[k] = op->zref_full[k] * (1.0f / 16777216.0f);
-            pgl_glBindTexture(PGGL_TEXTURE_2D, pgl_dtex);
-            pgl_obj_used |= 512u;
-            pgl_glTexImage2D(PGGL_TEXTURE_2D, 0, PGGL_DEPTH_COMPONENT32F,
-                             (PGsizei)st->rt_w, (PGsizei)st->rt_h, 0,
-                             PGGL_DEPTH_COMPONENT, PGGL_FLOAT, scaled);
+            pgl_specify_d32f((int)st->rt_w, (int)st->rt_h, scaled);
             free(scaled);
             ++pgl_depth_syncs;
         }
@@ -8323,8 +9770,10 @@ static void pgl_split_do_flush(PglSplitOp *op) {
     pgl_glBindFramebuffer(PGGL_FRAMEBUFFER, pgl_fbo);
     pgl_obj_used |= 8u;
     pgl_glReadBuffer(PGGL_COLOR_ATTACHMENT0);
-    pgl_glReadPixels(x0, y0, (PGsizei)w, (PGsizei)h, PGGL_RGBA,
-                     PGGL_UNSIGNED_BYTE, op->fl_px);
+    {   /* t_ab8159de: scaled read + box average (identity at scale 1). */
+        unsigned char *red = pgl_rb_color_native(x0, y0, x1, y1);
+        if (red) { memcpy(op->fl_px, red, (size_t)w * h * 4u); free(red); }
+    }
     {
         PGenum rb_err = 0;
         if (pgl_drain_errors("readback", &rb_err) != 0) {
@@ -8470,7 +9919,7 @@ static unsigned pica_gl_draw_split(const PicaGlVertex *verts, unsigned nverts,
        must still fall back to the software rasterizer). */
     if (!ntri || !st || !host || !host->rt_get || !host->rt_put) return 0;
     if (!st->rt_w || !st->rt_h) return 0;
-    if (st->mode == PICA_GL_TEV && st->tev.tex_en &&
+    if (st->mode == PICA_GL_TEV && st->tev.tex_en && !st->tex_is_rt &&
         (!st->tex_rgba || st->tex_w <= 0 || st->tex_h <= 0)) return 0;
     /* The split needs raw batched access for push-time refresh + write-back. */
     if (!host->rt_raw || !host->rt_px_off) return 0;
@@ -8619,6 +10068,15 @@ static int pica_gl_init_external(void *(*getproc)(const char *)) {
     return 0;
 }
 static void pica_gl_context_release(void) {}
+/* FREEZE WATCHDOG (t_4371e6ea): no GL backend compiled in, no hold. */
+static int pica_gl_hold_state(const void **owner, unsigned long long *releases,
+                              unsigned long long *mid) {
+    if (owner) *owner = NULL;
+    if (releases) *releases = 0;
+    if (mid) *mid = 0;
+    return 0;
+}
+static long pica_gl_hold_tid(void) { return 0; }
 static int pica_gl_active(void) { return 0; }
 /* t_cb8723ae: staging-decode sync hook (no GL build = no queue). */
 static void pica_gl_split_sync(void) {}
@@ -8628,6 +10086,22 @@ static unsigned long long pica_gl_draw_count(void) { return 0; }
 static const char *pica_gl_renderer(void) { return "not compiled in"; }
 static void pica_gl_shutdown(void) {}
 static int pica_gl_pending(void) { return 0; }
+/* t_fdd26eba: no GL backend, so a display transfer never inherits a scale. */
+static int pica_gl_transfer_scaled_capture(unsigned src_addr, unsigned src_w,
+                                           unsigned src_h, unsigned crop_w,
+                                           unsigned crop_h, unsigned dst_w,
+                                           unsigned dst_h, int vflip,
+                                           unsigned h_scale, unsigned v_scale,
+                                           unsigned char **out, unsigned *ow,
+                                           unsigned *oh, int *oscale) {
+    (void)src_addr; (void)src_w; (void)src_h; (void)crop_w; (void)crop_h;
+    (void)dst_w; (void)dst_h; (void)vflip; (void)h_scale; (void)v_scale;
+    if (out) *out = NULL;
+    (void)ow; (void)oh; (void)oscale;
+    return 0;
+}
+static unsigned long long pgl_tr_taken, pgl_tr_fallback, pgl_tr_ns,
+    pgl_tr_fallback_mem, pgl_tr_fallback_gate;
 static void pica_gl_flush(const PicaGlHost *host) { (void)host; }
 static unsigned pica_gl_draw(const PicaGlVertex *verts, unsigned nverts,
                              const PicaGlState *st, const PicaGlHost *host) {

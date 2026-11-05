@@ -626,7 +626,7 @@ pub fn emit_region(
 /// is compiled to `L_EXIT` instead, and the dispatcher observes the flag
 /// before whatever pc the statement left behind.
 #[allow(clippy::too_many_arguments)]
-fn region_exit_edges(
+pub(crate) fn region_exit_edges(
     exit: &Exit,
     from: u32,
     region: &Region,

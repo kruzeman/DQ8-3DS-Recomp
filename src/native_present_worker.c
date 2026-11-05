@@ -91,6 +91,12 @@ static void split_present_convert_job(const SplitPresentJob *job) {
         prev->valid = 1;
     }
     host_display_convert_span(job->raw, job->bytes, job->w, job->h, job->fmt);
+    {
+        /* t_5286064e: per-screen serial, bumped only for content this worker
+           actually converted (the elision above returns before this). */
+        int rot = 0, tgt = host_capture_target(job->w, job->h, &rot);
+        if (tgt >= 0) ++host_shadow_serial[tgt];
+    }
     host_shadow_dirty = 1; /* converted content needs a present */
     ++split_present_converted;
 }
@@ -134,6 +140,8 @@ static void split_present_teardown(void) {
     host_sdl_surface = NULL;
     if (host_sdl_tex_top) SDL_DestroyTexture(host_sdl_tex_top);
     if (host_sdl_tex_bot) SDL_DestroyTexture(host_sdl_tex_bot);
+    if (host_sdl_tex_full) SDL_DestroyTexture(host_sdl_tex_full);
+    host_sdl_tex_full = NULL;
     if (host_sdl_renderer) SDL_DestroyRenderer(host_sdl_renderer);
     if (host_sdl_window) SDL_DestroyWindow(host_sdl_window);
     host_sdl_tex_top = host_sdl_tex_bot = NULL;

@@ -14,6 +14,7 @@ mod block_ir;
 // S1b: Block-IR -> native C emitter for ONE straight-line block, behind the
 // `--s1-block` generation flag + the DQ8_S1_BLOCK runtime gate.
 mod block_emit;
+mod fn_emit;
 
 const SECTOR: u64 = 0x200;
 
@@ -1986,7 +1987,17 @@ fn recompile_arm_function(
     start: u32,
     extra_entries: &[u32],
 ) -> Result<(), String> {
-    recompile_arm_function_with_noreturn(code, output, base, start, extra_entries, &[], None, None)
+    recompile_arm_function_with_noreturn(
+        code,
+        output,
+        base,
+        start,
+        extra_entries,
+        &[],
+        None,
+        None,
+        &[],
+    )
 }
 
 /// S1 rollout: every region converted in ONE build (the multi-region
@@ -2009,6 +2020,7 @@ fn recompile_arm_function_with_noreturn(
     noreturn_calls: &[u32],
     s1_block: Option<u32>,
     s1_cfg: Option<Vec<(u32, u32)>>,
+    fn_emit_list: &[(u32, u32)],
 ) -> Result<(), String> {
     let bytes = fs::read(code).map_err(|e| format!("cannot read {}: {e}", code.display()))?;
     if start < base || start as usize + 4 > base as usize + bytes.len() {
@@ -4538,6 +4550,69 @@ fn recompile_arm_function_with_noreturn(
             })
         }
     };
+    // FN_EMIT (t_8b9fda4c): emit the guest functions named by
+    // --fn-emit-list as real C functions (r0..r14 as locals, direct
+    // intra-function gotos, native return, and real C calls between emitted
+    // functions).  Without the flags every FN_EMIT string below is empty and
+    // the generated C stays byte-identical to a build without them (checked by
+    // sha256 in reports/FN_EMIT_PILOT.md).
+    let fn_program = if fn_emit_list.is_empty() {
+        None
+    } else {
+        for &(entry, end) in fn_emit_list {
+            if end <= entry {
+                return Err(format!(
+                    "--fn-emit-list: 0x{entry:08X}..0x{end:08X}: end must be above the entry"
+                ));
+            }
+            let start_ok = entry >= base && (entry - base) as usize + 4 <= bytes.len();
+            let end_ok = end >= base && (end - base) as usize <= bytes.len();
+            if !start_ok || !end_ok {
+                return Err(format!(
+                    "--fn-emit-list: 0x{entry:08X}..0x{end:08X} leaves the code image"
+                ));
+            }
+        }
+        let boundary: std::collections::BTreeSet<u32> = BOUNDARY_PCS.iter().copied().collect();
+        let prog = fn_emit::emit_program(
+            fn_emit_list,
+            &emitted,
+            std::env::var("DQ8_DISABLE_MEMORY_FASTPATH").as_deref() != Ok("1"),
+            &boundary,
+        );
+        for f in &prog.funcs {
+            eprintln!(
+                "FN_EMIT_PLAN entry=0x{:08X} end=0x{:08X} insns={} calls={} native_calls={} \
+                 dispatcher_calls={} dispatcher_exits={} (indirect={} opaque={}) resumes={} \
+                 may_dispatch={} boundary_sites={}/{}",
+                f.entry,
+                f.end,
+                f.insn_count,
+                f.calls,
+                f.calls_selected,
+                f.calls_dispatcher,
+                f.dispatcher_exits,
+                f.indirect_exits,
+                f.opaque_exits,
+                f.resume_points.len(),
+                if f.may_dispatch { 1 } else { 0 },
+                f.call_sites_exact,
+                f.call_sites_full
+            );
+        }
+        for f in &prog.skipped {
+            eprintln!(
+                "FN_EMIT_SKIP entry=0x{:08X} end=0x{:08X} reason={}",
+                f.entry, f.end, f.reason
+            );
+        }
+        if prog.funcs.is_empty() {
+            eprintln!("--fn-emit-list: no range could be emitted; generated C unchanged");
+            None
+        } else {
+            Some(prog)
+        }
+    };
     let mut c = String::from(
         r#"#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
@@ -4565,6 +4640,15 @@ fn recompile_arm_function_with_noreturn(
 #endif
 #endif
 /* FRAME_PROF_RUNTIME */
+/* FREEZE WATCHDOG (t_4371e6ea): forward declarations.  The implementation
+   lives just before translated_from(), i.e. after every spliced runtime
+   module whose state the dump reports (audio, GL, present worker, savestate),
+   so these are the only names the early call sites need. */
+static void dq8_watchdog_beat(void);
+static void dq8_watchdog_present_enter(void);
+static void dq8_watchdog_present_exit(void);
+static void dq8_watchdog_init(void);
+static void dq8_watchdog_stop(void);
 /* NATIVE_SPSC_RUNTIME */
 /* F4/F5 thread-split gate: DQ8_SPLIT_RENDER=1 moves framebuffer conversion,
    SDL event collection and presentation off the guest loop onto a dedicated
@@ -4691,6 +4775,11 @@ static int savestate_service(uint32_t *pc, uint32_t *r,
 static int savestate_take_resume(int *n, int *z, int *c, int *v, int *ge);
 static int savestate_cold_load(const char *path, uint32_t *pc, uint32_t *r);
 static void savestate_set_path(const char *path);
+/* HOST COMMANDS IN A WAIT (t_56936fec): defined in the spliced savestate
+   implementation below (src/native_savestate.c), used by the main-context
+   wait loops, which appear earlier in this file. */
+static int savestate_pending_kind(void);
+static void savestate_wait_escape(int kind, uint32_t handle, unsigned spin);
 static void guest_dump_threads(void);
 /* Host shadow buffers + scan-out state: defined with the host display code
    further below; the periodic progress dump reports their occupancy. */
@@ -4702,9 +4791,110 @@ static uint32_t gsp_fb_addr[2][2];
 static uint32_t gsp_fb_shown[2];
 static int gsp_fb_valid[2];
 static int guest_memory_range(uint32_t, uint64_t, uint32_t *);
+/* ======================================================================
+   PREEMPTIVE GUEST SLICE (t_353154d7)
+   ----------------------------------------------------------------------
+   The 3DS kernel preempts a runnable thread on a timer even when the guest
+   never calls an SVC.  The runtime only had a fixed 5000-instruction
+   dispatch quantum for worker contexts; a thread that keeps returning
+   runnable was handed the CPU again on the next scheduling pass, and the
+   main-context dispatch had no bound at all (it only called the scheduler
+   from a 100k-instruction watermark).  This adds a real slice:
+
+     * per-dispatch instruction bound  (DQ8_GUEST_SLICE_STEPS, default 5000,
+       the quantum the worker dispatch already used -- unchanged when the
+       slice is off)
+     * per-dispatch wall/guest-time bound (DQ8_GUEST_SLICE_MS, default 4 ms):
+       a worker dispatch returns to the scheduler after at most one slice
+       even when the thread is still runnable
+     * continuous-run fairness in schedule_guest_thread(): a thread that has
+       executed for a whole slice without parking is passed over once when
+       another runnable thread exists, and when it is the only runnable thread
+       the scheduler returns to its caller (the frame/audio/host path) instead
+       of immediately handing it the CPU again.
+
+   DQ8_GUEST_SLICE_MS=0 restores the pre-slice behaviour exactly (the 5000
+   instruction quantum, no fairness pass).  DQ8_GUEST_SLICE_RUN_STEPS=<n>
+   adds an instruction-based continuous-run budget (0 = time only).
+   DQ8_GUEST_SLICE_STEPS=0 removes the per-dispatch instruction bound
+   entirely (test-only A/B: a thread that never returns to the scheduler then
+   starves the frame path unless the time slice ends its dispatch).
+   DQ8_DETERMINISTIC pins the guest clock to retired instructions and an
+   exact bench budget, so the slice is disabled there (reported once).
+
+   Hot path: the dispatch loop only compares `steps` against a watermark;
+   the clock is read once per watermark, never per guest instruction.
+   ====================================================================== */
+static int guest_slice_on;                  /* DQ8_GUEST_SLICE_MS != 0 */
+static uint64_t guest_slice_ms = 4;         /* slice in milliseconds */
+static uint64_t guest_slice_ns;             /* guest_slice_ms in ns while on */
+static uint64_t guest_slice_steps = 5000;   /* per-dispatch instruction quantum */
+static uint64_t guest_slice_run_steps;      /* continuous-run instruction budget, 0 = time only */
+static uint64_t perf_slice_preempts;        /* worker dispatches ended by the slice */
+static uint64_t perf_slice_fairness_skips;  /* over-budget thread passed over */
+static uint64_t perf_slice_idle_returns;    /* over-budget thread was the only runnable one */
+static uint64_t perf_slice_max_run_ms;      /* longest uninterrupted execution stretch seen */
+static int guest_slice_last_expired;        /* last worker dispatch ended on the time slice */
+static uint64_t guest_slice_last_dispatch_ns; /* duration of the last worker dispatch */
+static int guest_slice_inited;
+static int guest_slice_other_runnable(unsigned except);
+static void guest_slice_init(void) {
+    const char *ms, *st, *rs;
+    if (guest_slice_inited) return;
+    guest_slice_inited = 1;
+    ms = getenv("DQ8_GUEST_SLICE_MS");
+    if (ms && *ms) {
+        guest_slice_ms = strtoull(ms, NULL, 0);
+        guest_slice_on = guest_slice_ms != 0u;
+    } else {
+        guest_slice_on = 1;                 /* default: preemption on */
+    }
+    if (!guest_slice_on) guest_slice_ms = 0u;
+    guest_slice_ns = guest_slice_ms * 1000000ull;
+    st = getenv("DQ8_GUEST_SLICE_STEPS");
+    if (st && *st) {
+        guest_slice_steps = strtoull(st, NULL, 0);   /* 0 = unbounded dispatch, test-only */
+    }
+    rs = getenv("DQ8_GUEST_SLICE_RUN_STEPS");
+    if (rs && *rs) guest_slice_run_steps = strtoull(rs, NULL, 0);
+    if (dq8_det_mode) {
+        /* The deterministic harness derives every guest clock from retired
+           instructions and stops at an exact instruction budget; slicing
+           would change the interleaving the trace is pinned to. */
+        if (guest_slice_on)
+            fprintf(stderr, "guest slice: off (DQ8_DETERMINISTIC pins the guest clock;"
+                            " requested DQ8_GUEST_SLICE_MS=%llu)\n",
+                    (unsigned long long)guest_slice_ms);
+        guest_slice_on = 0;
+        guest_slice_ns = 0;
+        guest_slice_ms = 0;
+        return;
+    }
+    fprintf(stderr, "guest slice: %s ms=%llu instr=%llu run_steps=%llu (DQ8_GUEST_SLICE_MS=0 disables)\n",
+            guest_slice_on ? "on" : "off", (unsigned long long)guest_slice_ms,
+            (unsigned long long)guest_slice_steps, (unsigned long long)guest_slice_run_steps);
+}
+static void guest_slice_report(void) {
+    fprintf(stderr, "SLICE STATS: on=%d ms=%llu quantum=%llu preempts=%llu fairness_skips=%llu"
+                    " idle_returns=%llu max_run_ms=%llu\n",
+            guest_slice_on, (unsigned long long)guest_slice_ms,
+            (unsigned long long)guest_slice_steps,
+            (unsigned long long)perf_slice_preempts,
+            (unsigned long long)perf_slice_fairness_skips,
+            (unsigned long long)perf_slice_idle_returns,
+            (unsigned long long)perf_slice_max_run_ms);
+}
 static void guest_periodic_dump(int sig) {
     (void)sig;
     if (getenv("DQ8_PROGRESS_SECONDS")) {
+        fprintf(stderr, "SLICE on=%d ms=%llu quantum=%llu preempts=%llu fairness_skips=%llu"
+                        " idle_returns=%llu max_run_ms=%llu\n",
+                guest_slice_on, (unsigned long long)guest_slice_ms,
+                (unsigned long long)guest_slice_steps,
+                (unsigned long long)perf_slice_preempts,
+                (unsigned long long)perf_slice_fairness_skips,
+                (unsigned long long)perf_slice_idle_returns,
+                (unsigned long long)perf_slice_max_run_ms);
         if (dq8_det_mode) {
             fprintf(stderr, "DETDUMP steps=%llu idle_ms=%.3f now_ms=%.3f vblanks=%llu jumps=%llu"
                             " main_retired=%llu depth=%u main_pc=%08X active_pc=%08X\n",
@@ -4814,16 +5004,41 @@ typedef struct {
     int n, z, c, v, ge, active, blocked;
 } GuestThread;
 static GuestThread guest_threads[64];
+/* PREEMPTIVE GUEST SLICE (t_353154d7): per-slot scheduling state.  Kept out
+   of GuestThread on purpose: GuestThread is serialised byte-for-byte into a
+   savestate variable (src/native_savestate.c) and sizeof(GuestThread) is part
+   of the state build signature, so growing it would reject every savestate
+   written by an earlier build. */
+typedef struct {
+    uint64_t slice_accum_ns; /* CPU time of the current continuous execution stretch */
+    uint64_t slice_mark;     /* thread->retired_steps when that stretch began */
+    int slice_active;        /* the thread has been running without parking */
+    int slice_preempted;     /* the stretch used a whole slice: pass this thread over once */
+} ThreadSched;
+static ThreadSched thread_sched[64];
 static unsigned guest_thread_count, guest_thread_cursor;
 static uint32_t current_guest_thread_id = 1u;
 static void guest_dump_threads(void) {
     for (unsigned i = 0; i < guest_thread_count; ++i) {
         GuestThread *t = &guest_threads[i];
-        fprintf(stderr, "guest thread[%u] id=%08X active=%d blocked=%d pc=%08X tls=%08X wait=%08X/%u/%08X handle=%08X\n",
+        fprintf(stderr, "guest thread[%u] id=%08X active=%d blocked=%d pc=%08X tls=%08X wait=%08X/%u/%08X handle=%08X retired=%llu dispatches=%llu\n",
                 i, t->guest_thread_id, t->active, t->blocked, t->pc,
-                t->tls_base, t->wait_address, t->wait_type, t->wait_value, t->wait_handle);
+                t->tls_base, t->wait_address, t->wait_type, t->wait_value, t->wait_handle,
+                (unsigned long long)t->retired_steps, (unsigned long long)t->dispatch_calls);
     }
 }
+/* HOST COMMANDS IN A WAIT (t_56936fec): state and forward declarations for the
+   main-context wait loops (svcWaitSynchronization, svcWaitSynchronizationN,
+   svcArbitrateAddress, svcSleepThread) and the WAITWEDGE diagnostic.  The
+   helpers themselves sit next to the svcWaitSynchronization service loop; the
+   arbiter wait loop appears earlier in this file than they do. */
+static uint64_t test_wedge_at_ns, test_wedge_for_ns, test_wedge_t0_ns, test_wedge_until_ns;
+static int test_wedge_cfg = -1, test_wedge_fired;
+static int test_main_wedge_active(uint64_t now);
+static void test_main_wedge_forget(void);
+static int wait_wedge_seconds(void);
+static void guest_wait_wedge_report(uint32_t handle, uint64_t timeout,
+                                    unsigned spin, uint64_t waited_ns, const char *site);
 static void translated_from(uint32_t *r, uint32_t start_pc, GuestThread *context);
 static void schedule_guest_thread(void);
 static int guest_poll_wait_n(const uint32_t *handles, uint32_t count, uint32_t all,
@@ -5202,7 +5417,10 @@ static void tempo_gsp_drop_seen(void) {
     ++tempo_gsp_drops; ++tempo_gsp_drop_win;
 }
 static unsigned long long tempo_swaps, tempo_swap_win;
+static _Atomic unsigned long long guest_frame_swaps;   /* guest published a top-screen frame */
+static _Atomic unsigned long long guest_vbl_events;    /* vblank periods actually delivered */
 static void tempo_swap_seen(void) {
+    atomic_fetch_add_explicit(&guest_frame_swaps, 1u, memory_order_relaxed);
     if (!tempo_get()) return;
     ++tempo_swaps; ++tempo_swap_win;
 }
@@ -5456,6 +5674,15 @@ static void movie_trace_tick(void) {
 static int guest_any_runnable_thread(void) {
     for (unsigned i = 0; i < guest_thread_count; ++i)
         if (guest_threads[i].active && !guest_threads[i].blocked) return 1;
+    return 0;
+}
+/* PREEMPTIVE GUEST SLICE (t_353154d7): is any *other* worker runnable?  Only
+   used when a thread's slice has expired, i.e. off the per-instruction path. */
+static int guest_slice_other_runnable(unsigned except) {
+    for (unsigned i = 0; i < guest_thread_count; ++i) {
+        if (i == except) continue;
+        if (guest_threads[i].active && !guest_threads[i].blocked) return 1;
+    }
     return 0;
 }
 /* DQ8 bench harness (perf audit 5.1): DQ8_BENCH_STEPS=<N> runs the main
@@ -6487,6 +6714,9 @@ static __thread unsigned pica_vs_fail_reason, pica_vs_fail_detail;
 static unsigned pica_draw_log_count, pica_draw_log_tris, pica_draw_log_clip;
 static unsigned pica_draw_log_nfdrop;
 static unsigned pica_draw_log_arej, pica_draw_log_drej, pica_draw_log_frw;
+static unsigned pica_draw_log_fcw, pica_draw_log_fccw; /* t_0bf6793d winding tally */
+/* t_150574cd: face-culling counters (defined in pica_vs.c, spliced later). */
+static unsigned long long pica_cull_kept_tris, pica_cull_dropped_tris;
 static float pica_draw_log_wmin, pica_draw_log_wmax;
 /* t_41f38df0 cutscene-camera forensics: pica_uni_cam_trace (pica_vs.c) logs
    the camera/model uniforms of the draws DQ8_TRACE_UNIDRAW asks for and calls
@@ -6541,9 +6771,96 @@ static void pica_dump_current_cmdlist(unsigned count) {
     }
     dump_done = 1;
 }
+/* TEXDRAW (t_0bf6793d, DIAGNOSTIC ONLY): per-draw texture-unit + TEV-stage
+   state, limited to draws whose pixel bounding box intersects a screen rect.
+   DQ8_TRACE_TEXDRAW=x0,y0,x1,y1 selects the rect; a bare value selects every
+   draw.  Prints the texunit0/1/2 enable, address, dimensions, param word
+   (wrap + filter + TYPE bits 28-30) and format, plus the TEV stage-0..4
+   source/combiner words, lighting enable and blend state.  Off by default:
+   without the variable this function is never entered. */
+static int pica_texdraw_armed = -1, pica_texdraw_all;
+static int pica_texdraw_rx0, pica_texdraw_ry0, pica_texdraw_rx1, pica_texdraw_ry1;
+static void pica_texdraw_trace(int failed) {
+    if (pica_texdraw_armed < 0) {
+        const char *e = getenv("DQ8_TRACE_TEXDRAW");
+        pica_texdraw_armed = 0;
+        if (e && e[0]) {
+            if (sscanf(e, "%d,%d,%d,%d", &pica_texdraw_rx0, &pica_texdraw_ry0,
+                       &pica_texdraw_rx1, &pica_texdraw_ry1) == 4)
+                pica_texdraw_armed = 1;
+            else { pica_texdraw_all = 1; pica_texdraw_armed = 1; }
+        }
+    }
+    if (!pica_texdraw_armed) return;
+    if (!pica_texdraw_all) {
+        if (pica_db_x0 > (uint32_t)pica_texdraw_rx1 || pica_db_x1 < (uint32_t)pica_texdraw_rx0 ||
+            pica_db_y0 > (uint32_t)pica_texdraw_ry1 || pica_db_y1 < (uint32_t)pica_texdraw_ry0)
+            return;
+    }
+    fprintf(stderr,
+            "TEXDRAW t=%.2f draw=%llu list=%llu rt=%08X bbox=%u,%u..%u,%u tris=%u "
+            "cfg=%08X t0=%u a0=%08X d0=%08X p0=%08X f0=%X "
+            "t1=%u a1=%08X d1=%08X p1=%08X f1=%X t2=%u a2=%08X d2=%08X p2=%08X f2=%X "
+            "lit=%u tev0=%08X/%08X/%08X tev1=%08X/%08X/%08X tevS=%08X tevIn=%08X "
+            "blend=%08X/%08X mask=%08X atest=%08X cull=%u cw=%u ccw=%u "
+            "mag0=%u min0=%u mip0=%u lod0=%08X mag1=%u min1=%u mip1=%u lod1=%08X "
+            "mag2=%u min2=%u mip2=%u lod2=%08X "
+            "tris_kept=%llu tris_culled=%llu%s\n",
+            dq8_layer_t(),
+            (unsigned long long)pica_draw_count, (unsigned long long)pica_list_no,
+            pica_rt_addr, pica_db_x0, pica_db_y0, pica_db_x1, pica_db_y1,
+            pica_draw_log_tris, pica_regs[0x80],
+            pica_regs[0x80] & 1u, pica_regs[0x85] & 0x0FFFFFFFu, pica_regs[0x82], pica_regs[0x83], pica_regs[0x8E] & 0xFu,
+            (pica_regs[0x80] >> 1) & 1u, pica_regs[0x95] & 0x0FFFFFFFu, pica_regs[0x92], pica_regs[0x93], pica_regs[0x96] & 0xFu,
+            (pica_regs[0x80] >> 2) & 1u, pica_regs[0x9D] & 0x0FFFFFFFu, pica_regs[0x9A], pica_regs[0x9B], pica_regs[0x9E] & 0xFu,
+            pica_regs[0x8F] & 1u,
+            pica_regs[0xC0], pica_regs[0xC1], pica_regs[0xC2],
+            pica_regs[0xC8], pica_regs[0xC9], pica_regs[0xCA],
+            pica_regs[0xE0], pica_regs[0xFD],
+            pica_regs[0x100], pica_regs[0x101], pica_regs[0x107], pica_regs[0x104],
+            pica_regs[0x40] & 3u, pica_draw_log_fcw, pica_draw_log_fccw,
+            (pica_regs[0x83] >> 1) & 1u, (pica_regs[0x83] >> 2) & 1u,
+            (pica_regs[0x83] >> 24) & 1u, pica_regs[0x84],
+            (pica_regs[0x93] >> 1) & 1u, (pica_regs[0x93] >> 2) & 1u,
+            (pica_regs[0x93] >> 24) & 1u, pica_regs[0x94],
+            (pica_regs[0x9B] >> 1) & 1u, (pica_regs[0x9B] >> 2) & 1u,
+            (pica_regs[0x9B] >> 24) & 1u, pica_regs[0x9C],
+            pica_cull_kept_tris, pica_cull_dropped_tris,
+            failed ? " FAILED" : "");
+}
+/* DQ8_TRACE_CULL=1: per-scene face-culling tally.  Counts how many draws the
+   scene issues under each GPUREG 0x40 mode (0 KeepAll / 1 KeepClockWise /
+   2 KeepCounterClockWise / 3 KeepAll2) and how many triangles the filter has
+   kept and dropped so far.  Cumulative and printed every 32 draws, so the
+   last line before a timed/`timeout` run is killed still carries the totals. */
+static int pica_cullstat_on = -1;
+static unsigned long long pica_cull_draws_by_mode[4], pica_cull_draw_total;
+static unsigned long long pica_cull_kept_total, pica_cull_dropped_total;
+static void pica_cull_trace(void) {
+    unsigned mode;
+    if (pica_cullstat_on < 0) {
+        const char *e = getenv("DQ8_TRACE_CULL");
+        pica_cullstat_on = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    if (!pica_cullstat_on) return;
+    mode = pica_regs[0x40] & 3u;
+    ++pica_cull_draws_by_mode[mode];
+    pica_cull_kept_total += pica_cull_kept_tris;
+    pica_cull_dropped_total += pica_cull_dropped_tris;
+    if (++pica_cull_draw_total & 31u) return;
+    fprintf(stderr,
+            "CULLSTAT t=%.2f draws=%llu keepall=%llu keepcw=%llu keepccw=%llu "
+            "keepall2=%llu tris_kept=%llu tris_culled=%llu\n",
+            dq8_layer_t(), pica_cull_draw_total,
+            pica_cull_draws_by_mode[0], pica_cull_draws_by_mode[1],
+            pica_cull_draws_by_mode[2], pica_cull_draws_by_mode[3],
+            pica_cull_kept_total, pica_cull_dropped_total);
+}
 static void pica_log_draw(int failed) {
     pica_uni_cam_trace(pica_draw_log_count);
     pica_px_report();
+    pica_texdraw_trace(failed);
+    pica_cull_trace();
     if (!dq8_layer_trace()) return;
     fprintf(stderr, "DRAW t=%.2f list=%llu draw=%llu count=%u tris=%u rsn=%u det=%08X gs=%X clip=%u nfdrop=%u arej=%u drej=%u frw=%u wmin=%.4g wmax=%.4g bbox=%u,%u..%u,%u blend=%08X/%08X mask=%08X atest=%08X rt=%08X prim_a=%.3f tev_a=%.3f%s\n",
             dq8_layer_t(), pica_list_no, (unsigned long long)pica_draw_count,
@@ -6925,40 +7242,34 @@ static int pica_wrap_coord(uint32_t mode, int val, uint32_t size) {
     }
     }
 }
-static int pica_sample_tex0(float u, float v, uint8_t *r, uint8_t *g, uint8_t *b, uint8_t *a) {
-    uint32_t addr_field = pica_regs[0x85] & 0x0FFFFFFFu;
-    uint32_t w = (pica_regs[0x82] >> 16) & 0x7FFu;
-    uint32_t h = pica_regs[0x82] & 0x7FFu;
-    uint32_t fmt = pica_regs[0x8E] & 0xFu;
+/* Per-unit texture registers (Azahar regs_texturing.h layout): border color,
+   size, param, address, format.  Unit 0's format lives at 0x8E (after the
+   cube/shadow block), unit 1's at 0x96 and unit 2's at 0x9E.
+   t_e216fc37: the sampler is unit-parameterised because the TEV chain can read
+   TEV source 4 (texture1) / 5 (texture2), which this runtime used to treat as
+   0.0 — the ground "shadow" draws multiply texture1 in and came out black. */
+static const unsigned pica_tex_unit_reg[3][5] = {
+    { 0x81u, 0x82u, 0x83u, 0x85u, 0x8Eu },   /* unit 0 */
+    { 0x91u, 0x92u, 0x93u, 0x95u, 0x96u },   /* unit 1 */
+    { 0x99u, 0x9Au, 0x9Bu, 0x9Du, 0x9Eu },   /* unit 2 */
+};
+/* Decode ONE texel of a texture unit from an in-range (x, y).  This is the
+   pre-filtering pica_sample_tex_unit body with the coordinate/wrap part left
+   to the caller (t_c043d7f7 refactor); the decode arithmetic is unchanged, so
+   the nearest sampling path stays bit-exact. */
+static int pica_texel_unit(unsigned unit, int xi, int yi,
+                           uint8_t *r, uint8_t *g, uint8_t *b, uint8_t *a) {
+    const unsigned *regs = pica_tex_unit_reg[unit < 3u ? unit : 0u];
+    uint32_t addr_field = pica_regs[regs[3]] & 0x0FFFFFFFu;
+    uint32_t w = (pica_regs[regs[1]] >> 16) & 0x7FFu;
+    uint32_t h = pica_regs[regs[1]] & 0x7FFu;
+    uint32_t fmt = pica_regs[regs[4]] & 0xFu;
     if (!addr_field || !w || !h) return 0;
     uint32_t paddr = addr_field * 8u;
     uint32_t va = guest_memory_address(paddr);
     uint32_t mapped;
     if (!guest_memory_range(va, 4u, &mapped)) return 0;
-    /* Azahar RasterizerSoftware::TextureColor (sw_rasterizer.cpp:530-566):
-       s=(s32)(u*width) with NO pre-clamp; wrap modes come from
-       GPUREG_TEXUNIT0_PARAM (wrap_t bits 8-10, wrap_s bits 12-14) and the
-       border colour from GPUREG_TEXUNIT0_BORDER_COLOR (0x81, r/g/b/a bytes). */
-    int s = (int)(u * (float)w);
-    int t = (int)(v * (float)h);
-    uint32_t wrap_s = (pica_regs[0x83] >> 12) & 7u;
-    uint32_t wrap_t = (pica_regs[0x83] >> 8) & 7u;
-    int border_s = (wrap_s == 1u) ? (s < 0 || s >= (int)w)
-                  : (wrap_s == 5u) ? (s >= (int)w) : 0;
-    int border_t = (wrap_t == 1u) ? (t < 0 || t >= (int)h)
-                  : (wrap_t == 5u) ? (t >= (int)h) : 0;
-    if (border_s || border_t) {
-        uint32_t bc = pica_regs[0x81];
-        *r = (uint8_t)(bc & 0xFFu);
-        *g = (uint8_t)((bc >> 8) & 0xFFu);
-        *b = (uint8_t)((bc >> 16) & 0xFFu);
-        *a = (uint8_t)((bc >> 24) & 0xFFu);
-        return 1;
-    }
-    s = pica_wrap_coord(wrap_s, s, w);
-    /* PICA textures are stored bottom-up: azahar inverts t after wrapping. */
-    t = (int)h - 1 - pica_wrap_coord(wrap_t, t, h);
-    uint32_t x = (uint32_t)s, y = (uint32_t)t;
+    uint32_t x = (uint32_t)xi, y = (uint32_t)yi;
     /* PICA texture formats: 0 RGBA8, 1 RGB8, 2 RGB5A1, 3 RGB565, 4 RGBA4,
        5 IA8, 6 RG8, 7 I8, 8 A8, 9 IA4, 10 I4, 11 A4, 12 ETC1, 13 ETC1A4.
        Layout = Morton 8x8 tiles; per-tile size from Azahar CalculateTileSize. */
@@ -7097,6 +7408,158 @@ static int pica_sample_tex0(float u, float v, uint8_t *r, uint8_t *g, uint8_t *b
         }
     }
     return 1;
+}
+/* t_c043d7f7: PICA texture filtering (mag/min, mip bit, LOD word).
+   PARAM register (Azahar regs_texturing.h TextureConfig union): bit1
+   mag_filter, bit2 min_filter, bit24 mip_filter (0 = nearest, 1 = linear);
+   wrap_t bits 8-10 and wrap_s bits 12-14 (already used by the wrap code).
+   The LOD word (0x84 / 0x94 / 0x9C) carries bias bits 0-12 (fixed1.4.8),
+   max_level bits 16-19, min_level bits 24-27.
+   DQ8_TEX_FILTER=0 forces nearest everywhere (A/B switch, default on).
+   The software rasteriser has no screen-space derivatives, so it cannot
+   reproduce the PICA LOD selection; it applies linear filtering when either
+   the mag or the min bit asks for it.  Every textured draw in the scenes
+   traced so far sets both bits together (reports/TEXTURE_FILTER.md), so the
+   distinction does not arise yet.  Mip levels are not decoded: the software
+   path always samples level 0, i.e. a mip_filter=linear request degrades to
+   plain bilinear instead of going black. */
+static int pica_tex_filter_gate = -1;
+static int pica_tex_filter_on(void) {
+    if (pica_tex_filter_gate < 0) {
+        const char *e = getenv("DQ8_TEX_FILTER");
+        pica_tex_filter_gate = !(e && e[0] == '0');
+    }
+    return pica_tex_filter_gate;
+}
+static void pica_tex_border_color(unsigned unit, uint8_t *r, uint8_t *g,
+                                  uint8_t *b, uint8_t *a) {
+    uint32_t bc = pica_regs[pica_tex_unit_reg[unit < 3u ? unit : 0u][0]];
+    *r = (uint8_t)(bc & 0xFFu);
+    *g = (uint8_t)((bc >> 8) & 0xFFu);
+    *b = (uint8_t)((bc >> 16) & 0xFFu);
+    *a = (uint8_t)((bc >> 24) & 0xFFu);
+}
+/* Sample a texture unit.  filter != 0 enables the guest's mag/min bits;
+   filter == 0 is the exact nearest path used to decode staging images and
+   for the DQ8_TEX_FILTER=0 A/B.  Nearest arithmetic is bit-identical to the
+   pre-refactor code: same (int)(u*w) truncation, same wrap order, same t
+   flip.  Bilinear taps wrap independently (so the two taps of an edge pair
+   may come from opposite sides of a REPEAT texture), each tap keeps the
+   bottom-up t flip, and border modes apply the border colour per tap. */
+static int pica_sample_tex_unit_ex(unsigned unit, float u, float v, int filter,
+                                   uint8_t *r, uint8_t *g, uint8_t *b, uint8_t *a) {
+    const unsigned *regs = pica_tex_unit_reg[unit < 3u ? unit : 0u];
+    uint32_t addr_field = pica_regs[regs[3]] & 0x0FFFFFFFu;
+    uint32_t w = (pica_regs[regs[1]] >> 16) & 0x7FFu;
+    uint32_t h = pica_regs[regs[1]] & 0x7FFu;
+    uint32_t param = pica_regs[regs[2]];
+    uint32_t wrap_s = (param >> 12) & 7u;
+    uint32_t wrap_t = (param >> 8) & 7u;
+    if (!addr_field || !w || !h) return 0;
+    if (filter) {
+        uint32_t mag = (param >> 1) & 1u, minf = (param >> 2) & 1u;
+        filter = (mag | minf) != 0u;
+    }
+    if (!filter) {
+        /* Azahar RasterizerSoftware::TextureColor (sw_rasterizer.cpp:530-566):
+           s=(s32)(u*width) with NO pre-clamp; wrap modes from PARAM, border
+           colour from BORDER_COLOR. */
+        int s = (int)(u * (float)w);
+        int t = (int)(v * (float)h);
+        int border_s = (wrap_s == 1u) ? (s < 0 || s >= (int)w)
+                      : (wrap_s == 5u) ? (s >= (int)w) : 0;
+        int border_t = (wrap_t == 1u) ? (t < 0 || t >= (int)h)
+                      : (wrap_t == 5u) ? (t >= (int)h) : 0;
+        if (border_s || border_t) {
+            pica_tex_border_color(unit, r, g, b, a);
+            return 1;
+        }
+        s = pica_wrap_coord(wrap_s, s, w);
+        /* PICA textures are stored bottom-up: azahar inverts t after wrapping. */
+        t = (int)h - 1 - pica_wrap_coord(wrap_t, t, h);
+        return pica_texel_unit(unit, s, t, r, g, b, a);
+    }
+    {
+        float fu = u * (float)w - 0.5f;
+        float fv = v * (float)h - 0.5f;
+        int s0, t0, dx, dy;
+        float fs, ft;
+        uint8_t c[4][4];
+        /* Huge or non-finite coordinates occur legitimately (a repeating
+           ground texture at v ~ -6 maps to thousands of texels); clamp the
+           float before converting so the cast is defined. */
+        if (!(fu > -1.0e7f)) fu = -1.0e7f;
+        if (fu > 1.0e7f) fu = 1.0e7f;
+        if (!(fv > -1.0e7f)) fv = -1.0e7f;
+        if (fv > 1.0e7f) fv = 1.0e7f;
+        s0 = (int)floorf(fu);
+        t0 = (int)floorf(fv);
+        fs = fu - (float)s0;
+        ft = fv - (float)t0;
+        for (dy = 0; dy < 2; ++dy) {
+            for (dx = 0; dx < 2; ++dx) {
+                uint8_t *q = c[dy * 2 + dx];
+                int sx = s0 + dx, ty = t0 + dy;
+                int border_s = (wrap_s == 1u) ? (sx < 0 || sx >= (int)w)
+                              : (wrap_s == 5u) ? (sx >= (int)w) : 0;
+                int border_t = (wrap_t == 1u) ? (ty < 0 || ty >= (int)h)
+                              : (wrap_t == 5u) ? (ty >= (int)h) : 0;
+                if (border_s || border_t) {
+                    pica_tex_border_color(unit, &q[0], &q[1], &q[2], &q[3]);
+                    continue;
+                }
+                sx = pica_wrap_coord(wrap_s, sx, w);
+                ty = (int)h - 1 - pica_wrap_coord(wrap_t, ty, h);
+                if (!pica_texel_unit(unit, sx, ty, &q[0], &q[1], &q[2], &q[3]))
+                    return 0;
+            }
+        }
+        /* Bilinear in the PICA/GL texel-centre convention: coordinate
+           u*w - 0.5, floor for the low tap, fractional weights. */
+        {
+            float w00 = (1.0f - fs) * (1.0f - ft);
+            float w10 = fs * (1.0f - ft);
+            float w01 = (1.0f - fs) * ft;
+            float w11 = fs * ft;
+            unsigned ch;
+            for (ch = 0; ch < 4u; ++ch) {
+                float val = (float)c[0][ch] * w00 + (float)c[1][ch] * w10 +
+                            (float)c[2][ch] * w01 + (float)c[3][ch] * w11;
+                int out = (int)(val + 0.5f);
+                if (out < 0) out = 0;
+                if (out > 255) out = 255;
+                if (ch == 0u) *r = (uint8_t)out;
+                else if (ch == 1u) *g = (uint8_t)out;
+                else if (ch == 2u) *b = (uint8_t)out;
+                else *a = (uint8_t)out;
+            }
+        }
+    }
+    return 1;
+}
+static int pica_sample_tex_unit(unsigned unit, float u, float v,
+                                uint8_t *r, uint8_t *g, uint8_t *b, uint8_t *a) {
+    return pica_sample_tex_unit_ex(unit, u, v, pica_tex_filter_on(),
+                                   r, g, b, a);
+}
+static int pica_sample_tex_unit_exact(unsigned unit, float u, float v,
+                                      uint8_t *r, uint8_t *g, uint8_t *b,
+                                      uint8_t *a) {
+    return pica_sample_tex_unit_ex(unit, u, v, 0, r, g, b, a);
+}
+static int pica_sample_tex0(float u, float v, uint8_t *r, uint8_t *g, uint8_t *b, uint8_t *a) {
+    return pica_sample_tex_unit(0u, u, v, r, g, b, a);
+}
+static int pica_sample_tex1(float u, float v, uint8_t *r, uint8_t *g, uint8_t *b, uint8_t *a) {
+    return pica_sample_tex_unit(1u, u, v, r, g, b, a);
+}
+static int pica_sample_tex0_exact(float u, float v, uint8_t *r, uint8_t *g,
+                                  uint8_t *b, uint8_t *a) {
+    return pica_sample_tex_unit_exact(0u, u, v, r, g, b, a);
+}
+static int pica_sample_tex1_exact(float u, float v, uint8_t *r, uint8_t *g,
+                                  uint8_t *b, uint8_t *a) {
+    return pica_sample_tex_unit_exact(1u, u, v, r, g, b, a);
 }
 
 static uint32_t gsp_dma_log[8][3]; /* src, dest, size */
@@ -7601,6 +8064,7 @@ static void gsp_vblank_service_period(uint64_t now, uint64_t period, unsigned ca
         gsp_next_vblank_ns += period;
         gsp_enqueue_interrupt(2u); /* PDC0: top-screen VBlank */
         gsp_enqueue_interrupt(3u); /* PDC1: bottom-screen VBlank */
+        atomic_fetch_add_explicit(&guest_vbl_events, 1u, memory_order_relaxed);
         ++fired;
     }
     if (dq8_det_mode) dq8_det_vblanks += fired;
@@ -8170,10 +8634,30 @@ static uint32_t gsp_transfer_bytes_per_pixel(uint32_t format) {
 #define HOST_SCALE 2
 static uint8_t host_shadow_top[HOST_TOP_W * HOST_TOP_H * 4u];
 static uint8_t host_shadow_bot[HOST_BOT_W * HOST_BOT_H * 4u];
+/* t_5286064e: per-screen content serials.  Bumped by the display-transfer
+   converter (host_display_convert_span callers) whenever screen i's shadow is
+   rewritten, so the presenter can rescale only the screens that changed -- per
+   screen, never per window (a split layout needs a static bottom screen to
+   cost nothing while the top runs at 30 fps). */
+static uint64_t host_shadow_serial[2];
 static int host_display_ready;
 static int host_display_quit;
 static int host_display_ignore_black;
 static void host_display_shutdown(void);
+/* ---------------- HOST COMMANDS IN A WAIT (t_56936fec) --------------------
+   Quit (window close, Esc/Q, SIGINT/SIGTERM) must also escape a main-context
+   guest wait.  The window paths below already ran exit(0) from the pump, so
+   SIGINT/SIGTERM only need the same destination: a flag set by the handler
+   (async-signal-safe) and the ONE clean-exit function every quit path uses.
+   exit() from here runs the registered atexit handlers -- split present-worker
+   join (which also drains and presents the last frame), pica_gl_shutdown and
+   the audio shutdown -- i.e. the same teardown main()'s epilogue performs. */
+static volatile sig_atomic_t host_signal_quit;
+static void host_signal_quit_handler(int sig) { (void)sig; host_signal_quit = 1; }
+static void host_quit_now(const char *why) {
+    fprintf(stderr, "host quit: %s (clean exit)\n", why);
+    exit(0);
+}
 #ifdef DQ8_ENABLE_SDL
 static SDL_Window *host_sdl_window;
 /* Tentative declaration: the real definition is next to the GSP queue counter
@@ -8185,6 +8669,8 @@ static uint64_t pica_gl_draws_ok, pica_gl_draws_sw;
 static SDL_Renderer *host_sdl_renderer;
 static SDL_Texture *host_sdl_tex_top;
 static SDL_Texture *host_sdl_tex_bot;
+/* t_5286064e: the single composed full-window texture (renderer path). */
+static SDL_Texture *host_sdl_tex_full;
 static SDL_Surface *host_sdl_surface;     /* window framebuffer (no renderer) */
 static SDL_Surface *host_shadow_surf_top; /* wraps host_shadow_top pixels */
 static SDL_Surface *host_shadow_surf_bot;
@@ -8355,6 +8841,8 @@ static void host_display_shutdown_body(void) {
     host_sdl_surface = NULL; /* owned by the window */
     if (host_sdl_tex_top) SDL_DestroyTexture(host_sdl_tex_top);
     if (host_sdl_tex_bot) SDL_DestroyTexture(host_sdl_tex_bot);
+    if (host_sdl_tex_full) SDL_DestroyTexture(host_sdl_tex_full);
+    host_sdl_tex_full = NULL;
     if (host_sdl_renderer) SDL_DestroyRenderer(host_sdl_renderer);
     if (host_sdl_window) SDL_DestroyWindow(host_sdl_window);
     host_sdl_tex_top = host_sdl_tex_bot = NULL;
@@ -8671,13 +9159,13 @@ static void host_display_pump_events(void) {
        DQ8_SPLIT_RENDER=1: SDL collection runs on the present worker and
        crosses here as a copied button mask (H1 contract §3.4); HID ring
        publication stays on this thread, unchanged. */
+    if (host_signal_quit) host_quit_now("SIGINT/SIGTERM");
     if (split_render_enabled()) {
         native_hid_buttons = split_render_hid_mask();
         native_hid_pump();
         if (split_render_quit_requested()) {
-            fprintf(stderr, "host display: quit requested\n");
             split_render_flush_sync();
-            exit(0);
+            host_quit_now("window close (split present worker)");
         }
         return;
     }
@@ -8688,11 +9176,672 @@ static void host_display_pump_events(void) {
     }
     native_hid_pump();
     if (host_display_ready && host_display_quit) {
-        fprintf(stderr, "host display: quit requested\n");
-        exit(0);
+        host_quit_now("window close / Esc");
     }
 }
-static void host_display_present_impl(void) {
+/* ---------------- t_5286064e: composed presentation ----------------------
+   The window shows two FIXED-resolution surfaces: top 400x240 -> 800x480 at
+   (0,0) and bottom 320x240 -> 640x480 at (80,480), black bars elsewhere.  The
+   frozen path spent, per published frame, an SDL_FillRect over the whole 3 MB
+   window surface plus TWO SDL_BlitScaled calls.  SDL's scaler here is the
+   generic SDL_Blit_Slow: for each of the 768 000 destination pixels it does an
+   inverse-mapped source lookup, a format conversion, an alpha blend and a
+   call through a function table -- 5.4 ms per published frame on the RX 580
+   rig (FRAMEPROF present_ms 1.88 mean over 1315 iterations ~ 2.9 iterations
+   per publish).  None of that work is content-dependent: the geometry is
+   constant, the scale factor is exactly 2, and the destination under both
+   blits is the black that was just filled.
+
+   So do the obvious thing: scale with an integer 2x nearest-neighbour copy
+   written straight into the destination pixels (SSE2: 16 source bytes -> two
+   16-byte stores, duplicated to the second row), and present once.  Only the
+   screens whose shadow content actually changed are recomposed (per-screen
+   serials bumped by the converter), and when neither changed the present call
+   itself is skipped -- the compositor/window keeps the last frame.
+
+   FIDELITY (verified against SDL 2.30, see reports/PRESENT_PATH.md): for an
+   exact 2x ratio SDL_BlitScaled samples src[dst/2] for every destination
+   pixel and, because the destination under the blit is the just-filled black,
+   blends a non-opaque source pixel as src*a/255 over black.  The kernel
+   reproduces both cases and the destination channel order; the extraction test
+   tools/present_kernel_test.py showed byte-identical output over random content for opaque, random-alpha
+   and 0/255-alpha sources in both destination formats.
+
+   SEAM (operator constraint): the presenter is split into (a) this per-screen
+   scaler and (b) a layout step that decides where each scaled screen goes.  A
+   target is any pixel image with a pitch plus a present action, and each
+   screen owns a rectangle inside it, so nothing below assumes "one window":
+   the stacked layout (default) is one 800x960 target presenting once, and
+   DQ8_PRESENT_LAYOUT=split is reserved for one window per screen (the second
+   window is not implemented yet, so split logs once and keeps stacked).
+
+   Knobs: DQ8_PRESENT_SCALER unset/1 = composed kernel (default), =0 = the
+   frozen FillRect + 2x BlitScaled path byte-for-byte, =2 = composed path with
+   the scalar kernel (no SSE2).  DQ8_PRESENT_LAYOUT=stacked|split.
+   DQ8_PRESENT_STATS=1 dumps composed-present counters at exit. */
+#define HOST_PRESENT_W ((int)HOST_TOP_W * HOST_SCALE)
+#define HOST_PRESENT_H (((int)HOST_TOP_H + (int)HOST_BOT_H) * HOST_SCALE)
+#define HOST_PRESENT_BOT_DX ((((int)HOST_TOP_W - (int)HOST_BOT_W) / 2) * HOST_SCALE)
+#define HOST_PRESENT_BOT_DY ((int)HOST_TOP_H * HOST_SCALE)
+/* Destination pixel layouts the kernel knows.  The low bit selects the fourth
+   byte (0x00 for an XRGB-style surface, 0xFF where the destination has an
+   alpha channel); >= 2 swaps R and B (B,G,R memory order). */
+enum { HP_KIND_RGBA = 0, HP_KIND_RGBA_A = 1, HP_KIND_BGRX = 2, HP_KIND_BGRX_A = 3 };
+/* Present actions: the layout decides this, the composed code never does. */
+enum { HP_PRESENT_NONE = 0, HP_PRESENT_X11, HP_PRESENT_WINDOW, HP_PRESENT_RENDERER };
+
+static uint64_t host_present_composed_presents, host_present_composed_screens;
+static uint64_t host_present_composed_skipped, host_present_translucent_redos;
+static uint64_t host_present_ns_compose, host_present_ns_put;
+static int host_present_stats_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("DQ8_PRESENT_STATS") != NULL;
+    return on;
+}
+
+static int host_present_scaler_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("DQ8_PRESENT_SCALER");
+        mode = 1;
+        if (e && e[0] == '0' && !e[1]) mode = 0;
+        else if (e && e[0] == '2' && !e[1]) mode = 2;
+    }
+    return mode;
+}
+static void host_present_stats_dump(void) {
+    double n = host_present_composed_presents ? (double)host_present_composed_presents : 1.0;
+    fprintf(stderr, "present composed: presents=%llu screens_composed=%llu "
+            "unchanged_skips=%llu translucent_redos=%llu "
+            "ms_compose/present=%.3f ms_put/present=%.3f\n",
+            (unsigned long long)host_present_composed_presents,
+            (unsigned long long)host_present_composed_screens,
+            (unsigned long long)host_present_composed_skipped,
+            (unsigned long long)host_present_translucent_redos,
+            (double)host_present_ns_compose / n / 1e6,
+            (double)host_present_ns_put / n / 1e6);
+}
+static int host_present_dst_kind(const SDL_PixelFormat *f) {
+    if (!f || f->BytesPerPixel != 4) return -1;
+    if (f->Rmask == 0x000000FFu && f->Gmask == 0x0000FF00u && f->Bmask == 0x00FF0000u) {
+        if (f->Amask == 0) return HP_KIND_RGBA;
+        if (f->Amask == 0xFF000000u) return HP_KIND_RGBA_A;
+        return -1;
+    }
+    if (f->Rmask == 0x00FF0000u && f->Gmask == 0x0000FF00u && f->Bmask == 0x000000FFu) {
+        if (f->Amask == 0) return HP_KIND_BGRX;
+        if (f->Amask == 0xFF000000u) return HP_KIND_BGRX_A;
+        return -1;
+    }
+    return -1;
+}
+/* Scalar-per-pixel kernel: the reference semantics (identical output to the
+   SSE2 path, ~6x slower) and the non-x86 fallback.  Returns 1 if any source
+   pixel was non-opaque. */
+static int host_present_row_c(uint8_t *d0, uint8_t *d1, const uint8_t *s,
+                              int sw, int kind) {
+    int x, translucent = 0;
+    int ab = (kind & 1) ? 0xFF : 0x00;
+    for (x = 0; x < sw; ++x) {
+        const uint8_t *p = s + (size_t)x * 4u;
+        unsigned a = p[3];
+        uint8_t r = 0, g = 0, b = 0, q0, q1, q2;
+        if (a == 255u) { r = p[0]; g = p[1]; b = p[2]; }
+        else if (a) {
+            translucent = 1;
+            r = (uint8_t)((p[0] * a) / 255u);
+            g = (uint8_t)((p[1] * a) / 255u);
+            b = (uint8_t)((p[2] * a) / 255u);
+        } else {
+            translucent = 1;
+        }
+        q0 = (uint8_t)((kind >= 2) ? b : r);
+        q1 = g;
+        q2 = (uint8_t)((kind >= 2) ? r : b);
+        d0[0] = q0; d0[1] = q1; d0[2] = q2; d0[3] = (uint8_t)ab;
+        d0[4] = q0; d0[5] = q1; d0[6] = q2; d0[7] = (uint8_t)ab;
+        if (d1) {
+            d1[0] = q0; d1[1] = q1; d1[2] = q2; d1[3] = (uint8_t)ab;
+            d1[4] = q0; d1[5] = q1; d1[6] = q2; d1[7] = (uint8_t)ab;
+        }
+        d0 += 8; if (d1) d1 += 8;
+    }
+    return translucent;
+}
+/* One source row -> two destination rows.  Returns 1 if any pixel was
+   non-opaque (the caller then owns a black base under the region). */
+static int host_present_row(uint8_t *d0, uint8_t *d1, const uint8_t *s,
+                            int sw, int kind) {
+#if defined(__SSE2__)
+    int x = 0, translucent = 0;
+    const __m128i opq = _mm_set1_epi32((int)0xFF000000u);
+    const __m128i mR = _mm_set1_epi32(0x000000FF);
+    const __m128i mG = _mm_set1_epi32(0x0000FF00);
+    const __m128i keep = (kind & 1) ? _mm_set1_epi32(-1)
+                                    : _mm_set1_epi32(0x00FFFFFF);
+    if (host_present_scaler_mode() == 2)
+        return host_present_row_c(d0, d1, s, sw, kind);
+    for (; x + 4 <= sw; x += 4) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(const void *)(s + (size_t)x * 4u));
+        __m128i a, b;
+        if (_mm_movemask_epi8(_mm_cmpeq_epi32(_mm_and_si128(v, opq), opq)) != 0xFFFF) {
+            translucent = 1;    /* non-opaque group: finish it in the scalar path */
+            break;
+        }
+        if (kind >= 2) {
+            /* B,G,R memory order: byte0 <-> byte2, alpha/pad byte cleared below. */
+            __m128i lo = _mm_and_si128(v, mR);
+            __m128i mi = _mm_and_si128(v, mG);
+            __m128i hi = _mm_and_si128(_mm_srli_epi32(v, 16), mR);
+            v = _mm_or_si128(_mm_or_si128(_mm_slli_epi32(lo, 16), mi), hi);
+        }
+        v = _mm_and_si128(v, keep);
+        a = _mm_unpacklo_epi32(v, v);   /* p0 p0 p1 p1 */
+        b = _mm_unpackhi_epi32(v, v);   /* p2 p2 p3 p3 */
+        _mm_storeu_si128((__m128i *)(void *)(d0 + (size_t)x * 8u), a);
+        _mm_storeu_si128((__m128i *)(void *)(d0 + (size_t)x * 8u + 16u), b);
+        if (d1) {
+            _mm_storeu_si128((__m128i *)(void *)(d1 + (size_t)x * 8u), a);
+            _mm_storeu_si128((__m128i *)(void *)(d1 + (size_t)x * 8u + 16u), b);
+        }
+    }
+    if (x < sw)
+        translucent |= host_present_row_c(d0 + (size_t)x * 8u,
+                                          d1 ? d1 + (size_t)x * 8u : NULL,
+                                          s + (size_t)x * 4u, sw - x, kind);
+    return translucent;
+#else
+    return host_present_row_c(d0, d1, s, sw, kind);
+#endif
+}
+/* Per-screen scaler: shadow surface -> 2x pixels at (dx,dy) in the target. */
+static int host_present_scale2(uint8_t *dst, int dst_pitch, int kind,
+                               const uint8_t *src, int sw, int sh,
+                               int dx, int dy) {
+    int y, translucent = 0;
+    for (y = 0; y < sh; ++y) {
+        uint8_t *d0 = dst + (size_t)(dy + 2 * y) * (size_t)dst_pitch +
+                      (size_t)dx * 4u;
+        translucent |= host_present_row(d0, d0 + (size_t)dst_pitch,
+                                        src + (size_t)y * (size_t)sw * 4u,
+                                        sw, kind);
+    }
+    return translucent;
+}
+static void host_present_fill_black_rect(uint8_t *dst, int dst_pitch, int kind,
+                                         int dx, int dy, int w, int h) {
+    int y, x;
+    uint32_t v = (kind & 1) ? 0xFF000000u : 0u;
+    for (y = 0; y < h; ++y) {
+        uint8_t *row = dst + (size_t)(dy + y) * (size_t)dst_pitch + (size_t)dx * 4u;
+        if (!v) { memset(row, 0, (size_t)w * 4u); continue; }
+        for (x = 0; x < w; ++x) ((uint32_t *)(void *)(row + (size_t)x * 4u))[0] = v;
+    }
+}
+
+/* A presentation target: one pixel image plus the rectangle each screen
+   occupies inside it.  composed[i] is the shadow serial already present in
+   that screen's rectangle, so an unchanged screen is never rescaled -- per
+   screen, which is what a split (one-window-per-screen) layout needs. */
+typedef struct {
+    uint8_t *pix;
+    int pitch, w, h, kind, action;
+    int dx[2], dy[2];
+    uint64_t composed[2];
+    uint64_t composed_src[2];   /* t_fdd26eba: scaled image serial in the rect
+                                   (0 = composed from the guest shadow) */
+    int black;          /* target currently holds the force-black image */
+    int need_clear;     /* geometry changed: clear once, recompose everything */
+} HostPresentTarget;
+static HostPresentTarget host_present_targets[2];
+static int host_present_target_count;
+static uint8_t host_compose_buf[HOST_PRESENT_W * HOST_PRESENT_H * 4u];
+
+/* ============ t_fdd26eba item B: PRESENT THE SCALED SCREEN ================
+   Azahar's presenter samples the screen texture with
+   `width * scale_factor` (renderer_opengl.cpp:580-585): the window is drawn
+   from the SCALED display-transfer destination, not from a native image that
+   was upscaled again.  This is the host-composer equivalent.
+
+   WHAT IS PRESENTED.  A screen's scaled image is the display transfer's
+   destination surface at the internal scale, produced by
+   pica_gl_transfer_scaled_capture() (source scaled backing -> GL_LINEAR blit
+   into the scaled destination size) and rotated into screen orientation by
+   the SAME mapping the native shadow conversion uses (portrait source(x,y) ->
+   landscape W-1-x, y), so the framing cannot differ: only the detail does.
+
+   FRAME PAIRING (the trap that killed the t_aaecbb52 spike: presenting "the
+   current FBO" showed a frame the LCD was not showing).  An image is stored
+   against the guest LCD framebuffer ADDRESS its transfer wrote, and the
+   composer picks the image whose address is the one the GSP scan-out is
+   showing right now (`gsp_fb_addr[screen][gsp_fb_shown[screen]]`).  That is
+   the accepted transfer by construction — the scan-out shield decides which
+   buffer is visible, and this follows the shield.  When the shown buffer has
+   no image (never transferred since the run started, a non-GL producer wrote
+   it, the guest drew it with the CPU/software path, split-render, ...) the
+   screen falls back to the guest path and is counted.
+
+   STALENESS.  Each entry keeps the FNV-1a hash of the guest destination bytes
+   it was derived from; the scan-out path re-hashes the shown buffer and drops
+   the entry when the bytes changed behind our back (so a buffer the guest
+   rewrote without a display transfer can never be presented from an old
+   scaled image).  `DQ8_PRESENT_SOURCE=guest|scaled`, default scaled when
+   DQ8_RENDER_SCALE>1 and guest otherwise; the guest path is the old code byte
+   for byte. */
+#define HOST_SCALED_SLOTS 2
+typedef struct {
+    int valid;
+    uint32_t addr;      /* guest LCD framebuffer address the transfer wrote */
+    int w, h, bpp;      /* guest destination geometry that produced it */
+    uint64_t hash;      /* hash of those guest bytes at capture time */
+    uint64_t serial;    /* bumped on every store (composer recompose key) */
+    int f, pw, ph;      /* internal scale, landscape image dims (400f x 240f) */
+    size_t cap;         /* bytes allocated at pix */
+    uint8_t *pix;       /* landscape RGBA, malloc'd on first use */
+} HostScaledScreen;
+static HostScaledScreen host_scaled[2][HOST_SCALED_SLOTS];
+static uint64_t host_scaled_serial_gen;
+static uint64_t host_scaled_taken, host_scaled_store_fail;
+static uint64_t host_scaled_used[2], host_scaled_absent[2], host_scaled_stale;
+static uint64_t host_scaled_ns;
+static int host_scaled_stats_hooked;
+static void host_scaled_stats_dump(void) {
+    fprintf(stderr, "present scaled source: transfers taken=%llu store_fail=%llu "
+            "screen_uses=%llu/%llu absent_fallbacks=%llu/%llu stale_drops=%llu "
+            "capture_ms=%.2f\n",
+            (unsigned long long)host_scaled_taken,
+            (unsigned long long)host_scaled_store_fail,
+            (unsigned long long)host_scaled_used[0],
+            (unsigned long long)host_scaled_used[1],
+            (unsigned long long)host_scaled_absent[0],
+            (unsigned long long)host_scaled_absent[1],
+            (unsigned long long)host_scaled_stale,
+            (double)host_scaled_ns / 1e6);
+}
+/* DQ8_PRESENT_SOURCE=guest|scaled; default scaled when the internal scale is
+   above 1, guest otherwise (so a run that does not ask for a render scale is
+   byte-identical to dq8-b48). */
+static int host_present_scaled_source(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("DQ8_PRESENT_SOURCE");
+        const char *rs = getenv("DQ8_RENDER_SCALE");
+        int want = 0;
+        if (e && e[0]) want = (strcmp(e, "scaled") == 0);
+        else want = (rs && rs[0] && atoi(rs) > 1) ? 1 : 0;
+        mode = want;
+        fprintf(stderr, "host present: source=%s (DQ8_PRESENT_SOURCE=%s, "
+                        "DQ8_RENDER_SCALE=%s)\n",
+                want ? "scaled display transfer" : "guest framebuffer shadow",
+                (e && e[0]) ? e : "(unset)",
+                (rs && rs[0]) ? rs : "(unset)");
+        if (want && !host_scaled_stats_hooked) {
+            host_scaled_stats_hooked = 1;
+            atexit(host_scaled_stats_dump);
+        }
+    }
+    return mode;
+}
+static HostScaledScreen *host_scaled_slot(int screen, uint32_t addr) {
+    int i;
+    if (screen < 0 || screen > 1) return NULL;
+    for (i = 0; i < HOST_SCALED_SLOTS; ++i)
+        if (host_scaled[screen][i].valid && host_scaled[screen][i].addr == addr)
+            return &host_scaled[screen][i];
+    return NULL;
+}
+/* Store one scaled destination (portrait, guest memory row order) as the
+   screen's landscape image, keyed by the guest LCD address it was written to.
+   The rotation is the native converter's: dst(dy = W-1-x, dx = y). */
+static void host_scaled_store(int screen, uint32_t addr, int w, int h, int bpp,
+                              uint64_t hash, const unsigned char *img,
+                              int dw, int dh, int f) {
+    static const char *const names[2] = { "top", "bottom" };
+    HostScaledScreen *e = NULL;
+    int sw_scr = (screen == 0) ? (int)HOST_TOP_W : (int)HOST_BOT_W;
+    int sh_scr = (screen == 0) ? (int)HOST_TOP_H : (int)HOST_BOT_H;
+    int i, x, y;
+    size_t need;
+    uint64_t t0 = host_monotonic_ns();
+    if (screen < 0 || screen > 1 || !img || f <= 1) return;
+    if (dw != sh_scr * f || dh != sw_scr * f) {
+        /* The transfer's declared destination is not this screen's LCD shape:
+           nothing sensible to present, keep the guest path for it. */
+        ++host_scaled_store_fail;
+        if (host_scaled_store_fail <= 8u)
+            fprintf(stderr, "present scaled source: %s transfer destination "
+                            "%dx%d at x%d is not the %dx%d screen — guest path\n",
+                    names[screen], dw, dh, f, sw_scr, sh_scr);
+        return;
+    }
+    need = (size_t)dw * (size_t)dh * 4u;
+    e = host_scaled_slot(screen, addr);
+    if (!e) {
+        for (i = 0; i < HOST_SCALED_SLOTS; ++i)
+            if (!host_scaled[screen][i].valid) { e = &host_scaled[screen][i]; break; }
+        if (!e) {   /* recycle the oldest entry of this screen */
+            e = &host_scaled[screen][0];
+            for (i = 1; i < HOST_SCALED_SLOTS; ++i)
+                if (host_scaled[screen][i].serial < e->serial)
+                    e = &host_scaled[screen][i];
+        }
+        e->valid = 0;
+    }
+    if (e->cap < need) {
+        uint8_t *n = (uint8_t *)realloc(e->pix, need);
+        if (!n) { ++host_scaled_store_fail; return; }
+        e->pix = n;
+        e->cap = need;
+    }
+    for (x = 0; x < dw; ++x) {
+        uint32_t *drow = (uint32_t *)(void *)(e->pix + (size_t)(dw - 1 - x) *
+                                              (size_t)dh * 4u);
+        const uint32_t *scol = (const uint32_t *)(const void *)(img + (size_t)x * 4u);
+        for (y = 0; y < dh; ++y) drow[y] = scol[(size_t)y * (size_t)dw];
+    }
+    e->valid = 1;
+    e->addr = addr;
+    e->w = w; e->h = h; e->bpp = bpp;
+    e->hash = hash;
+    e->f = f;
+    e->pw = dh;
+    e->ph = dw;
+    e->serial = ++host_scaled_serial_gen;
+    ++host_scaled_taken;
+    host_scaled_ns += host_monotonic_ns() - t0;
+    if (host_scaled_taken <= 4u)
+        fprintf(stderr, "present scaled source: %s screen image %dx%d at x%d "
+                        "from LCD buffer %08X (%dx%d) — adopted #%llu\n",
+                names[screen], e->pw, e->ph, f, addr, w, h,
+                (unsigned long long)host_scaled_taken);
+}
+/* The image for what the window is showing: the one whose guest LCD address is
+   the GSP scan-out's shown buffer.  NULL (and counted) when there is none. */
+static HostScaledScreen *host_scaled_shown(int screen) {
+    HostScaledScreen *e;
+    uint32_t shown;
+    if (screen < 0 || screen > 1 || !gsp_fb_valid[screen]) {
+        ++host_scaled_absent[screen & 1];
+        return NULL;
+    }
+    shown = gsp_fb_addr[screen][gsp_fb_shown[screen] & 1];
+    e = host_scaled_slot(screen, shown);
+    if (!e) {
+        ++host_scaled_absent[screen];
+        return NULL;
+    }
+    return e;
+}
+/* Compose one screen rect from a scaled image (W*f x H*f) into the window's
+   fixed 2x rect.  ratio = f/HOST_SCALE: 1 is an exact copy (f=2 -> 1:1),
+   >1 is a box average over ratio x ratio source pixels (f=4 -> 2:1), 0 is a
+   nearest-neighbour fallback for a non-integral ratio (f=3).  The source has
+   no trustworthy alpha (the guest's destination is RGB8), so alpha is forced
+   opaque exactly like host_present_scale2's RGB8 path. */
+static void host_present_blit_scaled(uint8_t *dst, int dst_pitch, int kind,
+                                     const uint8_t *src, int sw, int sh,
+                                     int ratio, int dx, int dy, int ow, int oh) {
+    int X, Y, ab = (kind & 1) ? 0xFF : 0x00;
+    for (Y = 0; Y < oh; ++Y) {
+        uint8_t *d = dst + (size_t)(dy + Y) * (size_t)dst_pitch + (size_t)dx * 4u;
+        for (X = 0; X < ow; ++X) {
+            unsigned r = 0, g = 0, b = 0, n = 0;
+            if (ratio > 1) {
+                int yy, xx;
+                for (yy = Y * ratio; yy < (Y + 1) * ratio && yy < sh; ++yy) {
+                    const uint8_t *s = src + ((size_t)yy * (size_t)sw +
+                                              (size_t)X * (size_t)ratio) * 4u;
+                    for (xx = X * ratio; xx < (X + 1) * ratio && xx < sw;
+                         ++xx, s += 4) {
+                        r += s[0]; g += s[1]; b += s[2]; ++n;
+                    }
+                }
+                if (n) { r = (r + n / 2u) / n; g = (g + n / 2u) / n; b = (b + n / 2u) / n; }
+            } else {
+                int sx = (sw == ow) ? X : (int)((long)X * sw / ow);
+                int sy = (sh == oh) ? Y : (int)((long)Y * sh / oh);
+                const uint8_t *s = src + ((size_t)sy * (size_t)sw + (size_t)sx) * 4u;
+                r = s[0]; g = s[1]; b = s[2];
+            }
+            d[0] = (uint8_t)((kind >= 2) ? b : r);
+            d[1] = (uint8_t)g;
+            d[2] = (uint8_t)((kind >= 2) ? r : b);
+            d[3] = (uint8_t)ab;
+            d += 4;
+        }
+    }
+}
+
+/* The layout step.  stacked = one target (this window) holding both screens;
+   split = one target per screen, which is why a target carries its own
+   per-screen rectangles and serials instead of the window being implicit. */
+static HostPresentTarget *host_present_target_for(int action, uint8_t *pix,
+                                                  int pitch, int kind,
+                                                  int w, int h) {
+    static int logged;
+    HostPresentTarget *t = &host_present_targets[0];
+    const char *layout = getenv("DQ8_PRESENT_LAYOUT");
+    int split = layout && strcmp(layout, "split") == 0;
+    if (!t->pix || t->pix != pix || t->pitch != pitch || t->kind != kind ||
+        t->w != w || t->h != h) {
+        t->pix = pix;
+        t->pitch = pitch;
+        t->kind = kind;
+        t->w = w;
+        t->h = h;
+        t->composed[0] = t->composed[1] = ~(uint64_t)0;
+        t->black = 0;
+        t->need_clear = 1;
+    }
+    t->action = action;
+    t->dx[0] = 0;
+    t->dy[0] = 0;
+    t->dx[1] = HOST_PRESENT_BOT_DX;
+    t->dy[1] = HOST_PRESENT_BOT_DY;
+    host_present_target_count = 1;
+    if (!logged) {
+        static const char *names[] = { "none", "x11-shm", "window-surface", "renderer" };
+        logged = 1;
+        fprintf(stderr, "host present: composed %dx%d target (%dx%d) action=%s "
+                "kind=%d kernel=%s layout=%s%s\n",
+                w, h, HOST_PRESENT_W, HOST_PRESENT_H,
+                names[(action >= 0 && action <= 3) ? action : 0], kind,
+                host_present_scaler_mode() == 2 ? "scalar" : "sse2",
+                split ? "split" : "stacked",
+                split ? " (one window per screen not implemented; stacked)" : "");
+        if (getenv("DQ8_PRESENT_STATS")) atexit(host_present_stats_dump);
+    }
+    (void)host_present_target_count;
+    return t;
+}
+/* Compose every screen whose serial moved.  Returns 1 if any pixels changed. */
+static int host_present_target_compose(HostPresentTarget *t) {
+    int i, moved = 0;
+    if (t->need_clear) {
+        host_present_fill_black_rect(t->pix, t->pitch, t->kind, 0, 0, t->w, t->h);
+        t->composed[0] = t->composed[1] = ~(uint64_t)0;
+        t->composed_src[0] = t->composed_src[1] = 0;
+        t->black = 0;
+        t->need_clear = 0;
+        moved = 1;
+    }
+    for (i = 0; i < 2; ++i) {
+        const uint8_t *src;
+        int sw, sh, w, h;
+        HostScaledScreen *sc = NULL;
+        uint64_t sc_serial = 0;
+        if (host_present_scaled_source()) {
+            sc = host_scaled_shown(i);
+            if (sc) sc_serial = sc->serial;
+        }
+        if (t->composed[i] == host_shadow_serial[i] &&
+            t->composed_src[i] == sc_serial) {
+            ++host_present_composed_skipped;
+            continue;
+        }
+        if (i == 0) { src = host_shadow_top; sw = (int)HOST_TOP_W; sh = (int)HOST_TOP_H; }
+        else        { src = host_shadow_bot; sw = (int)HOST_BOT_W; sh = (int)HOST_BOT_H; }
+        w = sw * HOST_SCALE;
+        h = sh * HOST_SCALE;
+        if (sc && sc->pw == w * (sc->f / HOST_SCALE) && sc->f % HOST_SCALE == 0 &&
+            sc->ph == h * (sc->f / HOST_SCALE)) {
+            int ratio = sc->f / HOST_SCALE;
+            host_present_blit_scaled(t->pix, t->pitch, t->kind, sc->pix,
+                                     sc->pw, sc->ph, ratio,
+                                     t->dx[i], t->dy[i], w, h);
+            ++host_scaled_used[i];
+        } else if (host_present_scale2(t->pix, t->pitch, t->kind, src, sw, sh,
+                                       t->dx[i], t->dy[i])) {
+            /* A non-opaque source pixel was blended over the black the old
+               path had just filled; redo this region on a black base so the
+               result cannot depend on the previous frame. */
+            ++host_present_translucent_redos;
+            host_present_fill_black_rect(t->pix, t->pitch, t->kind,
+                                         t->dx[i], t->dy[i], w, h);
+            host_present_scale2(t->pix, t->pitch, t->kind, src, sw, sh,
+                                t->dx[i], t->dy[i]);
+        }
+        t->composed[i] = host_shadow_serial[i];
+        t->composed_src[i] = sc_serial;
+        ++host_present_composed_screens;
+        moved = 1;
+    }
+    return moved;
+}
+/* LCD force-black image (rare; the caller already suppresses repeats). */
+static int host_present_target_black(HostPresentTarget *t) {
+    if (t->black && !t->need_clear) return 0;
+    host_present_fill_black_rect(t->pix, t->pitch, t->kind, 0, 0, t->w, t->h);
+    t->composed[0] = t->composed[1] = ~(uint64_t)0;
+    t->black = 1;
+    t->need_clear = 0;
+    return 1;
+}
+/* DQ8_PRESENT_SELFTEST=1: render the frozen path and the composed path from
+   the SAME shadows into two scratch surfaces and compare them byte for byte.
+   This is the pixel-identity proof on real game content (the unit test in
+   tools/present_kernel_test.py covers synthetic content); it is a debug mode only -- it
+   doubles the per-present work and is never used for measurements. */
+static uint64_t host_selftest_calls, host_selftest_compared;
+static uint64_t host_selftest_mismatch_frames, host_selftest_mismatch_bytes;
+static void host_present_selftest_dump(void) {
+    fprintf(stderr, "host present SELFTEST: presents=%llu compared=%llu "
+            "mismatch_frames=%llu mismatch_bytes=%llu%s\n",
+            (unsigned long long)host_selftest_calls,
+            (unsigned long long)host_selftest_compared,
+            (unsigned long long)host_selftest_mismatch_frames,
+            (unsigned long long)host_selftest_mismatch_bytes,
+            host_selftest_mismatch_frames ? "  (PIXEL DIFFERENCE)" : "  (IDENTICAL)");
+}
+static void host_present_selftest(SDL_Surface *ws, int kind, int black) {
+    static SDL_Surface *ref, *got;
+    static int on = -1;
+    static int exit_hooked;
+    uint64_t calls, compared;
+    if (on < 0) {
+        on = getenv("DQ8_PRESENT_SELFTEST") != NULL;
+        if (on) fprintf(stderr, "host present: SELFTEST on (frozen path vs "
+                                "composed path, byte compare)\n");
+    }
+    if (!on) return;
+    if (!ref) {
+        ref = SDL_CreateRGBSurface(0, HOST_PRESENT_W, HOST_PRESENT_H, 32,
+            ws->format->Rmask, ws->format->Gmask, ws->format->Bmask,
+            ws->format->Amask);
+        got = SDL_CreateRGBSurface(0, HOST_PRESENT_W, HOST_PRESENT_H, 32,
+            ws->format->Rmask, ws->format->Gmask, ws->format->Bmask,
+            ws->format->Amask);
+        if (!ref || !got) { on = 0; return; }
+    }
+    ++host_selftest_calls;
+    calls = host_selftest_calls;
+    if (calls > 16 && (calls % 8) != 0) return;
+    compared = ++host_selftest_compared;
+    /* frozen path: fill + two scaled blits, exactly as the old code did */
+    SDL_FillRect(ref, NULL, SDL_MapRGB(ref->format, 0, 0, 0));
+    if (!black && host_shadow_surf_top && host_shadow_surf_bot) {
+        SDL_Rect top = { 0, 0, (int)HOST_TOP_W * HOST_SCALE, (int)HOST_TOP_H * HOST_SCALE };
+        SDL_Rect bot = {
+            ((int)HOST_TOP_W - (int)HOST_BOT_W) / 2 * HOST_SCALE,
+            (int)HOST_TOP_H * HOST_SCALE,
+            (int)HOST_BOT_W * HOST_SCALE, (int)HOST_BOT_H * HOST_SCALE
+        };
+        SDL_BlitScaled(host_shadow_surf_top, NULL, ref, &top);
+        SDL_BlitScaled(host_shadow_surf_bot, NULL, ref, &bot);
+    }
+    /* composed path, same sources, same destination format */
+    host_present_fill_black_rect((uint8_t *)got->pixels, got->pitch, kind,
+                                 0, 0, HOST_PRESENT_W, HOST_PRESENT_H);
+    if (!black) {
+        host_present_scale2((uint8_t *)got->pixels, got->pitch, kind,
+                            host_shadow_top, (int)HOST_TOP_W, (int)HOST_TOP_H, 0, 0);
+        host_present_scale2((uint8_t *)got->pixels, got->pitch, kind,
+                            host_shadow_bot, (int)HOST_BOT_W, (int)HOST_BOT_H,
+                            HOST_PRESENT_BOT_DX, HOST_PRESENT_BOT_DY);
+    }
+    {
+        int y, x;
+        uint64_t bad = 0;
+        for (y = 0; y < HOST_PRESENT_H; ++y) {
+            const uint8_t *a = (const uint8_t *)ref->pixels + (size_t)y * ref->pitch;
+            const uint8_t *b = (const uint8_t *)got->pixels + (size_t)y * got->pitch;
+            for (x = 0; x < HOST_PRESENT_W * 4; ++x)
+                if (a[x] != b[x]) ++bad;
+        }
+        if (bad) {
+            ++host_selftest_mismatch_frames;
+            host_selftest_mismatch_bytes += bad;
+            if (host_selftest_mismatch_frames <= 4u)
+                fprintf(stderr, "host present: SELFTEST MISMATCH call=%llu "
+                        "bytes=%llu black=%d\n",
+                        (unsigned long long)calls, (unsigned long long)bad, black);
+        }
+    }
+    if (calls == 1)
+        fprintf(stderr, "host present: SELFTEST compared=%llu mismatches=%llu\n",
+                (unsigned long long)compared,
+                (unsigned long long)host_selftest_mismatch_frames);
+    if (!exit_hooked) {
+        exit_hooked = 1;
+        atexit(host_present_selftest_dump);
+    }
+}
+/* Present one target with its path's single present call. */
+static void host_present_target_present(HostPresentTarget *t) {
+    ++host_present_composed_presents;
+    if (t->action == HP_PRESENT_X11) {
+        host_x11_present_put();
+        return;
+    }
+    if (t->action == HP_PRESENT_WINDOW) {
+        SDL_Surface *ws = host_sdl_surface;
+        int y;
+        if (!ws || t->pix != host_compose_buf) return;
+        for (y = 0; y < t->h && y < ws->h; ++y)
+            memcpy((uint8_t *)ws->pixels + (size_t)y * (size_t)ws->pitch,
+                   t->pix + (size_t)y * (size_t)t->pitch, (size_t)t->w * 4u);
+        if (SDL_UpdateWindowSurface(host_sdl_window) != 0) {
+            static unsigned update_failures;
+            if (update_failures++ < 4u)
+                fprintf(stderr, "host display: SDL_UpdateWindowSurface failed: %s\n",
+                        SDL_GetError());
+        }
+        return;
+    }
+    if (t->action == HP_PRESENT_RENDERER) {
+        SDL_Rect full = { 0, 0, t->w, t->h };
+        if (!host_sdl_tex_full)
+            host_sdl_tex_full = SDL_CreateTexture(host_sdl_renderer,
+                SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, t->w, t->h);
+        if (!host_sdl_tex_full) return;
+        SDL_UpdateTexture(host_sdl_tex_full, NULL, t->pix, t->pitch);
+        SDL_RenderCopy(host_sdl_renderer, host_sdl_tex_full, NULL, &full);
+        SDL_RenderPresent(host_sdl_renderer);
+        return;
+    }
+}
+
+static void host_display_present_impl_body(void) {
     if (!host_display_ready) return;
     /* GL context hold boundary (t_86b8f1f9): SDL's blit/present below is a
        foreign GL user on this thread; drop the GL backend's context hold
@@ -8742,6 +9891,54 @@ static void host_display_present_impl(void) {
             }
             host_sdl_surface = ws;
         }
+        /* t_5286064e: composed path (default) -- see the block above.  A
+           destination format the kernel does not know, a window that is not
+           the fixed 800x960 geometry, or DQ8_PRESENT_SCALER=0 falls through to
+           the frozen FillRect + 2x SDL_BlitScaled path below. */
+        {
+            int kind = host_present_scaler_mode() ? host_present_dst_kind(ws->format) : -1;
+            if (kind >= 0 && ws->w == HOST_PRESENT_W && ws->h == HOST_PRESENT_H) {
+                HostPresentTarget *t = host_display_use_x11
+                    ? host_present_target_for(HP_PRESENT_X11, (uint8_t *)ws->pixels,
+                                              ws->pitch, kind, ws->w, ws->h)
+                    : host_present_target_for(HP_PRESENT_WINDOW, host_compose_buf,
+                                              HOST_PRESENT_W * 4, kind,
+                                              HOST_PRESENT_W, HOST_PRESENT_H);
+                host_present_selftest(ws, kind, black);
+                {
+                    /* DQ8_PRESENT_STATS=1: split the composed present into
+                       compose vs present-call time, so the operator can see
+                       what is left of the per-frame cost on a real GPU. */
+                    uint64_t t0 = host_present_stats_on() ? host_monotonic_ns() : 0;
+                    uint64_t t1 = t0, t2 = t0;
+                    int did_present = 0;
+                    if (black) {
+                        if (host_present_target_black(t)) {
+                            host_present_target_present(t);
+                            did_present = 1;
+                        }
+                    } else if (host_present_target_compose(t)) {
+                        t1 = t0 ? host_monotonic_ns() : 0;
+                        host_present_target_present(t);
+                        did_present = 1;
+                    } else if (t->action == HP_PRESENT_WINDOW) {
+                        /* An SDL window surface may be rotated or reallocated
+                           by the backend between updates, so it is always
+                           re-pushed from the persistent composed image. */
+                        t1 = t0 ? host_monotonic_ns() : 0;
+                        host_present_target_present(t);
+                        did_present = 1;
+                    }
+                    if (t0) {
+                        t2 = host_monotonic_ns();
+                        if (t1 < t0) t1 = t2;
+                        host_present_ns_compose += t1 - t0;
+                        host_present_ns_put += did_present ? t2 - t1 : 0;
+                    }
+                }
+                return;
+            }
+        }
         SDL_FillRect(ws, NULL, SDL_MapRGB(ws->format, 0, 0, 0));
         if (!black && host_shadow_surf_top && host_shadow_surf_bot) {
             SDL_Rect top = { 0, 0, HOST_TOP_W * HOST_SCALE, HOST_TOP_H * HOST_SCALE };
@@ -8765,6 +9962,24 @@ static void host_display_present_impl(void) {
         }
         return;
     }
+    /* t_5286064e: renderer path -- compose once into host_compose_buf (the
+       persistent image), upload ONE texture, one RenderCopy, no clear.  The
+       frozen path uploaded two textures and cleared the window every frame.
+       Only taken while the window is exactly the composed geometry; any other
+       window size keeps the rect-based path below. */
+    {
+        int ww = 0, wh = 0;
+        SDL_GetWindowSize(host_sdl_window, &ww, &wh);
+        if (host_present_scaler_mode() && ww == HOST_PRESENT_W && wh == HOST_PRESENT_H) {
+            HostPresentTarget *t = host_present_target_for(HP_PRESENT_RENDERER,
+                host_compose_buf, HOST_PRESENT_W * 4, HP_KIND_RGBA_A,
+                HOST_PRESENT_W, HOST_PRESENT_H);
+            if (black) host_present_target_black(t);
+            else host_present_target_compose(t);
+            host_present_target_present(t);
+            return;
+        }
+    }
     SDL_UpdateTexture(host_sdl_tex_top, NULL, host_shadow_top, HOST_TOP_W * 4);
     SDL_UpdateTexture(host_sdl_tex_bot, NULL, host_shadow_bot, HOST_BOT_W * 4);
     SDL_SetRenderDrawColor(host_sdl_renderer, 0, 0, 0, 255);
@@ -8784,9 +9999,20 @@ static void host_display_present_impl(void) {
 #else
 static void host_display_shutdown_body(void) { (void)host_display_ready; }
 static void host_display_init_body(void) {}
-static void host_display_pump_events(void) { native_hid_pump(); }
-static void host_display_present_impl(void) {}
+static void host_display_pump_events(void) {
+    if (host_signal_quit) host_quit_now("SIGINT/SIGTERM");
+    native_hid_pump();
+}
+static void host_display_present_impl_body(void) {}
 #endif
+/* FREEZE WATCHDOG (t_4371e6ea): every present (guest thread and split-present
+   worker) enters through this wrapper, so a freeze inside SDL/X11/GL present
+   is named as such in the dump instead of looking like an idle main thread. */
+static void host_display_present_impl(void) {
+    dq8_watchdog_present_enter();
+    host_display_present_impl_body();
+    dq8_watchdog_present_exit();
+}
 /* Guest-thread wrappers.  With DQ8_SPLIT_RENDER=1 the worker thread calls
    the *_impl/body functions directly; the guest-thread entry points become
    no-ops for present (the worker paces it) while HID stays on this thread. */
@@ -8804,6 +10030,7 @@ static void host_display_present(void) {
     {
         static uint64_t fps_last_ns;
         static unsigned long long fps_last_game, fps_last_draws, fps_game_frames;
+        static unsigned long long fps_last_presents, fps_last_drained;
         static int fps_title_off = -1;
         if (fps_title_off < 0) {
             const char *e = getenv("DQ8_FPS_TITLE");
@@ -8818,11 +10045,41 @@ static void host_display_present(void) {
             if (dt >= 1.0) {
                 unsigned long long dg = fps_game_frames - fps_last_game;
                 char title[192];
-                if (dg > 0)
+                if (dg > 0) {
+                    /* Azahar semantics: fps = frames the guest actually put on the
+                       screen per wall second (a flip of the shown buffer), and
+                       speed% = emulated console time per wall second, measured in
+                       60 Hz vblank periods.  A game that is 30 fps by design shows
+                       30 fps at 100% speed; the old counter compared draw-batch
+                       counts and over-reported by 1.5-2x. */
+                    unsigned long long swaps = atomic_load_explicit(&guest_frame_swaps, memory_order_relaxed);
+                    unsigned long long vbls = atomic_load_explicit(&guest_vbl_events, memory_order_relaxed)
+                                             + atomic_load_explicit(&gsp_vbl_drained, memory_order_relaxed);
+                    static double target_fps = -1.0;
+                    if (target_fps < 0.0) {
+                        const char *tv = getenv("DQ8_TARGET_FPS");
+                        target_fps = (tv && *tv) ? atof(tv) : 30.0;
+                        if (target_fps <= 0.0) target_fps = 30.0;
+                    }
+                    double dp = (double)(swaps - fps_last_presents);
+                    unsigned long long dr = vbls;
+                    /* Percentage of the title's frame rate, not of the pacer: the
+                       guest clock here is driven by our vblank pacer, so a
+                       time-based ratio is ~100% by construction and hides a slow
+                       game.  fps/target is what "30 fps = 100%" means. */
+                    double speed = 100.0 * (dp / dt) / target_fps;
                     snprintf(title, sizeof title,
-                             "DQ8  |  GAME %.1f fps  |  %5.1f ms/frame",
-                             (double)dg / dt, 1000.0 * dt / (double)dg);
-                else
+                             "DQ8  |  %4.1f fps  |  %3.0f%%%%  |  %5.1f ms",
+                             dp / dt, speed, 1000.0 * dt / (double)dp);
+                    { static int fpslog = -1;
+                      if (fpslog < 0) { const char *q = getenv("DQ8_FPSLOG"); fpslog = (q && q[0] == '1'); }
+                      if (fpslog)
+                          fprintf(stderr, "FPSLOG fps=%.1f/s target_pct=%.0f%% vblank=%.1f/s frame_ms=%.1f\n",
+                                  dp / dt, speed, (double)(dr - fps_last_drained) / dt, 1000.0 * dt / (double)dp);
+                    }
+                    fps_last_presents = swaps;
+                    fps_last_drained = dr;
+                } else
                     snprintf(title, sizeof title,
                              "DQ8  |  GAME 0.0 fps (paused/loading)");
                 SDL_SetWindowTitle(host_sdl_window, title);
@@ -9045,11 +10302,17 @@ static void host_display_capture_transfer(uint32_t mapped_dest, uint32_t w, uint
     }
     ++host_display_capture_converted;
     if (split_render_enabled()) {
-        /* F4: snapshot the bytes on THIS thread (guest RAM never crosses
-           the queue) and let the present worker convert/present. */
+        /* F4: snapshot the bytes on THIS thread (guest RAM never crosses the
+           queue) and let the present worker convert/present. */
         if (!bpp || mapped_dest >= GUEST_RAM_SIZE) return;
         split_present_submit(mapped_dest, w, h, format);
         return;
+    }
+    {
+        /* t_5286064e: this screen's shadow is about to be rewritten, so the
+           presenter must rescale exactly this screen and nothing else. */
+        int rot = 0, tgt = host_capture_target(w, h, &rot);
+        if (tgt >= 0) ++host_shadow_serial[tgt];
     }
     host_shadow_dirty = 1; /* a real producer event: the window needs a present */
     /* Framebuffer snapshotting (for the built-in /tmp PPM capture) must work
@@ -9231,9 +10494,67 @@ static double dlog_dark_tiled(uint32_t addr, uint32_t w, uint32_t h, uint32_t gs
 }
 
 static uint32_t dlog_xsrc, dlog_xdst, dlog_xw, dlog_xh, dlog_xfmt, dlog_xn;
+/* t_fdd26eba item A/B handover: one display transfer's scaled destination.
+   Produced by pica_gl_transfer_scaled_capture() BEFORE the download boundary
+   (the scaled backing lives in GL) and stored against the guest LCD address
+   the transfer wrote, so the composer can pick, for every frame, the image of
+   the buffer the GSP scan-out is showing. */
+typedef struct {
+    const unsigned char *img;   /* portrait destination, guest memory row order */
+    int w, h;                   /* portrait = declared destination * f */
+    int f;                      /* internal scale it was taken at */
+    uint32_t guest_dst;         /* guest LCD address it was written to */
+    uint64_t hash;              /* hash of the guest bytes it decodes to */
+} HostScaledCapture;
+
+/* t_fdd26eba item A: take one display transfer's scaled destination from the
+   GL backend, before the download boundary.  Returns 0 (and leaves sc->img
+   NULL) when the transfer does not qualify — the caller then produces only the
+   native destination, exactly like dq8-b48. */
+static int host_scaled_capture_for_transfer(const uint32_t *args,
+                                            HostScaledCapture *sc) {
+    uint32_t source = args[0], input_dim = args[2], output_dim = args[3];
+    uint32_t flags = args[4];
+    uint32_t in_w = input_dim & 0xFFFFu, in_h = input_dim >> 16u;
+    uint32_t out_w = output_dim & 0xFFFFu, out_h = output_dim >> 16u;
+    uint32_t scaling = (flags >> 24) & 3u, h_scale, v_scale;
+    unsigned char *img = NULL;
+    unsigned iw = 0, ih = 0;
+    int f = 0;
+    uint64_t t0;
+    sc->img = NULL;
+    if (!host_present_scaled_source()) return 0;
+    if (!out_w || !out_h || scaling > 2u) return 0;
+    if (!in_w) in_w = out_w;
+    if (!in_h) in_h = out_h;
+    h_scale = (scaling != 0u) ? 1u : 0u;
+    v_scale = (scaling == 2u) ? 1u : 0u;
+    t0 = host_monotonic_ns();
+    if (!pica_gl_transfer_scaled_capture(source, in_w, in_h, out_w, out_h,
+                                         out_w >> h_scale, out_h >> v_scale,
+                                         (int)(flags & 1u), h_scale, v_scale,
+                                         &img, &iw, &ih, &f)) {
+        host_scaled_ns += host_monotonic_ns() - t0;
+        return 0;
+    }
+    host_scaled_ns += host_monotonic_ns() - t0;
+    sc->img = img;
+    sc->w = (int)iw;
+    sc->h = (int)ih;
+    sc->f = f;
+    sc->guest_dst = args[1];
+    return 1;
+}
 static void gsp_display_transfer(uint32_t *args) {
     int xp = xfer_prof_enabled();
     uint64_t xp_t0 = 0, xp_flush = 0, xp_loop = 0;
+    HostScaledCapture sc;
+    int have_sc;
+    memset(&sc, 0, sizeof sc);
+    /* t_fdd26eba item A: the scaled destination must be taken while the GL
+       episode is still pending — the download boundary right below is exactly
+       the point where the scaled backing stops being current. */
+    have_sc = host_scaled_capture_for_transfer(args, &sc);
     if (xp) xp_t0 = host_monotonic_ns();
     pica_gl_flush_guest_rt(); /* transfer reads source pixels from guest RAM */
     if (xp) { xp_flush = host_monotonic_ns() - xp_t0; xp_t0 = host_monotonic_ns(); }
@@ -9269,6 +10590,7 @@ static void gsp_display_transfer(uint32_t *args) {
         !guest_memory_range(dest, (uint64_t)eff_w * eff_h * out_bpp, &mapped_dest)) {
         fprintf(stderr, "invalid GSP display transfer src=%08X dim=%08X dst=%08X dim=%08X flags=%08X\n",
                 source, input_dim, dest, output_dim, flags);
+        if (have_sc) free((void *)sc.img);
         return;
     }
     uint32_t guest_src = source, guest_dst = dest;
@@ -9283,6 +10605,7 @@ static void gsp_display_transfer(uint32_t *args) {
     uint32_t scaling = (flags >> 24) & 3u;
     if (scaling == 3u) {
         fprintf(stderr, "GSP display transfer: reserved scaling mode 3, flags=%08X\n", flags);
+        if (have_sc) free((void *)sc.img);
         return;
     }
     uint32_t h_scale = (scaling != 0u) ? 1u : 0u;
@@ -9425,6 +10748,34 @@ static void gsp_display_transfer(uint32_t *args) {
         }
     }
 transfer_pixels_done:
+    /* t_fdd26eba: the hash of the guest bytes this transfer just produced, so
+       the scan-out can tell whether a presented scaled image still describes
+       the buffer the LCD is showing. */
+    if (have_sc)
+        sc.hash = elide_hash_bytes(14695981039346656037ull, ram + dest,
+                                   (size_t)out_w * (size_t)out_h * (size_t)out_bpp);
+    {   /* t_fdd26eba diagnosis: dump the scaled destination so its geometry can
+           be checked against the native destination bytes (which
+           DQ8_DUMP_TRANSFER_PREFIX writes).  Off by default. */
+        const char *sd = getenv("DQ8_XFER_SCALED_DUMP");
+        static unsigned sd_n;
+        if (have_sc && sd && sd[0] && sd_n < 16u) {
+            char p[1024];
+            FILE *fp;
+            snprintf(p, sizeof p, "%s/scaled-%02u.ppm", sd, sd_n);
+            fp = fopen(p, "wb");
+            if (fp) {
+                int i;
+                fprintf(fp, "P6\n%d %d\n255\n", sc.w, sc.h);
+                for (i = 0; i < sc.w * sc.h; ++i)
+                    fwrite(sc.img + (size_t)i * 4u, 1u, 3u, fp);
+                fclose(fp);
+                fprintf(stderr, "XFER scaled dump: %dx%d (x%d) dst=%08X -> %s\n",
+                        sc.w, sc.h, sc.f, sc.guest_dst, p);
+            }
+            ++sd_n;
+        }
+    }
     if (xp) { xp_loop = host_monotonic_ns() - xp_t0; xp_t0 = host_monotonic_ns(); }
     const char *prefix = getenv("DQ8_DUMP_TRANSFER_PREFIX");
     if (prefix && output_format == 1u) {
@@ -9461,6 +10812,20 @@ transfer_pixels_done:
             host_display_capture_transfer(dest, out_w, out_h, output_format);
         }
     }
+    /* t_fdd26eba item A/B: store the scaled destination of this transfer for
+       the address it wrote — INDEPENDENTLY of the scan-out shield.  DQ8's
+       transfers always target the pair member that is NOT shown yet; the next
+       vblank flips to it (the shield then keeps it), so the transfer into the
+       hidden buffer is exactly the one whose image the window will need.  The
+       composer matches by shown ADDRESS, so a stored image can never be
+       presented for a buffer the LCD is not showing. */
+    if (have_sc) {
+        int rot = 0, tgt = host_capture_target(out_w, out_h, &rot);
+        if (tgt >= 0)
+            host_scaled_store(tgt, guest_dst, (int)out_w, (int)out_h,
+                              (int)out_bpp, sc.hash, sc.img, sc.w, sc.h, sc.f);
+        free((void *)sc.img);
+    }
     if (xp) {
         uint64_t xp_t1 = host_monotonic_ns();
         xfer_prof_report(xp_flush, xp_loop, xp_t1 - xp_t0,
@@ -9483,6 +10848,7 @@ transfer_pixels_done:
                         uint8_t *p = host_shadow_top + (dy * HOST_TOP_W + dx) * 4u;
                         p[0] = r; p[1] = g; p[2] = b; p[3] = 255;
                         host_shadow_dirty = 1;
+                        ++host_shadow_serial[0]; /* t_5286064e: shadow rewritten */
                     }
                 }
         }
@@ -9515,6 +10881,54 @@ static void pica_px_present(void) {
    each screen is serialized through a single buffered fwrite instead of
    per-pixel 3-byte writes, and DQ8_CAPTURE_PPM_DIR redirects the files so
    parallel runs cannot collide on the fixed /tmp names. */
+/* t_fdd26eba: DQ8_PRESENT_DUMP_PPM=<dir> — write the COMPOSED WINDOW image as
+   a PPM, headless.  "The framebuffer PPM is sharp" says nothing about
+   presentation: this runs the very composer the window present path uses into
+   host_compose_buf, so a guest-source run and a scaled-source run produce two
+   images of the same frame through the same code (that is what the acceptance
+   measurements compare).  Called from the capture path, which is already
+   throttled and runs on the guest thread (the GL context owner). */
+static void host_present_dump_window(void) {
+    const char *dir = getenv("DQ8_PRESENT_DUMP_PPM");
+    static int shot;
+    char path[600], p2[640];
+    HostPresentTarget *t;
+    FILE *f;
+    int x, y;
+    if (!dir || !dir[0]) return;
+    t = host_present_target_for(HP_PRESENT_WINDOW, host_compose_buf,
+                                HOST_PRESENT_W * 4, HP_KIND_RGBA_A,
+                                HOST_PRESENT_W, HOST_PRESENT_H);
+    if (gsp_lcd_force_black && !host_display_ignore_black)
+        host_present_target_black(t);
+    else
+        host_present_target_compose(t);
+    if (shot < 24) {
+        snprintf(p2, sizeof p2, "%s/dq8-present-%03d.ppm", dir, shot);
+        ++shot;
+        f = fopen(p2, "wb");
+        if (f) {
+            fprintf(f, "P6\n%d %d\n255\n", HOST_PRESENT_W, HOST_PRESENT_H);
+            for (y = 0; y < HOST_PRESENT_H; ++y) {
+                const uint8_t *row = host_compose_buf +
+                    (size_t)y * HOST_PRESENT_W * 4u;
+                for (x = 0; x < HOST_PRESENT_W; ++x)
+                    fwrite(row + (size_t)x * 4u, 1u, 3u, f);
+            }
+            fclose(f);
+        }
+    }
+    snprintf(path, sizeof path, "%s/dq8-present.ppm", dir);
+    f = fopen(path, "wb");
+    if (!f) return;
+    fprintf(f, "P6\n%d %d\n255\n", HOST_PRESENT_W, HOST_PRESENT_H);
+    for (y = 0; y < HOST_PRESENT_H; ++y) {
+        const uint8_t *row = host_compose_buf + (size_t)y * HOST_PRESENT_W * 4u;
+        for (x = 0; x < HOST_PRESENT_W; ++x)
+            fwrite(row + (size_t)x * 4u, 1u, 3u, f);
+    }
+    fclose(f);
+}
 static void gsp_write_screen_ppms_impl(void) {
     /* No pica_gl_flush_guest_rt() here: the guest-side producer flushes
        before snapshotting, and under DQ8_SPLIT_RENDER=1 this runs on the
@@ -9617,6 +11031,7 @@ static void gsp_write_screen_ppms_impl(void) {
         }
     }
     pica_px_present();
+    host_present_dump_window(); /* t_fdd26eba: composed window image */
 }
 /* Guest-thread wrapper: under DQ8_SPLIT_RENDER=1 the present worker owns
    the PPM snapshots (it owns the shadow buffers); guest-side producers
@@ -9861,7 +11276,10 @@ static void gsp_scanout_capture(void) {
            it (level semantics: writer discipline is not observable here, and
            re-applying one entry is idempotent). */
         if (dirty) {
-            if (screen == 0u) tempo_swap_seen(); /* guest published a top-screen frame */
+            /* A frame is a *change of the displayed buffer*: the guest re-publishes
+               the same shown slot between flips, and counting those doubled the
+               reported frame rate. */
+            if (screen == 0u && (gsp_fb_valid[0] == 0u || shown_fb != gsp_fb_shown[0])) tempo_swap_seen();
             if (addr) {
                 gsp_fb_addr[screen][active_fb] = addr;
                 gsp_fb_fmt[screen] = fmt;
@@ -9885,6 +11303,28 @@ static void gsp_scanout_capture(void) {
             fprintf(stderr, "GSP scan-out screen=%u addr=%08X fmt=%u stride=%u "
                     "slot=%u shown=%u dirty=%u\n",
                     screen, addr, fmt, stride, active_fb, show, dirty);
+        /* t_fdd26eba: a scaled screen image is only presentable while the guest
+           bytes it decodes to are the bytes the LCD is showing.  Drop it when
+           they are not (a non-transfer producer wrote this buffer). */
+        if (host_present_scaled_source()) {
+            HostScaledScreen *e = host_scaled_slot((int)screen, addr);
+            if (e) {
+                uint64_t hp = elide_hash_bytes(14695981039346656037ull,
+                                               ram + mapped_fb,
+                                               (size_t)stride * (size_t)h);
+                if (e->w != (int)w || e->h != (int)h || e->bpp != (int)bpp ||
+                    e->hash != hp) {
+                    e->valid = 0;
+                    ++host_scaled_stale;
+                    if (host_scaled_stale <= 8u)
+                        fprintf(stderr, "present scaled source: screen %u buffer "
+                                "%08X changed outside a display transfer — "
+                                "dropping its scaled image (stale #%llu)\n",
+                                screen, addr,
+                                (unsigned long long)host_scaled_stale);
+                }
+            }
+        }
         host_display_capture_transfer(mapped_fb, w, h, fmt);
     }
     /* IDLE THROTTLE: feed the scene-identity detector with the just-captured
@@ -10389,6 +11829,17 @@ static void main_context_sleep(int64_t duration) {
     for (;;) {
         uint64_t now = dq8_guest_now_ns();
         if (deadline && now >= deadline) return;
+        /* HOST COMMANDS IN A WAIT (t_56936fec): an unbounded svcSleepThread in
+           the main context is the same wedge class as an un-signalled wait --
+           F5/F9 are acted on at a dispatch boundary this sleep must return to. */
+        {
+            int host_kind = savestate_pending_kind();
+            if (host_kind) {
+                savestate_wait_escape(host_kind, 0u, 0u);
+                return;
+            }
+        }
+        if (host_signal_quit) host_quit_now("SIGINT/SIGTERM inside guest sleep");
         schedule_guest_thread();
         guest_service_host_deadlines(dq8_guest_now_ns());
         if (!deadline && !guest_any_runnable_thread()) return;
@@ -10703,12 +12154,45 @@ static uint32_t svc_arbitrate(uint32_t handle, uint32_t address, uint32_t type,
         main_arbiter_address = address;
         uint64_t deadline = timed && (int64_t)timeout > 0
             ? dq8_guest_now_ns() + idle_stretch_wait(timeout) : 0u;
-        for (;;) {
+        /* HOST COMMANDS IN A WAIT (t_56936fec): this is the arbiter counterpart
+           of the svcWaitSynchronization service loop -- the operator's freeze is
+           this loop, with the lock at owner+0x70 held by the 0x185FF4 list
+           self-cycle and no signal ever arriving.  F5/F9 are set by the host
+           pump that runs inside this loop; the dispatcher only acts on them at
+           a main-context dispatch boundary, so the wait breaks with the kernel
+           timeout result and the load replaces the machine state (a save keeps
+           the timeout, which this loop already returns for a timed wait). */
+        uint64_t wedge_start = dq8_guest_now_ns();
+        int wedge_secs = wait_wedge_seconds();
+        uint64_t wedge_ns = (uint64_t)wedge_secs * 1000000000ull;
+        int wedge_reported = 0;
+        unsigned arb_spin = 0;
+        for (;; ++arb_spin) {
+            {
+                int host_kind = savestate_pending_kind();
+                if (host_kind) {
+                    if (host_kind == 2) test_main_wedge_forget();
+                    savestate_wait_escape(host_kind, handle, arb_spin);
+                    main_arbiter_waiting = 0u;
+                    main_arbiter_signaled = 0u;
+                    main_arbiter_handle = main_arbiter_address = 0u;
+                    return 0x09401BFEu;
+                }
+            }
+            if (host_signal_quit) host_quit_now("SIGINT/SIGTERM inside arbiter wait");
             schedule_guest_thread();
             uint64_t now = dq8_guest_now_ns();
             guest_service_host_deadlines(now);
-            if (main_arbiter_signaled) break;
+            if (main_arbiter_signaled && !(test_wedge_cfg && test_main_wedge_active(now))) break;
             if (deadline && now >= deadline) break;
+            /* WAITWEDGE (t_56936fec): same bounded diagnostic as the wait loop;
+               reuses `now`, gated by the spin watermark. */
+            if (wedge_ns && !wedge_reported && (arb_spin & 255u) == 0u &&
+                now - wedge_start >= wedge_ns) {
+                wedge_reported = 1;
+                guest_wait_wedge_report(handle, timeout, arb_spin, now - wedge_start,
+                                        "svc_arbitrate");
+            }
             if (guest_any_runnable_thread()) continue;
             if (!runnable_nap()) { guest_pacing_nap(deadline, 1000000ull); continue; }
             guest_wait_until_deadline(deadline);
@@ -12633,6 +14117,7 @@ static uint32_t svc_create_thread(uint32_t *r) {
     if (guest_thread_count >= 64u) { fputs("native guest thread table exhausted\n", stderr); exit(21); }
     GuestThread *thread = &guest_threads[guest_thread_count++];
     memset(thread, 0, sizeof(*thread));
+    memset(&thread_sched[guest_thread_count - 1u], 0, sizeof(ThreadSched));
     thread->r[0] = r[2];
     thread->r[13] = r[3] & ~7u;
     thread->r[14] = 0xFFFFFFFFu;
@@ -12748,6 +14233,31 @@ static void schedule_guest_thread(void) {
     for (unsigned checked = 0; checked < guest_thread_count; ++checked) {
         GuestThread *thread = &guest_threads[index];
         if (thread->active && !thread->blocked) {
+            /* PREEMPTIVE GUEST SLICE (t_353154d7).  A thread whose continuous
+               execution stretch has already consumed a whole slice yields its
+               turn: the next runnable thread runs instead, and when this is the
+               only runnable thread the scheduler returns to its caller (the
+               guest dispatch loop, which services the frame/audio/host path)
+               without handing the CPU straight back.  A park below clears the
+               stretch, so a thread that waits is never "continuous". */
+            ThreadSched *ts = &thread_sched[index];
+            if (guest_slice_on && ts->slice_preempted) {
+                ts->slice_preempted = 0;
+                ts->slice_active = 0;
+                ts->slice_accum_ns = 0;
+                if (guest_slice_other_runnable(index)) {
+                    ++perf_slice_fairness_skips;
+                    index = (index + 1u) % guest_thread_count;
+                    continue;
+                }
+                ++perf_slice_idle_returns;
+                return;
+            }
+            if (guest_slice_on && !ts->slice_active) {
+                ts->slice_active = 1;
+                ts->slice_accum_ns = 0;
+                ts->slice_mark = thread->retired_steps;
+            }
             uint32_t *parent_regs = active_guest_regs;
             uint32_t parent_pc = current_guest_pc, parent_previous_pc = previous_guest_pc;
             uint32_t parent_fpr[32]; memcpy(parent_fpr, fpr, sizeof(fpr));
@@ -12783,9 +14293,34 @@ static void schedule_guest_thread(void) {
                guest_stack_track sees the true extent, not just the top page. */
             if (index < GUEST_THREAD_STACK_SLOTS)
                 guest_stack_track(index, thread->r[13]);
+            /* Slice accounting (t_353154d7): the dispatch returned without the
+               thread parking.  If the continuous stretch has now used a whole
+               slice (the dispatch loop hit the time bound, or the stretch's
+               retired-instruction budget is spent), mark it so the next pass
+               gives another runnable thread the CPU first. */
+            if (guest_slice_on && ts->slice_active) {
+                uint64_t used = thread->retired_steps - ts->slice_mark;
+                ts->slice_accum_ns += guest_slice_last_dispatch_ns;
+                if (ts->slice_accum_ns / 1000000ull > perf_slice_max_run_ms)
+                    perf_slice_max_run_ms = ts->slice_accum_ns / 1000000ull;
+                if (!thread_blocked_requested &&
+                    (guest_slice_last_expired ||
+                     (guest_slice_ns && ts->slice_accum_ns >= guest_slice_ns) ||
+                     (guest_slice_run_steps && used >= guest_slice_run_steps))) {
+                    ++perf_slice_preempts;
+                    ts->slice_preempted = 1;
+                    ts->slice_active = 0;
+                    ts->slice_accum_ns = 0;
+                }
+            }
             if (thread_blocked_requested) {
                 ++perf_worker_parks;
                 thread->blocked = 1;
+                /* A park ends the continuous execution stretch: the slice
+                   budget must not carry across a wait (t_353154d7). */
+                ts->slice_active = 0;
+                ts->slice_accum_ns = 0;
+                ts->slice_preempted = 0;
                 thread->wait_handle = thread_wait_handle_requested;
                 thread->wait_address = thread_wait_address_requested;
                 thread->wait_arbiter = thread_wait_arbiter_requested;
@@ -13126,8 +14661,124 @@ static uint32_t svc_clear_event(uint32_t handle) {
     }
     fprintf(stderr, "unimplemented 3DS SVC ClearEvent: handle=%08X\n", handle); exit(24);
 }
+/* ---------------- HOST COMMANDS IN A WAIT (t_56936fec) --------------------
+   The main guest context cannot park, so svcWaitSynchronization services the
+   host from INSIDE this file's spin loop until the awaited object signals.  An
+   object that never signals (the operator's 0x185FF4 list self-cycle holds the
+   recursive lock the main thread wants) keeps that loop running essentially
+   forever, and the F5/F9 request the SDL pump sets is only ACTED ON by the
+   dispatcher at the next main-context dispatch boundary -- which the loop
+   never reaches.
+
+   The loop therefore polls the host-command state directly: one relaxed atomic
+   load per iteration for a savestate request, one for the quit flag (a plain
+   load on every target we ship).  Nothing else changes on the healthy path:
+   the wedge guard below is gated on the caller's existing spin counter and
+   reuses the clock value the loop already read, so it adds no clock read. */
+
+/* ---- TEST-ONLY controlled wedge ----------------------------------------
+   A fresh new game reaches the operator's freeze through a race (the 0x185FF4
+   list self-cycle beating the main thread to the lock) that does not reproduce
+   on the test rigs.  To exercise the exact shipped code path deterministically,
+   this knob simulates an awaited object that never signals: from
+   DQ8_TEST_MAIN_WEDGE_AT seconds after start, the first main-context wait stops
+   observing readiness for DQ8_TEST_MAIN_WEDGE_MS milliseconds (default 1 h).
+   Everything else in the loop is the shipped path -- host pump, SDL input,
+   scheduler, WAITWEDGE guard and the host-command escape.  Unset: not armed,
+   `test_wedge_cfg` is 0 and the readiness test is the original one. */
+/* `test_wedge_*` state is declared next to guest_dump_threads (it is used by
+   the arbiter wait loop, which appears earlier in this file than the helpers
+   below). */
+static void test_main_wedge_init(void) {
+    if (test_wedge_cfg >= 0) return;
+    test_wedge_cfg = 0;
+    test_wedge_t0_ns = host_monotonic_ns();
+    const char *at = getenv("DQ8_TEST_MAIN_WEDGE_AT");
+    if (!at || !*at) return;
+    const char *ms = getenv("DQ8_TEST_MAIN_WEDGE_MS");
+    double secs = atof(at), hold_ms = (ms && *ms) ? atof(ms) : 3600000.0;
+    test_wedge_at_ns = (uint64_t)((secs > 0.0 ? secs : 0.0) * 1e9);
+    test_wedge_for_ns = (uint64_t)((hold_ms > 0.0 ? hold_ms : 0.0) * 1e6);
+    test_wedge_cfg = test_wedge_for_ns ? 1 : 0;
+    if (test_wedge_cfg)
+        fprintf(stderr, "TEST WEDGE: the first main-context wait after %.1f s will "
+                        "ignore readiness for %.0f ms (controlled reproduction)\n",
+                secs, hold_ms);
+}
+static int test_main_wedge_active(uint64_t now) {
+    if (!test_wedge_cfg) return 0;
+    if (!test_wedge_fired && now >= test_wedge_t0_ns + test_wedge_at_ns) {
+        test_wedge_fired = 1;
+        test_wedge_until_ns = now + test_wedge_for_ns;
+        fprintf(stderr, "TEST WEDGE: armed at t=%.1f s, readiness suppressed for %.0f ms\n",
+                (double)(now - test_wedge_t0_ns) / 1e9, (double)test_wedge_for_ns / 1e6);
+    }
+    return test_wedge_fired && now < test_wedge_until_ns;
+}
+
+/* A savestate load replaces the machine state the simulated un-signalled object
+   belongs to; drop the wedge so the restored state runs normally. */
+static void test_main_wedge_forget(void) { test_wedge_until_ns = 0; }
+
+/* DQ8_WAIT_WEDGE_S: seconds a main-context wait may run before one WAITWEDGE
+   diagnostic line is emitted.  Default 10; 0 disables. */
+static int wait_wedge_seconds(void) {
+    static int seconds = -1;
+    if (seconds < 0) {
+        const char *e = getenv("DQ8_WAIT_WEDGE_S");
+        seconds = (e && *e) ? atoi(e) : 10;
+        if (seconds < 0) seconds = 0;
+    }
+    return seconds;
+}
+
+/* The operator's freeze shape: exactly one active guest thread is runnable
+   (the spinner) and every other active thread is blocked. */
+static int guest_single_runnable_thread(unsigned *index_out) {
+    unsigned runnable = 0, found = 0;
+    for (unsigned i = 0; i < guest_thread_count; ++i) {
+        const GuestThread *t = &guest_threads[i];
+        if (!t->active) continue;
+        if (!t->blocked) { ++runnable; found = i; }
+    }
+    *index_out = found;
+    return runnable == 1u;
+}
+
+/* One self-describing line plus the guest thread table, printed at most once
+   per wait episode.  The watchdog card (t_4371e6ea) adds host backtraces on
+   top of this format; the line and table are what it keys on. */
+static void guest_wait_wedge_report(uint32_t handle, uint64_t timeout,
+                                    unsigned spin, uint64_t waited_ns,
+                                    const char *site) {
+    unsigned spinner = 0;
+    if (!guest_single_runnable_thread(&spinner)) return;
+    const GuestThread *t = &guest_threads[spinner];
+    fprintf(stderr,
+            "WAITWEDGE site=%s handle=%08X spin=%u wait_ms=%.0f timeout=%s depth=%u "
+            "main_pc=%08X spinner=%u id=%08X pc=%08X retired=%llu dispatches=%llu\n",
+            site, handle, spin, (double)waited_ns / 1e6,
+            (int64_t)timeout < 0 ? "infinite" : "finite",
+            thread_execution_depth, current_guest_pc, spinner,
+            t->guest_thread_id, t->pc,
+            (unsigned long long)t->retired_steps,
+            (unsigned long long)t->dispatch_calls);
+    guest_dump_threads();
+}
+
 static uint32_t svc_wait_synchronization_inner(uint32_t handle, uint64_t timeout) {
     static unsigned trace_count;
+    /* DIAG (t_56936fec): the main context's waits are the ones that can wedge
+       the host (it cannot park), so they get their own bounded trace line; the
+       general trace above is dominated by worker waits. */
+    {
+        static unsigned main_trace_count;
+        if (thread_execution_depth == 0 &&
+            dq8_env_on("DQ8_TRACE_WAIT", &dq8_env_trace_wait) && main_trace_count++ < 64u)
+            fprintf(stderr, "main-wait enter pc=%08X handle=%08X timeout=%016llX ready=%d\n",
+                    current_guest_pc, handle, (unsigned long long)timeout,
+                    guest_object_ready(handle, current_guest_thread_id));
+    }
     if (dq8_env_on("DQ8_TRACE_WAIT", &dq8_env_trace_wait) && trace_count++ < 128u)
         fprintf(stderr, "guest WaitSynchronization pc=%08X thread=%08X handle=%08X timeout=%016llX live=%u signaled=%u mutex_locked=%u\n",
                 current_guest_pc, current_guest_thread_id, handle,
@@ -13239,20 +14890,52 @@ static uint32_t svc_wait_synchronization_inner(uint32_t handle, uint64_t timeout
     if (thread_execution_depth == 0) {
         uint64_t start_ns = dq8_guest_now_ns();
         uint64_t deadline_ns = (int64_t)timeout < 0 ? 0u : start_ns + idle_stretch_wait(timeout);
-        for (unsigned spin = 0; spin < 20000000u; ++spin) {
+        int wedge_secs = wait_wedge_seconds();
+        uint64_t wedge_ns = (uint64_t)wedge_secs * 1000000000ull;
+        int wedge_reported = 0;
+        unsigned spin = 0;
+        for (; spin < 20000000u; ++spin) {
             ++perf_main_wait_spins;
+            /* HOST COMMANDS IN A WAIT (t_56936fec).  F5/F9 set
+               savestate_pending from the SDL pump (or the present worker); the
+               action is performed by savestate_service() at the next
+               main-context dispatch boundary, which this loop must reach.  The
+               wait therefore breaks with the kernel timeout result: on the load
+               path that value is discarded together with the rest of the
+               replaced machine state, on a save it is a legitimate "nothing was
+               ready" that the guest already handles.  One plain load when
+               nothing is pending. */
+            {
+                int host_kind = savestate_pending_kind();
+                if (host_kind) {
+                    if (host_kind == 2) test_main_wedge_forget();
+                    savestate_wait_escape(host_kind, handle, spin);
+                    return 0x09401BFEu;
+                }
+            }
+            if (host_signal_quit) host_quit_now("SIGINT/SIGTERM inside guest wait");
             if (dq8_env_on("DQ8_TRACE_WAIT", &dq8_env_trace_wait) && (spin % 2000u) == 0u)
                 fprintf(stderr, "main-wait spin=%u handle=%08X depth=%u\n", spin, handle, thread_execution_depth);
             guest_service_host_deadlines(dq8_guest_now_ns());
             schedule_guest_thread();
             uint64_t now = dq8_guest_now_ns();
             guest_service_host_deadlines(now);
-            if (guest_object_ready(handle, current_guest_thread_id)) {
+            if (!(test_wedge_cfg && test_main_wedge_active(now)) &&
+                guest_object_ready(handle, current_guest_thread_id)) {
                 if (!guest_object_acquire(handle, current_guest_thread_id)) return 0xD8E007F7u;
                 return 0;
             }
             if (deadline_ns && now >= deadline_ns)
                 return 0x09401BFEu;
+            /* WAITWEDGE (t_56936fec): bounded, one line per wait episode, no
+               extra clock read -- `now` is the value the loop just loaded and
+               the spin watermark keeps the condition off the hot path. */
+            if (wedge_ns && !wedge_reported && (spin & 255u) == 0u &&
+                now - start_ns >= wedge_ns) {
+                wedge_reported = 1;
+                guest_wait_wedge_report(handle, timeout, spin, now - start_ns,
+                                        "svc_wait_synchronization");
+            }
             if (guest_any_runnable_thread()) continue;
             if (!runnable_nap()) { guest_pacing_nap(deadline_ns, 2000000ull); continue; }
             guest_wait_until_deadline(deadline_ns);
@@ -13333,7 +15016,24 @@ static uint32_t svc_wait_synchronization_n(uint32_t *r) {
     }
     uint64_t start = dq8_guest_now_ns();
     uint64_t deadline = (int64_t)timeout >= 0 ? start + idle_stretch_wait(timeout) : 0u;
+    unsigned wait_spin = 0;
+    int wedge_secs = wait_wedge_seconds();
+    uint64_t wedge_ns = (uint64_t)wedge_secs * 1000000000ull;
+    int wedge_reported = 0;
     for (;;) {
+        /* HOST COMMANDS IN A WAIT (t_56936fec): same escape as the single
+           handle loop -- report the kernel timeout and let the dispatcher act
+           on F5/F9 at the boundary this return makes reachable. */
+        {
+            int host_kind = savestate_pending_kind();
+            if (host_kind) {
+                savestate_wait_escape(host_kind, count ? handles[0] : 0u, wait_spin);
+                r[1] = 0xFFFFFFFFu;
+                return 0x09401BFEu;
+            }
+        }
+        if (host_signal_quit) host_quit_now("SIGINT/SIGTERM inside guest wait n");
+        ++wait_spin;
         schedule_guest_thread();
         uint64_t now = dq8_guest_now_ns();
         guest_service_host_deadlines(now);
@@ -13343,6 +15043,13 @@ static uint32_t svc_wait_synchronization_n(uint32_t *r) {
         if (result) { r[1] = index; tempo_wait_ready(tempo_slot); return 0; }
         if (deadline && now >= deadline) {
             r[1] = 0xFFFFFFFFu; return 0x09401BFEu;
+        }
+        /* WAITWEDGE (t_56936fec): same bounded diagnostic as the single wait. */
+        if (wedge_ns && !wedge_reported && (wait_spin & 255u) == 0u &&
+            now - start >= wedge_ns) {
+            wedge_reported = 1;
+            guest_wait_wedge_report(count ? handles[0] : 0u, timeout, wait_spin,
+                                    now - start, "svc_wait_synchronization_n");
         }
         if (guest_any_runnable_thread()) continue;
         if (!runnable_nap()) { guest_pacing_nap(deadline, 1000000ull); continue; }
@@ -13577,9 +15284,651 @@ static int dq8_pc_needs_boundary(uint32_t pc) {
         if (pc == trace_guest_pcs[i]) return 1;
     return 0;
 }
+/* ======================================================================
+   FREEZE WATCHDOG (t_4371e6ea)
+   ----------------------------------------------------------------------
+   NAMES THE CLASS AND THE BLOCKING POINT OF A FREEZE, with no gdb and no
+   reproduction.
+
+   Main side (HOT PATH): dq8_watchdog_beat() is one static increment plus one
+   relaxed atomic store per main-context dispatch-loop iteration.  With the
+   watchdog disabled it is one predictable branch.
+
+   Watchdog thread: samples the counter every 250 ms.  When it has not moved
+   for DQ8_WATCHDOG_S seconds (default 5) the thread writes ONE self-contained
+   block to fd 2 and repeats every DQ8_WATCHDOG_REPEAT_S (default 10) while
+   the stall lasts.  The block is assembled in a static buffer and emitted
+   with write(2): the frozen main thread may hold the stdio lock, so calling
+   fprintf() from the watchdog could deadlock against the very freeze it is
+   reporting.
+
+   Block contents:
+     - how long the heartbeat has been stuck, the heartbeat value and the
+       last FRAMEPROF line (present_ms / gl_ms included);
+     - the guest thread table (active/blocked/pc/wait/handle);
+     - host state: whether a present call is in flight and on which tid, the
+       GL context hold state and its owner, the audio queue depth (device
+       lead in ms), the GSP relay ring and command ring occupancies, and the
+       duration of the last completed present;
+     - a verdict line: HOST-BLOCK (loop stopped iterating) vs LOOP-ALIVE /
+       GUEST-SPIN (loop is advancing, so a frozen screen is a guest-side
+       spin: look at the runnable guest thread in the table);
+     - a backtrace of the main thread and of every other host thread, taken
+       with pthread_kill()/tgkill(SIGUSR2) one thread at a time.  The handler
+       calls backtrace(3)+backtrace_symbols_fd(3) (no stdio, no malloc after
+       the priming call in dq8_watchdog_init) and returns; the watchdog then
+       resolves the captured return addresses through addr2line so the pasted
+       block names the sleeping/locking function.
+
+   Usage:
+     kill -USR1 <pid>              one dump now (works while the loop is
+                                   healthy too: the guest-spin case)
+     DQ8_WATCHDOG=0                disable the whole watchdog
+     DQ8_WATCHDOG_S=<s>            stall threshold, default 5
+     DQ8_WATCHDOG_REPEAT_S=<s>     repeat period while stalled, default 10
+     DQ8_WATCHDOG_SYM=0            skip the addr2line symbolication
+     DQ8_WATCHDOG_TEST_STALL_MS=N  sleep N ms once inside the FIRST main-loop
+                                   iteration (synthetic-stall proof)
+     DQ8_DETERMINISTIC=1           the watchdog is disabled and says so
+   ====================================================================== */
+#include <execinfo.h>
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/prctl.h>
+#include <sys/wait.h>
+#include <sys/syscall.h>   /* SYS_gettid / SYS_tgkill: not implied by a -DGL build */
+
+#define DQ8_WD_MAX_THREADS 32
+#define DQ8_WD_MAX_FRAMES 40
+#define DQ8_WD_BUF_SIZE 65536
+
+static _Atomic uint64_t wd_heartbeat;       /* main-loop iterations (relaxed) */
+static _Atomic int wd_in_present;           /* a host thread is inside a present call */
+static _Atomic long wd_present_tid;         /* ... and this is which one */
+static _Atomic uint64_t wd_present_since_ns;
+static _Atomic uint64_t wd_last_present_ns; /* duration of the last completed present */
+static _Atomic int wd_stop;
+static _Atomic int wd_manual;
+static _Atomic int wd_bt_done;
+static _Atomic long wd_bt_from;
+static int wd_beat_on;                      /* hot-path gate */
+static int wd_quiet;                        /* shutdown: no more dumps */
+static int wd_decided;
+static int wd_sym_on = 1;
+static uint64_t wd_beat_local;
+static uint64_t wd_t0_ns;                   /* watchdog start (uptime origin) */
+static pthread_t wd_main_thread;
+static pid_t wd_main_tid, wd_self_tid;
+static uint64_t wd_stall_ns = 5000000000ull;
+static uint64_t wd_repeat_ns = 10000000000ull;
+static int wd_test_stall_ms, wd_test_stall_done;
+static void *wd_frames[DQ8_WD_MAX_FRAMES];
+static int wd_frame_count;
+static int wd_cap[2] = { -1, -1 };          /* capture pipe: signal -> buffer */
+static int wd_cap_fd = -1;                  /* write end, read from the handler */
+static char wd_buf[DQ8_WD_BUF_SIZE];
+static size_t wd_buf_len;
+static char wd_exe[512];
+static const char *wd_exe_base = "";
+
+/* ---- hot path: one store (or one branch when disabled) ---------------- */
+static void dq8_watchdog_beat(void) {
+    if (!wd_beat_on) return;
+    atomic_store_explicit(&wd_heartbeat, ++wd_beat_local, memory_order_relaxed);
+}
+static void dq8_watchdog_present_enter(void) {
+    if (!wd_beat_on) return;
+    atomic_store_explicit(&wd_present_since_ns, host_monotonic_ns(), memory_order_relaxed);
+    atomic_store_explicit(&wd_present_tid, (long)syscall(SYS_gettid), memory_order_relaxed);
+    atomic_store_explicit(&wd_in_present, 1, memory_order_relaxed);
+}
+static void dq8_watchdog_present_exit(void) {
+    uint64_t t0;
+    if (!wd_beat_on) return;
+    t0 = atomic_load_explicit(&wd_present_since_ns, memory_order_relaxed);
+    atomic_store_explicit(&wd_last_present_ns, host_monotonic_ns() - t0, memory_order_relaxed);
+    atomic_store_explicit(&wd_in_present, 0, memory_order_relaxed);
+}
+
+/* ---- buffer helpers (watchdog thread only) ---------------------------- */
+/* The whole dump is assembled here and emitted with ONE write() at the end
+   (one self-contained block the operator can paste).  Every line of a
+   wd_out() call is far below WD_LINE_MAX, so a single flush whenever less
+   than that remains is enough to guarantee nothing is silently dropped. */
+#define WD_LINE_MAX 1024u
+static void wd_flush(void);
+static void wd_out(const char *fmt, ...) {
+    va_list ap;
+    int k;
+    if (sizeof wd_buf - wd_buf_len < WD_LINE_MAX) wd_flush();
+    va_start(ap, fmt);
+    k = vsnprintf(wd_buf + wd_buf_len, sizeof wd_buf - wd_buf_len, fmt, ap);
+    va_end(ap);
+    if (k < 0) return;
+    if ((size_t)k >= sizeof wd_buf - wd_buf_len) wd_buf_len = sizeof wd_buf - 1u;
+    else wd_buf_len += (size_t)k;
+}
+static void wd_flush(void) {
+    size_t done = 0;
+    while (done < wd_buf_len) {
+        ssize_t w = write(2, wd_buf + done, wd_buf_len - done);
+        if (w <= 0) break;
+        done += (size_t)w;
+    }
+    wd_buf_len = 0;
+}
+/* Raw bytes captured from a traced thread (its backtrace_symbols_fd output). */
+static void wd_append(const char *p, size_t n) {
+    while (n > 0) {
+        size_t room;
+        if (wd_buf_len >= sizeof wd_buf) wd_flush();
+        room = sizeof wd_buf - wd_buf_len;
+        if (room > n) room = n;
+        memcpy(wd_buf + wd_buf_len, p, room);
+        wd_buf_len += room;
+        p += room;
+        n -= room;
+    }
+}
+static void wd_drain_capture(void) {
+    char tmp[4096];
+    int guard;
+    if (wd_cap[0] < 0) return;
+    for (guard = 0; guard < 256; ++guard) {
+        ssize_t got = read(wd_cap[0], tmp, sizeof tmp);
+        if (got <= 0) break;
+        wd_append(tmp, (size_t)got);
+    }
+}
+
+/* ---- signal handlers (async-signal-safe: no stdio, no malloc) ---------- */
+static void wd_sig_backtrace(int sig) {
+    void *frames[DQ8_WD_MAX_FRAMES];
+    char hdr[96];
+    int n, k, fd;
+    long tid = (long)syscall(SYS_gettid);
+    (void)sig;
+    /* Write into the capture pipe when it exists, so the dump stays ONE
+       contiguous block on fd 2; fall back to fd 2 directly if it does not.
+       write(2) to a pipe is async-signal-safe; the reader drains after each
+       thread, so the 64 KiB pipe never fills. */
+    fd = wd_cap_fd >= 0 ? wd_cap_fd : 2;
+    n = backtrace(frames, (int)(sizeof frames / sizeof frames[0]));
+    k = snprintf(hdr, sizeof hdr, "WATCHDOG   raw tid=%ld frames=%d\n", tid, n);
+    if (k > 0) { ssize_t w = write(fd, hdr, (size_t)k); (void)w; }
+    if (n > 0) backtrace_symbols_fd(frames, n, fd);
+    /* Publish the captured frames for the watchdog's symbolication pass. */
+    if (n > DQ8_WD_MAX_FRAMES) n = DQ8_WD_MAX_FRAMES;
+    wd_frame_count = n;
+    for (int i = 0; i < n; ++i) wd_frames[i] = frames[i];
+    atomic_store_explicit(&wd_bt_from, tid, memory_order_release);
+    atomic_store_explicit(&wd_bt_done, 1, memory_order_release);
+}
+static void wd_sig_manual(int sig) {
+    (void)sig;
+    atomic_store_explicit(&wd_manual, 1, memory_order_relaxed);
+}
+
+/* ---- addr2line symbolication of the captured frames ------------------- */
+static int wd_run_addr2line(const unsigned long *offs, int n, char *out, size_t cap) {
+    char num[DQ8_WD_MAX_FRAMES][24];
+    char *argv[DQ8_WD_MAX_FRAMES + 8];
+    int pfd[2];
+    pid_t pid;
+    int i, status = 0;
+    size_t used = 0;
+    if (n <= 0 || n > DQ8_WD_MAX_FRAMES || !wd_exe[0]) return 0;
+    for (i = 0; i < n; ++i) snprintf(num[i], sizeof num[i], "0x%lx", offs[i]);
+    if (pipe(pfd) != 0) return 0;
+    pid = fork();
+    if (pid < 0) { close(pfd[0]); close(pfd[1]); return 0; }
+    if (pid == 0) {
+        int devnull;
+        dup2(pfd[1], 1);
+        devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, 2); close(devnull); }
+        close(pfd[0]);
+        close(pfd[1]);
+        argv[0] = (char *)"addr2line";
+        argv[1] = (char *)"-f";
+        argv[2] = (char *)"-C";
+        argv[3] = (char *)"-e";
+        argv[4] = wd_exe;
+        for (i = 0; i < n; ++i) argv[5 + i] = num[i];
+        argv[5 + n] = NULL;
+        execv("/usr/bin/addr2line", argv);
+        execv("/bin/addr2line", argv);
+        _exit(127);
+    }
+    close(pfd[1]);
+    for (;;) {
+        struct pollfd p = { pfd[0], POLLIN, 0 };
+        ssize_t got;
+        if (poll(&p, 1, 500) <= 0) break;             /* bounded: never hang the dump */
+        got = read(pfd[0], out + used, cap - 1u - used);
+        if (got <= 0) break;
+        used += (size_t)got;
+        if (used >= cap - 1u) break;
+    }
+    close(pfd[0]);
+    out[used] = 0;
+    if (waitpid(pid, &status, WNOHANG) == 0) kill(pid, SIGKILL);
+    waitpid(pid, &status, 0);
+    return (int)used;
+}
+static void wd_symbolize(long tid) {
+    unsigned long offs[DQ8_WD_MAX_FRAMES];
+    int idx[DQ8_WD_MAX_FRAMES];
+    int nreq = 0, i;
+    char *buf;
+    size_t cap = 8192;
+    if (!wd_sym_on || wd_frame_count <= 0) return;
+    for (i = 0; i < wd_frame_count; ++i) {
+        Dl_info info;
+        if (!dladdr(wd_frames[i], &info) || !info.dli_fbase || !info.dli_fname) continue;
+        if (!wd_exe_base[0] || !strstr(info.dli_fname, wd_exe_base)) continue; /* main exe only */
+        offs[nreq] = (unsigned long)((const char *)wd_frames[i] - (const char *)info.dli_fbase);
+        idx[nreq] = i;
+        ++nreq;
+    }
+    if (nreq <= 0) return;
+    buf = malloc(cap);
+    if (!buf) return;
+    if (wd_run_addr2line(offs, nreq, buf, cap) > 0) {
+        char *line = buf;
+        int k = 0;
+        while (*line && k < nreq) {
+            char *name = line;
+            char *nl = strchr(line, '\n');
+            char *loc;
+            if (!nl) break;
+            *nl = 0;
+            loc = nl + 1;
+            nl = strchr(loc, '\n');
+            if (!nl) { /* last line without newline */ }
+            else *nl = 0;
+            wd_out("WATCHDOG   sym #%-2d %s  %s\n", idx[k], name, loc);
+            ++k;
+            if (!nl) break;
+            line = nl + 1;
+        }
+    }
+    free(buf);
+}
+
+/* ---- per-thread facts from /proc (always available, even for a thread
+   whose signal mask blocks SIGUSR2) -------------------------------------- */
+static unsigned long long wd_thread_sigblk(pid_t tid) {
+    char path[64], buf[2048];
+    int fd;
+    ssize_t n;
+    char *p;
+    snprintf(path, sizeof path, "/proc/self/task/%ld/status", (long)tid);
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    n = read(fd, buf, sizeof buf - 1u);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    p = strstr(buf, "SigBlk:");
+    if (!p) return 0;
+    return strtoull(p + 7, NULL, 16);
+}
+static void wd_thread_facts(pid_t tid, char *out, size_t cap) {
+    char path[64], comm[32] = "?", state = '?', wchan[64] = "?";
+    int fd;
+    ssize_t n;
+    snprintf(path, sizeof path, "/proc/self/task/%ld/comm", (long)tid);
+    fd = open(path, O_RDONLY);
+    if (fd >= 0) {
+        n = read(fd, comm, sizeof comm - 1u);
+        close(fd);
+        if (n > 0) { while (n > 0 && (comm[n - 1] == '\n' || comm[n - 1] == '\r')) --n; comm[n] = 0; }
+    }
+    snprintf(path, sizeof path, "/proc/self/task/%ld/stat", (long)tid);
+    fd = open(path, O_RDONLY);
+    if (fd >= 0) {
+        char stat[512];
+        n = read(fd, stat, sizeof stat - 1u);
+        close(fd);
+        if (n > 0) {
+            stat[n] = 0;
+            char *rp = strrchr(stat, ')');
+            if (rp && rp[1] == ' ') state = rp[2];
+        }
+    }
+    snprintf(path, sizeof path, "/proc/self/task/%ld/wchan", (long)tid);
+    fd = open(path, O_RDONLY);
+    if (fd >= 0) {
+        n = read(fd, wchan, sizeof wchan - 1u);
+        close(fd);
+        if (n > 0) { while (n > 0 && (wchan[n - 1] == '\n' || wchan[n - 1] == '\r')) --n; wchan[n] = 0; }
+    }
+    snprintf(out, cap, "comm=%s state=%c wchan=%s sigblk=%016llx", comm, state, wchan,
+             wd_thread_sigblk(tid));
+}
+
+/* ---- one thread's backtrace, one at a time ---------------------------- */
+static void wd_trace_thread(pid_t tid, int is_main) {
+    char facts[256];
+    int acked = 0, i;
+    long from = 0;
+    unsigned long long blk = wd_thread_sigblk(tid);
+    wd_thread_facts(tid, facts, sizeof facts);
+    if (blk & 0x800ull) { /* SIGUSR2 = 12 -> bit 11 */
+        wd_out("WATCHDOG bt tid=%ld%s %s (SIGUSR2 BLOCKED in this thread's mask: no user "
+               "backtrace; the kernel wait is the wchan)\n",
+               (long)tid, is_main ? " (main)" : "", facts);
+        return;
+    }
+    wd_out("WATCHDOG bt tid=%ld%s %s\n", (long)tid, is_main ? " (main)" : "", facts);
+    wd_frame_count = 0;
+    atomic_store_explicit(&wd_bt_done, 0, memory_order_relaxed);
+    atomic_store_explicit(&wd_bt_from, 0, memory_order_release);
+    wd_drain_capture();          /* nothing pending; keeps the pipe empty */
+    if (is_main) pthread_kill(wd_main_thread, SIGUSR2);
+    else syscall(SYS_tgkill, getpid(), tid, SIGUSR2);
+    for (i = 0; i < 400; ++i) {
+        if (atomic_load_explicit(&wd_bt_done, memory_order_acquire)) { acked = 1; break; }
+        struct timespec ts = { 0, 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    wd_drain_capture();          /* the handler finished: its raw text is in the pipe */
+    from = atomic_load_explicit(&wd_bt_from, memory_order_acquire);
+    if (!acked) {
+        wd_out("WATCHDOG   note: tid=%ld did not take SIGUSR2 within 400 ms "
+               "(uninterruptible wait or a stale task entry)\n", (long)tid);
+        return;
+    }
+    if (from != (long)tid) {
+        wd_out("WATCHDOG   note: SIGUSR2 acked by tid=%ld, expected tid=%ld\n",
+               from, (long)tid);
+    }
+    wd_symbolize((long)tid);
+}
+
+/* ---- the dump --------------------------------------------------------- */
+static uint32_t wd_ram8(uint32_t a) { return a < GUEST_RAM_SIZE ? ram[a] : 0xFFu; }
+static uint32_t wd_ram32(uint32_t a) {
+    uint32_t v = 0;
+    if (a <= GUEST_RAM_SIZE - 4u) memcpy(&v, ram + a, 4u);
+    else v = 0xFFFFFFFFu;
+    return v;
+}
+static void wd_dump(const char *why, uint64_t hb, uint64_t now, uint64_t last_move_ns) {
+    unsigned runnable = 0, i;
+    uint64_t stall_ms = (now - last_move_ns) / 1000000ull;
+    uint64_t uptime_ms = wd_t0_ns && now > wd_t0_ns ? (now - wd_t0_ns) / 1000000ull : 0;
+    const void *gl_owner = NULL;
+    unsigned long long gl_rel = 0, gl_mid = 0;
+    int gl_hold;
+    long gl_tid;
+    uint64_t audio_ahead = atomic_load_explicit(&dsp_sink_ahead_ns, memory_order_relaxed);
+    uint64_t last_present_ns = atomic_load_explicit(&wd_last_present_ns, memory_order_relaxed);
+    int in_present = atomic_load_explicit(&wd_in_present, memory_order_relaxed);
+    long present_tid = atomic_load_explicit(&wd_present_tid, memory_order_relaxed);
+    uint64_t present_since = atomic_load_explicit(&wd_present_since_ns, memory_order_relaxed);
+    char pf_line[400];
+    double pf_present_ms = 0.0, pf_gl_ms = 0.0;
+    int have_pf;
+    int loop_stalled = (now - last_move_ns) >= wd_stall_ns;
+    unsigned gsp_q_tid = gsp_thread_id;
+
+    wd_buf_len = 0;
+    pf_line[0] = 0;
+    have_pf = dq8_frame_prof_last(pf_line, sizeof pf_line, &pf_present_ms, &pf_gl_ms);
+    gl_hold = pica_gl_hold_state(&gl_owner, &gl_rel, &gl_mid);
+    gl_tid = pica_gl_hold_tid();
+
+    wd_out("\n");
+    wd_out("WATCHDOG ================= FREEZE WATCHDOG (%s) =================\n", why);
+    wd_out("WATCHDOG pid=%ld main_tid=%ld watchdog_tid=%ld uptime=%.1fs build=%s\n",
+           (long)getpid(), (long)wd_main_tid, (long)wd_self_tid,
+           (double)uptime_ms / 1000.0, wd_exe_base);
+    if (loop_stalled)
+        wd_out("WATCHDOG stall: main-loop heartbeat has NOT moved for %llu ms "
+               "(threshold %llu ms), heartbeat=%llu, main_guest_pc=%08X\n",
+               (unsigned long long)stall_ms, (unsigned long long)(wd_stall_ns / 1000000ull),
+               (unsigned long long)hb, main_guest_pc);
+    else
+        wd_out("WATCHDOG stall: none — heartbeat is moving (%llu ms since last move, "
+               "threshold %llu ms), heartbeat=%llu, main_guest_pc=%08X\n",
+               (unsigned long long)stall_ms, (unsigned long long)(wd_stall_ns / 1000000ull),
+               (unsigned long long)hb, main_guest_pc);
+    wd_out("WATCHDOG guest: active_pc=%08X previous_pc=%08X depth=%u scheduler_cur=%08X "
+           "threads=%u slice=%s\n",
+           current_guest_pc, previous_guest_pc, thread_execution_depth,
+           current_guest_thread_id, guest_thread_count, guest_slice_on ? "on" : "off");
+    wd_out("WATCHDOG host: present_in_call=%d%s", in_present, in_present ? "" : " ");
+    if (in_present)
+        wd_out("(tid=%ld for %llu ms)", present_tid,
+               present_since ? (unsigned long long)((now - present_since) / 1000000ull) : 0ull);
+    wd_out(" audio_queue=%.1f ms (underruns=%llu)\n",
+           (double)audio_ahead / 1e6, (unsigned long long)dsp_sink_underruns);
+    wd_out("WATCHDOG host: gl_context_hold=%d", gl_hold);
+    if (gl_hold)
+        wd_out(" owner_tid=%ld owner_marker=%p releases=%llu mid_retakes=%llu",
+               gl_tid, gl_owner, gl_rel, gl_mid);
+    wd_out(" last_present=%.3f ms\n", (double)last_present_ns / 1e6);
+    wd_out("WATCHDOG gsp: relay_ring[tid=%u] cur=%u count=%u | cmd_ring[tid=%u] index=%u "
+           "count=%u | shared_base=%08X registered=%u\n",
+           gsp_q_tid, wd_ram8(gsp_shared_base + gsp_q_tid * 0x40u),
+           wd_ram8(gsp_shared_base + gsp_q_tid * 0x40u + 1u), gsp_q_tid,
+           wd_ram32(gsp_shared_base + 0x800u + gsp_q_tid * 0x200u) & 0xFFu,
+           (wd_ram32(gsp_shared_base + 0x800u + gsp_q_tid * 0x200u) >> 8) & 0xFFu,
+           gsp_shared_base, gsp_relay_registered);
+    if (have_pf)
+        wd_out("WATCHDOG frameprof: last=%s (present_ms=%.3f gl_ms=%.3f)\n",
+               pf_line, pf_present_ms, pf_gl_ms);
+    else
+        wd_out("WATCHDOG frameprof: none (DQ8_FRAMEPROF is off; last_present above is "
+               "measured by the watchdog)\n");
+    wd_out("WATCHDOG guest threads: %u\n", guest_thread_count);
+    for (i = 0; i < guest_thread_count && i < 64u; ++i) {
+        const GuestThread *t = &guest_threads[i];
+        wd_out("WATCHDOG   [%u] id=%08X active=%d blocked=%d pc=%08X wait=%08X/%u/%08X "
+               "handle=%08X retired=%llu\n",
+               i, t->guest_thread_id, t->active, t->blocked, t->pc, t->wait_address,
+               t->wait_type, t->wait_value, t->wait_handle,
+               (unsigned long long)t->retired_steps);
+        if (t->active && !t->blocked) ++runnable;
+    }
+    if (loop_stalled) {
+        if (in_present)
+            wd_out("WATCHDOG verdict: HOST-BLOCK CLASS — the main loop is not iterating and "
+                   "a present call is in flight on tid=%ld (present/GL/window path is the "
+                   "block).\n", present_tid);
+        else if (thread_execution_depth)
+            wd_out("WATCHDOG verdict: GUEST-SPIN CLASS — the main loop cannot iterate "
+                   "because the main thread is executing a guest thread slice (depth=%u, "
+                   "thread %08X pc=%08X runnable=%u): the runnable guest thread below is the "
+                   "spinning one. If the main backtrace instead ends in a host call "
+                   "(read/futex/poll/nanosleep) rather than the interpreter, that call is the "
+                   "block and the class is host-block.\n",
+                   thread_execution_depth, current_guest_thread_id, current_guest_pc, runnable);
+        else
+            wd_out("WATCHDOG verdict: HOST-BLOCK CLASS — the main thread is in the main guest "
+                   "context (depth=0) but the loop is not iterating; the blocking call is "
+                   "named by the main-thread backtrace below (present, GL, audio, FS, a mutex "
+                   "or the savestate service).\n");
+        if (!in_present && gl_hold)
+            wd_out("WATCHDOG   note: the GL context hold is active on tid=%ld at the time of "
+                   "the dump (informational; a hold alone does not imply the block).\n", gl_tid);
+    } else {
+        wd_out("WATCHDOG verdict: LOOP-ALIVE (%u runnable guest thread(s), depth=%u). If the "
+               "screen is frozen while this dump was triggered, the class is GUEST-SPIN: the "
+               "runnable thread above is the spinning one and the main backtrace shows the "
+               "interpreter.\n", runnable, thread_execution_depth);
+    }
+    wd_out("WATCHDOG (paste this whole block, it is self-contained)\n");
+
+    /* Backtraces: main first, then every other host thread, one at a time. */
+    {
+        pid_t tids[DQ8_WD_MAX_THREADS];
+        int n = 0, truncated = 0;
+        DIR *d = opendir("/proc/self/task");
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d))) {
+                long v;
+                if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+                v = strtol(e->d_name, NULL, 10);
+                if (v <= 0) continue;
+                if (n < DQ8_WD_MAX_THREADS) tids[n++] = (pid_t)v;
+                else truncated = 1;
+            }
+            closedir(d);
+        }
+        wd_out("WATCHDOG backtraces: main thread first, then every other host "
+               "thread one at a time\n");
+        wd_trace_thread(wd_main_tid, 1);
+        for (i = 0; i < (unsigned)n; ++i) {
+            if (tids[i] == wd_main_tid || tids[i] == wd_self_tid) continue;
+            wd_trace_thread(tids[i], 0);
+        }
+        if (truncated)
+            wd_out("WATCHDOG note: more than 32 host threads; remaining ones not traced\n");
+    }
+    wd_out("WATCHDOG ================= end of freeze dump =================\n\n");
+    wd_flush();   /* ONE write: the whole block lands on stderr contiguous */
+}
+
+/* ---- watchdog thread -------------------------------------------------- */
+static void *wd_main(void *arg) {
+    uint64_t last_seen = atomic_load_explicit(&wd_heartbeat, memory_order_relaxed);
+    uint64_t last_move_ns = host_monotonic_ns();
+    uint64_t next_report_ns = 0;
+    int stalled = 0;
+    (void)arg;
+    wd_self_tid = (pid_t)syscall(SYS_gettid);
+    (void)prctl(PR_SET_NAME, (unsigned long)"dq8-watchdog", 0, 0, 0);
+    while (!atomic_load_explicit(&wd_stop, memory_order_relaxed)) {
+        struct timespec ts = { 0, 250000000L };
+        uint64_t hb, now;
+        nanosleep(&ts, NULL);
+        if (wd_quiet) continue;
+        hb = atomic_load_explicit(&wd_heartbeat, memory_order_relaxed);
+        now = host_monotonic_ns();
+        if (hb != last_seen) {
+            last_seen = hb;
+            last_move_ns = now;
+            stalled = 0;
+        }
+        if (atomic_exchange_explicit(&wd_manual, 0, memory_order_relaxed)) {
+            wd_dump("manual: kill -USR1", hb, now, last_move_ns);
+            next_report_ns = now + wd_repeat_ns;
+            continue;
+        }
+        if (now - last_move_ns >= wd_stall_ns) {
+            if (!stalled || now >= next_report_ns) {
+                wd_dump(stalled ? "still stalled" : "automatic: no heartbeat", hb, now,
+                        last_move_ns);
+                stalled = 1;
+                next_report_ns = now + wd_repeat_ns;
+            }
+        }
+    }
+    return NULL;
+}
+
+/* ---- init / stop ------------------------------------------------------ */
+static void dq8_watchdog_stop(void) {
+    wd_beat_on = 0;
+    atomic_store_explicit(&wd_stop, 1, memory_order_relaxed);
+}
+static void wd_atexit(void) {
+    wd_quiet = 1;
+    dq8_watchdog_stop();
+}
+static void dq8_watchdog_init(void) {
+    pthread_t th;
+    struct sigaction sa;
+    const char *e;
+    void *prime[DQ8_WD_MAX_FRAMES];
+    ssize_t n;
+    uint64_t s;
+    if (wd_decided) return;
+    wd_decided = 1;
+    e = getenv("DQ8_WATCHDOG");
+    if (e && e[0] == '0' && !e[1]) {
+        fprintf(stderr, "WATCHDOG: off (DQ8_WATCHDOG=0)\n");
+        return;
+    }
+    if (dq8_det_mode) {
+        fprintf(stderr, "WATCHDOG: disabled (DQ8_DETERMINISTIC=1 pins the guest clock; "
+                        "unset it to use the freeze watchdog)\n");
+        return;
+    }
+    e = getenv("DQ8_WATCHDOG_S");
+    if (e && *e) {
+        s = strtoull(e, NULL, 0);
+        if (s) wd_stall_ns = s * 1000000000ull;
+    }
+    e = getenv("DQ8_WATCHDOG_REPEAT_S");
+    if (e && *e) {
+        s = strtoull(e, NULL, 0);
+        if (s) wd_repeat_ns = s * 1000000000ull;
+    }
+    e = getenv("DQ8_WATCHDOG_SYM");
+    if (e && e[0] == '0' && !e[1]) wd_sym_on = 0;
+    e = getenv("DQ8_WATCHDOG_TEST_STALL_MS");
+    if (e && *e) wd_test_stall_ms = (int)strtol(e, NULL, 0);
+
+    n = readlink("/proc/self/exe", wd_exe, sizeof wd_exe - 1u);
+    if (n > 0) { wd_exe[n] = 0; wd_exe_base = strrchr(wd_exe, '/'); wd_exe_base = wd_exe_base ? wd_exe_base + 1 : wd_exe; }
+    else { wd_exe[0] = 0; wd_exe_base = "dq8"; }
+
+    wd_main_thread = pthread_self();
+    wd_main_tid = (pid_t)syscall(SYS_gettid);
+    wd_self_tid = wd_main_tid;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = wd_sig_backtrace;
+    sa.sa_flags = SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGUSR2, &sa, NULL);
+    sa.sa_handler = wd_sig_manual;
+    sa.sa_flags = SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGUSR1, &sa, NULL);
+    /* Priming backtrace(): the first call may dlopen libgcc, which must not
+       happen inside a signal handler. */
+    (void)backtrace(prime, (int)(sizeof prime / sizeof prime[0]));
+
+    /* Capture pipe: a traced thread's handler writes its raw frames here and
+       the watchdog thread copies them into the dump buffer, so the dump is
+       emitted as one block instead of line-by-line writes that other
+       threads' stderr can interleave with.  Read end non-blocking: the
+       drain stops at EAGAIN and can never hang the watchdog. */
+    {
+        int fl;
+        if (pipe2(wd_cap, O_CLOEXEC) == 0) {
+            fl = fcntl(wd_cap[0], F_GETFL, 0);
+            if (fl >= 0) (void)fcntl(wd_cap[0], F_SETFL, fl | O_NONBLOCK);
+            wd_cap_fd = wd_cap[1];
+        }
+    }
+
+    wd_t0_ns = host_monotonic_ns();
+    if (pthread_create(&th, NULL, wd_main, NULL) != 0) {
+        fprintf(stderr, "WATCHDOG: thread create failed; disabled\n");
+        return;
+    }
+    pthread_detach(th);
+    wd_beat_on = 1;
+    atexit(wd_atexit);
+    fprintf(stderr, "WATCHDOG: on (stall=%llu ms, repeat=%llu ms; kill -USR1 %ld = dump now; "
+                    "DQ8_WATCHDOG=0 disables)\n",
+            (unsigned long long)(wd_stall_ns / 1000000ull),
+            (unsigned long long)(wd_repeat_ns / 1000000ull), (long)getpid());
+}
+
 /* SAVESTATE_IMPL (t_d50c9503): spliced from src/native_savestate.c */
 /* S1_BLOCK_DEF */
 /* S1_CFG_DEF */
+/* FN_EMIT_DECLS */
+/* FN_EMIT_SHARDS */
+/* FN_EMIT_DEF */
 static void translated_from(uint32_t *r, uint32_t start_pc, GuestThread *context) {
     active_guest_regs = r;
     /* PERF-02: attribute the dispatch itself, so a session that spends its
@@ -13593,12 +15942,39 @@ static void translated_from(uint32_t *r, uint32_t start_pc, GuestThread *context
     int n=context ? context->n : 0, z=context ? context->z : 0;
     int c=context ? context->c : 0, v=context ? context->v : 0;
     int ge=context ? context->ge : 0;
+    /* PREEMPTIVE GUEST SLICE (t_353154d7): this dispatch can be ended by the
+       time slice even while the thread is still runnable.  `slice_t0` is read
+       once per dispatch, `next_slice_step` is the counter watermark; the clock
+       itself is only read when the watermark is reached. */
+    uint64_t slice_t0 = guest_slice_on ? dq8_guest_now_ns() : 0u;
+    uint64_t next_slice_step = 2048ull;
+    int slice_expired = 0;
+    guest_slice_last_expired = 0;
     /* SAVESTATE (t_d50c9503): a startup `--load-state` restores the main
        context's condition flags here (regs/pc come in through r/start_pc). */
     if (!context) savestate_take_resume(&n, &z, &c, &v, &ge);
     (void)n; (void)z; (void)c; (void)v; (void)ge;
     uint64_t dq8_gt_last = 0;
-    while (running && steps++ < (thread_execution_depth ? 5000ull : bench_step_limit)) {
+    while (running && !slice_expired && steps++ < (thread_execution_depth ? (guest_slice_steps ? guest_slice_steps : bench_step_limit) : bench_step_limit)) {
+        /* FREEZE WATCHDOG (t_4371e6ea): one relaxed store per main-context
+           iteration; the watchdog thread samples it every 250 ms.  Worker
+           contexts are inside a main-context iteration and therefore must
+           not move the counter, or a main-thread block would hide behind a
+           running worker slice. */
+        if (!context) dq8_watchdog_beat();
+        /* FREEZE WATCHDOG synthetic stall (DQ8_WATCHDOG_TEST_STALL_MS): sleep
+           once inside the FIRST main-loop iteration, so the watchdog's own
+           automatic dump has to name this sleep from the main backtrace. */
+        if (wd_test_stall_ms && !context && !wd_test_stall_done) {
+            struct timespec wd_test_ts;
+            wd_test_stall_done = 1;
+            fprintf(stderr, "WATCHDOG_TEST: sleeping %d ms inside the main loop "
+                            "(translated_from, first iteration, pc=%08X)\n",
+                    wd_test_stall_ms, start_pc);
+            wd_test_ts.tv_sec = wd_test_stall_ms / 1000;
+            wd_test_ts.tv_nsec = (long)(wd_test_stall_ms % 1000) * 1000000L;
+            nanosleep(&wd_test_ts, NULL);
+        }
         /* DETERMINISTIC (t_115d297c): fold retired main-context instructions
            into the virtual guest clock at a coarse watermark.  Off by default
            (one predictable branch per dispatch iteration). */
@@ -13660,6 +16036,19 @@ static void translated_from(uint32_t *r, uint32_t start_pc, GuestThread *context
                     continue;
                 }
             }
+        }
+        /* PREEMPTIVE GUEST SLICE (t_353154d7): end this worker dispatch after
+           one slice even though the thread stays runnable, so the scheduler
+           can hand the CPU to another runnable thread (or back to the main /
+           frame path).  The per-iteration cost is one compare against the
+           watermark; `dq8_guest_now_ns()` is read only when the watermark is
+           reached (every 2048 instructions), never per guest instruction.
+           `steps` can jump by a whole CHAIN_BATCH between iterations, so a
+           watermark -- not `steps % N` -- is used, exactly like the existing
+           scheduler watermark below. */
+        if (guest_slice_on && thread_execution_depth && steps >= next_slice_step) {
+            next_slice_step = steps + 2048ull;
+            if (dq8_guest_now_ns() - slice_t0 >= guest_slice_ns) slice_expired = 1;
         }
         /* The native main guest must not monopolize execution in a polling
            loop. The 3DS kernel preempts runnable threads even when guest code
@@ -14068,6 +16457,7 @@ static void translated_from(uint32_t *r, uint32_t start_pc, GuestThread *context
         }
         /* S1_DISPATCH_HOOK */
         /* S1_CFG_HOOK */
+        /* FN_EMIT_HOOK */
         switch (pc >> 12) {
 "#,
     );
@@ -14122,6 +16512,29 @@ static void translated_from(uint32_t *r, uint32_t start_pc, GuestThread *context
             boundary_pcs.push(*entry);
         }
     }
+    // FN_EMIT: same requirement as the S1c hook — a split-build part call must
+    // end its batch at an emitted function's entry or resume entry so
+    // dq8_main.c regains control and the hook sees that pc.
+    //
+    // DQ8_FN_BOUNDARY=0 is a DIAGNOSTIC build knob (t_e1547d93): it emits the
+    // bodies and the hook but leaves the 6 688 hook pcs out of the A05 boundary
+    // set, which isolates how much of the big list's per-frame cost is the
+    // boundary set rather than the entry check.  With it unset the generated C
+    // is unchanged.  The resulting binary is not shippable: a batch that runs
+    // through an entry pc inside a part never reaches the hook.
+    if let Some(prog) = &fn_program {
+        let boundary_hook_pcs = std::env::var("DQ8_FN_BOUNDARY").map(|v| v != "0").unwrap_or(true);
+        if boundary_hook_pcs {
+            for pc in &prog.hook_pcs {
+                boundary_pcs.push(*pc);
+            }
+        } else {
+            eprintln!(
+                "FN_EMIT: DIAGNOSTIC BUILD -- the {} hook pcs are NOT in the A05 boundary set",
+                prog.hook_pcs.len()
+            );
+        }
+    }
     let boundary_cases: String = boundary_pcs
         .iter()
         .map(|pc| format!("    case 0x{pc:08X}u:\n"))
@@ -14165,7 +16578,7 @@ static void translated_from(uint32_t *r, uint32_t start_pc, GuestThread *context
         }
         c.push_str("default: fprintf(stderr, \"translated PC escaped to %08X after %08X r0-r7=%08X/%08X/%08X/%08X/%08X/%08X/%08X/%08X lr=%08X sp=%08X\\n\", pc, previous_guest_pc, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[14], r[13]); exit(3); } break;\n");
     }
-    c.push_str("default: fprintf(stderr, \"translated PC escaped to %08X after %08X r0-r7=%08X/%08X/%08X/%08X/%08X/%08X/%08X/%08X lr=%08X sp=%08X\\n\", pc, previous_guest_pc, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[14], r[13]); exit(3); } } if(!context && bench_enabled && steps >= bench_step_limit) bench_report(steps, pc); if(steps>=1000000000000ull) { fprintf(stderr, \"guest instruction budget exhausted at pc=%08X r0=%08X r1=%08X r13=%08X\\n\", pc, r[0], r[1], r[13]); exit(4); } if(context) { context->pc=pc; context->n=n; context->z=z; context->c=c; context->v=v; context->ge=ge; if(!running && !thread_stopped_by_yield) context->active=0; if(!running && !thread_stopped_by_yield && context >= &guest_threads[0] && context < &guest_threads[GUEST_THREAD_STACK_SLOTS]) guest_stack_release((unsigned)(context - guest_threads)); } if(context) { uint64_t retired = running ? (steps ? steps - 1u : 0u) : steps; context->retired_steps += retired; perf_worker_retired += retired; dq8_det_fold_worker(retired); } else { uint64_t retired = running ? (steps ? steps - 1u : 0u) : steps; perf_main_retired += retired; } }\n");
+    c.push_str("default: fprintf(stderr, \"translated PC escaped to %08X after %08X r0-r7=%08X/%08X/%08X/%08X/%08X/%08X/%08X/%08X lr=%08X sp=%08X\\n\", pc, previous_guest_pc, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[14], r[13]); exit(3); } } if(!context && bench_enabled && steps >= bench_step_limit) bench_report(steps, pc); if(steps>=1000000000000ull) { fprintf(stderr, \"guest instruction budget exhausted at pc=%08X r0=%08X r1=%08X r13=%08X\\n\", pc, r[0], r[1], r[13]); exit(4); } guest_slice_last_expired = slice_expired; guest_slice_last_dispatch_ns = (thread_execution_depth && slice_t0) ? dq8_guest_now_ns() - slice_t0 : 0u; if(context) { context->pc=pc; context->n=n; context->z=z; context->c=c; context->v=v; context->ge=ge; if(!running && !thread_stopped_by_yield) context->active=0; if(!running && !thread_stopped_by_yield && context >= &guest_threads[0] && context < &guest_threads[GUEST_THREAD_STACK_SLOTS]) guest_stack_release((unsigned)(context - guest_threads)); } if(context) { uint64_t retired = running ? (steps ? steps - 1u : 0u) : steps; context->retired_steps += retired; perf_worker_retired += retired; dq8_det_fold_worker(retired); } else { uint64_t retired = running ? (steps ? steps - 1u : 0u) : steps; perf_main_retired += retired; } }\n");
     c.push_str(&format!(r#"int main(int argc, char **argv) {{
     (void)mem8; (void)mem16; (void)put8; (void)put16; (void)arm_shift; (void)arm_shift_carry; (void)arm_shift_imm; (void)arm_shift_imm_carry; (void)uqsub8; (void)qsub8; (void)qsub16; (void)par_op; (void)par_sel; (void)guest_udf; (void)guest_unsupported; (void)svc_create_address_arbiter; (void)dq8_pc_needs_boundary;
     (void)branch_indirect; (void)svc_break; (void)svc_arbitrate; (void)svc_send_sync; (void)svc_connect_to_port;
@@ -14271,6 +16684,15 @@ static void translated_from(uint32_t *r, uint32_t start_pc, GuestThread *context
         fprintf(stderr, "HIDREAD trace enabled t=0 is trace start\n");
     }}
     if (getenv("DQ8_PROGRESS_SECONDS")) {{ signal(SIGALRM, guest_periodic_dump); alarm(5u); }}
+    /* HOST COMMANDS IN A WAIT (t_56936fec): Ctrl+C / SIGTERM is a quit, not an
+       abort -- the flag is turned into the same clean exit the window-close
+       path performs (atexit: present-worker join, GL/audio teardown), including
+       from inside a main-context guest wait. */
+    signal(SIGINT, host_signal_quit_handler);
+    signal(SIGTERM, host_signal_quit_handler);
+    /* TEST-ONLY (t_56936fec): controlled main-context wedge; no-op when
+       DQ8_TEST_MAIN_WEDGE_AT is unset. */
+    test_main_wedge_init();
     /* GUESTPHASE (t_3de68379): DQ8_GUEST_TIME=1 accumulates the wall clock
        spent inside the guest dispatch loop and reports it on every
        FRAMESTAT line (guest_ms / guest_ms_per_frame / guest_pct_wall). */
@@ -14307,8 +16729,19 @@ static void translated_from(uint32_t *r, uint32_t start_pc, GuestThread *context
                    (unsigned long long)dq8_det_ns_per_step,
                    (unsigned long long)((GUEST_HOST_POLL_NS + dq8_det_ns_per_step - 1u) / dq8_det_ns_per_step));
        }} }}
+    /* PREEMPTIVE GUEST SLICE (t_353154d7): parse DQ8_GUEST_SLICE_MS and
+       friends after DQ8_DETERMINISTIC is known (the deterministic harness
+       turns the slice off) and report the chosen value once. */
+    guest_slice_init();
+    if (getenv("DQ8_SLICE_STATS")) atexit(guest_slice_report);
     /* S1_BLOCK_GATE */
     /* S1_CFG_GATE */
+    /* FN_EMIT_GATE */
+    /* FREEZE WATCHDOG (t_4371e6ea): started here, before the display/GL
+       bring-up and the dispatch loop, so a freeze inside host_display_init,
+       pica_gl_init or the savestate cold load is caught too.  Disabled by
+       DQ8_WATCHDOG=0 and by DQ8_DETERMINISTIC=1 (it says so on stderr). */
+    dq8_watchdog_init();
     host_display_init();
     pica_gl_init();
     uint32_t r[16]={{0}}; r[13]=0x10000000u; r[14]=0xFFFFFFFFu; main_guest_regs=r;
@@ -14334,11 +16767,38 @@ static void translated_from(uint32_t *r, uint32_t start_pc, GuestThread *context
     PF_ENTER(PF_GUEST);
     translated_from(r, ss_entry, NULL);
     PF_EXIT();
+    /* FREEZE WATCHDOG (t_4371e6ea): the guest loop is over; stop sampling so
+       the shutdown path (audio drain, savestate write, SDL teardown) can take
+       as long as it needs without being reported as a stall. */
+    dq8_watchdog_stop();
     printf("executed statically translated ARM function 0x{start:08X}; r0=0x%08X\n", r[0]);
     host_display_shutdown();
     return 0;
 }}
 "#));
+    // t_40d37ebb diagnosis: a step-indexed digest of the guest architectural
+    // state (env-gated, off by default) so two deterministic builds of the same
+    // scene can be diffed down to the first diverging instruction.  Inserted
+    // before the dispatch hook; the marker is re-emitted so the S1b splice
+    // below still finds it.
+    c = c.replace(
+        "        /* S1_DISPATCH_HOOK */\n",
+        concat!(
+            "        { static int sd_on = -1; static unsigned long long sd_every, sd_next, sd_to;\n",
+            "          if (sd_on < 0) { const char *e = getenv(\"DQ8_STATE_EVERY\"); const char *f = getenv(\"DQ8_STATE_FROM\"); const char *t = getenv(\"DQ8_STATE_TO\");\n",
+            "            sd_on = (e && *e) ? atoi(e) : 0; sd_every = sd_on > 0 ? (unsigned long long)sd_on : 0ull;\n",
+            "            sd_next = (f && *f) ? strtoull(f, 0, 0) : 0ull; sd_to = (t && *t) ? strtoull(t, 0, 0) : ~0ull; }\n",
+            "          if (sd_every && steps >= sd_next && steps <= sd_to) {\n",
+            "            unsigned _sdi;\n",
+            "            fprintf(stderr, \"STATE steps=%llu pc=%08X r=\", (unsigned long long)steps, pc);\n",
+            "            for (_sdi = 0; _sdi < 15u; ++_sdi) fprintf(stderr, \"%08X%s\", r[_sdi], _sdi == 14u ? \"\" : \",\");\n",
+            "            fprintf(stderr, \" nzcvge=%d%d%d%d%d run=%d\\n\", n, z, c, v, ge, running);\n",
+            "            sd_next = steps + sd_every; } }\n",
+            "        /* S1_DISPATCH_HOOK */\n",
+        )
+        .to_string()
+        .as_str(),
+    );
     // S1b markers: with --s1-block absent these all replace with "" and the
     // generated file stays byte-identical to the pre-S1b output (verified by
     // regenerating the default output and comparing its sha256 against the
@@ -14368,6 +16828,44 @@ static void translated_from(uint32_t *r, uint32_t start_pc, GuestThread *context
     c = c.replace(
         "    /* S1_CFG_GATE */\n",
         s1_cfg.as_ref().map(|r| r.gate_c.as_str()).unwrap_or(""),
+    );
+    // FN_EMIT markers: same byte-identity contract — without --fn-emit-list
+    // these all replace with "" and the generated file is unchanged.
+    c = c.replace(
+        "/* FN_EMIT_DECLS */\n",
+        fn_program
+            .as_ref()
+            .map(|p| format!("/* FN_EMIT_DECLS_BEGIN */\n{}/* FN_EMIT_DECLS_END */\n", p.decls_c))
+            .unwrap_or_default()
+            .as_str(),
+    );
+    c = c.replace(
+        "/* FN_EMIT_SHARDS */\n",
+        fn_program
+            .as_ref()
+            .map(|p| {
+                let mut text = String::new();
+                for (i, shard) in p.shards.iter().enumerate() {
+                    text.push_str(&format!(
+                        "/* FN_EMIT_SHARD_BEGIN {i} */\n{shard}/* FN_EMIT_SHARD_END */\n"
+                    ));
+                }
+                text
+            })
+            .unwrap_or_default()
+            .as_str(),
+    );
+    c = c.replace(
+        "/* FN_EMIT_DEF */\n",
+        fn_program.as_ref().map(|p| p.def_c.as_str()).unwrap_or(""),
+    );
+    c = c.replace(
+        "        /* FN_EMIT_HOOK */\n",
+        fn_program.as_ref().map(|p| p.hook_c.as_str()).unwrap_or(""),
+    );
+    c = c.replace(
+        "    /* FN_EMIT_GATE */\n",
+        fn_program.as_ref().map(|p| p.gate_c.as_str()).unwrap_or(""),
     );
     if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -14413,8 +16911,22 @@ fn run() -> Result<(), String> {
             let mut s1_block = None;
             let mut s1_cfg_entry: Option<u32> = None;
             let mut s1_cfg_regions: Vec<(u32, u32)> = Vec::new();
+            let mut fn_emit_entry: Option<u32> = None;
+            let mut fn_emit_range: Option<(u32, u32)> = None;
+            let mut fn_emit_list_path: Option<String> = None;
             let mut i = 0;
             while i < rest.len() {
+                // FN_EMIT list: a FILE PATH, not an address, so it is handled
+                // before the numeric-value parse below.
+                if rest[i] == "--fn-emit-list" {
+                    let path = rest
+                        .get(i + 1)
+                        .ok_or("--fn-emit-list needs a file path")?
+                        .clone();
+                    fn_emit_list_path = Some(path);
+                    i += 2;
+                    continue;
+                }
                 let value = rest
                     .get(i + 1)
                     .ok_or("missing recompile-arm option value")?;
@@ -14426,6 +16938,13 @@ fn run() -> Result<(), String> {
                     "--noreturn-call" => noreturn_calls.push(parsed),
                     "--s1-block" => s1_block = Some(parsed),
                     "--s1-cfg" => s1_cfg_entry = Some(parsed),
+                    "--fn-emit" => fn_emit_entry = Some(parsed),
+                    "--fn-emit-end" => {
+                        let entry = fn_emit_entry
+                            .take()
+                            .ok_or("--fn-emit-end requires --fn-emit")?;
+                        fn_emit_range = Some((entry, parsed));
+                    }
                     "--s1-cfg-end" => {
                         let entry = s1_cfg_entry
                             .take()
@@ -14434,7 +16953,7 @@ fn run() -> Result<(), String> {
                     }
                     _ => {
                         return Err(
-                            "recompile-arm options: --base ADDRESS, --extra-entry ADDRESS, --noreturn-call ADDRESS, --s1-block ADDRESS, --s1-cfg ADDRESS --s1-cfg-end ADDRESS".into(),
+                            "recompile-arm options: --base ADDRESS, --extra-entry ADDRESS, --noreturn-call ADDRESS, --s1-block ADDRESS, --s1-cfg ADDRESS --s1-cfg-end ADDRESS, --fn-emit ADDRESS --fn-emit-end ADDRESS".into(),
                         );
                     }
                 }
@@ -14445,6 +16964,39 @@ fn run() -> Result<(), String> {
             // convert several regions in one build.
             if s1_cfg_entry.is_some() {
                 return Err("--s1-cfg requires --s1-cfg-end".into());
+            }
+            if fn_emit_entry.is_some() {
+                return Err("--fn-emit requires --fn-emit-end".into());
+            }
+            // Assemble the emission list: the legacy single pair (spike
+            // compatibility, still used by tools/fn_emit_bench.sh) plus every
+            // pair in the --fn-emit-list file.
+            let mut fn_emit_pairs: Vec<(u32, u32)> = Vec::new();
+            if let Some(pair) = fn_emit_range {
+                fn_emit_pairs.push(pair);
+            }
+            if let Some(path) = &fn_emit_list_path {
+                let text = fs::read_to_string(path)
+                    .map_err(|e| format!("cannot read --fn-emit-list {path}: {e}"))?;
+                for (lineno, line) in text.lines().enumerate() {
+                    let line = line.split('#').next().unwrap_or("").trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let mut it = line.split_whitespace();
+                    let entry = it.next().ok_or_else(|| {
+                        format!("{path}:{}: expected `0xENTRY 0xEND`", lineno + 1)
+                    })?;
+                    let end = it.next().ok_or_else(|| {
+                        format!("{path}:{}: expected `0xENTRY 0xEND`", lineno + 1)
+                    })?;
+                    let parse = |s: &str| -> Result<u32, String> {
+                        u32::from_str_radix(s.trim_start_matches("0x").trim_start_matches("0X"), 16)
+                            .map_err(|_| format!("{path}:{}: invalid address {s}", lineno + 1))
+                    };
+                    fn_emit_pairs.push((parse(entry)?, parse(end)?));
+                }
+                println!("fn-emit-list: {} range(s) from {path}", fn_emit_pairs.len());
             }
             let s1_cfg = if s1_cfg_regions.is_empty() {
                 None
@@ -14460,6 +17012,7 @@ fn run() -> Result<(), String> {
                 &noreturn_calls,
                 s1_block,
                 s1_cfg,
+                &fn_emit_pairs,
             )
         }
         // S1a: representation-only Block-IR extraction for one guest address
@@ -14911,7 +17464,7 @@ mod tests {
         // failed the whole `cargo test` gate before it could run a single
         // test.  Pass the "no S1 emission" defaults so the suite compiles.
         recompile_arm_function_with_noreturn(
-            &input, &output, 0x1000, 0x1000, &[], &[0x1010], None, None,
+            &input, &output, 0x1000, 0x1000, &[], &[0x1010], None, None, &[],
         )
             .unwrap();
         let generated = fs::read_to_string(&output).unwrap();

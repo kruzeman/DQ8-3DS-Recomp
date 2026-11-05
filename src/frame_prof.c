@@ -58,6 +58,27 @@ static uint64_t pf_prev_self_ticks;
 static uint64_t pf_prev_core_total[512], pf_prev_core_idle[512];
 static int pf_prev_cores;
 static uint64_t pf_prev_thread_ticks[64];
+/* FREEZE WATCHDOG (t_4371e6ea): the last emitted FRAMEPROF line and its two
+   block-relevant numbers, so a stall dump can quote the frame budget that was
+   running when the loop stopped.  Written only from pf_frame_end (main
+   thread), read only from the watchdog thread; torn reads would print a
+   mixed line, which is a display-only wart, never a behaviour change. */
+static char pf_last_line[320];
+static int pf_last_len;
+static double pf_last_present_ms, pf_last_gl_ms;
+static int pf_last_valid;
+static int dq8_frame_prof_last(char *out, size_t cap, double *present_ms, double *gl_ms) {
+    if (!pf_last_valid) return 0;
+    if (out && cap) {
+        size_t n = (size_t)pf_last_len;
+        if (n >= cap) n = cap - 1u;
+        memcpy(out, pf_last_line, n);
+        out[n] = 0;
+    }
+    if (present_ms) *present_ms = pf_last_present_ms;
+    if (gl_ms) *gl_ms = pf_last_gl_ms;
+    return 1;
+}
 static int pf_prev_thread_tid[64];
 static int pf_prev_thread_n;
 static char pf_prev_thread_name[64][24];
@@ -487,6 +508,20 @@ static void pf_frame_end(void) {
     if (n > 0) {
         if (n > (int)sizeof line - 1) n = (int)sizeof line - 1;
         fwrite(line, 1, (size_t)n, stderr);
+        /* t_4371e6ea: keep the line (without its newline) for the freeze
+           watchdog dump.  pf_* accumulators are reset below, so the numbers
+           must be captured here, not read later. */
+        {
+            int m = n;
+            while (m > 0 && (line[m - 1] == '\n' || line[m - 1] == '\r')) --m;
+            if (m > (int)sizeof pf_last_line - 1) m = (int)sizeof pf_last_line - 1;
+            memcpy(pf_last_line, line, (size_t)m);
+            pf_last_line[m] = 0;
+            pf_last_len = m;
+            pf_last_present_ms = present_ms;
+            pf_last_gl_ms = gl_ms;
+            pf_last_valid = 1;
+        }
     }
     ++pf_win_frames;
     pf_win_total_ms += total_ms;

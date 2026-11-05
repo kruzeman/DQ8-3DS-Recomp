@@ -28,7 +28,12 @@ static int pica_px_find(int x, int y);
 #include <stdio.h>
 #include <stdlib.h>
 static FILE *pvs_f;
-static unsigned pvs_trace;
+/* t_e1773c51: per-thread.  pica_load_vertex() assigns it per vertex (line
+   ~2570) and pica_vs_finish()/pica_execute_vs() read it; the vertex pool runs
+   those on 8 threads at once, so a single global word was written by every
+   worker for every vertex (a data race, benign output but UB and it can flip
+   another worker's trace decision when DQ8_TRACE_VSDUMP is armed). */
+static __thread unsigned pvs_trace;
 static unsigned pvs_proj_trace; /* current vertex was instruction-traced: print VSPROJ */
 static void pvs_flow(unsigned pc, uint32_t w, unsigned next) {
     if (!pvs_f || !pvs_trace) return;
@@ -253,6 +258,7 @@ static float pica_multiply(float a, float b) {
 #include <emmintrin.h>
 #include <tmmintrin.h>
 #include <smmintrin.h>
+#include <immintrin.h>   /* t_e1773c51: AVX2 8-lane batch */
 #define PVS_SSE 1
 typedef struct { __m128i perm; __m128 sign; } PvsSwzVec;
 static PvsSwzVec pvs_swzv[256 * 3];       /* [desc][operand] */
@@ -562,6 +568,417 @@ static void pvs_dec_sync(void) {
         pvs_dec_ready = 1;
     }
 }
+/* ---- prepared per-program execution plan (t_fdc40e6f) --------------------
+   pvs_dec_tab (t_469b3d92) already removes the *bitfield decode* from the
+   per-vertex loop, but every one of the ~97 executed microcode instructions
+   still re-derives, at run time:
+     * where each operand lives  -- pvs_vec_src() branches three ways
+     (state input / state temp / uniform block) and then re-checks relative
+     addressing in the uniform case;
+     * where the destination lives -- a `<16 ? output : temp` select;
+     * which swizzle vector applies -- an index multiply off the descriptor;
+     * whether instrumentation is armed -- pvs_ghist_on, pf_trap_on,
+     pvs_dec_ready and pvs_trace were re-read FROM GLOBALS per instruction.
+   perf annotate on the operator's city state put 35 % of pica_load_vertex's
+   samples on the single `cmpb pvs_dec_ready` at the top of that loop.
+
+   The plan below is built ONCE per (program words, swizzle table, input map
+   0x2BB/0x2BC, output mask 0x2BD, OUTMAP_TOTAL 0x4F, maps 0x50..0x56) and
+   cached, so a draw whose program repeats costs nothing to prepare.  Each
+   entry carries, fully resolved:
+     * the operand address: an ABSOLUTE pointer for uniform / constant-ones
+     operands (their storage never moves) and a BYTE OFFSET for state
+     registers (selected at run time with a mask, not a branch);
+     * the swizzle vector index, the write mask, the destination byte offset
+       into the flat 48-register float block (input|temp|output are adjacent);
+     * for flow control, the decoded target / length / bool index.
+   Everything the plan cannot represent (unclassified opcode, descriptor out
+   of the swizzle table, relative uniform addressing, tracing) keeps PVO_GEN
+   and runs the existing interpreter body for that pc, with a per-occurrence
+   counter -- the plan never silently changes a result.
+
+   DQ8_VSPLAN=0 restores the pre-task path byte for byte (A/B reference). */
+enum {
+    PVO_GEN = 0, PVO_MOV, PVO_ADD, PVO_MUL, PVO_FLR, PVO_MAD, PVO_DP, PVO_CMP,
+    PVO_RCP, PVO_RSQ, PVO_MIN, PVO_MAX, PVO_SLT, PVO_SGE, PVO_MOVA,
+    PVO_END, PVO_JMP, PVO_CALL, PVO_CALLZ, PVO_CALLNZ, PVO_JMPC, PVO_JMPZ,
+    PVO_IFU, PVO_IFC
+};
+typedef struct {
+    uintptr_t a, b, c;        /* absolute operand pointer, or state byte offset */
+    uint16_t sw_a, sw_b, sw_c;/* index into pvs_swzv[] */
+    uint16_t dst;             /* byte offset into the 48-register float block */
+    uint16_t tgt;             /* flow: decoded branch/call target */
+    int16_t  na, nb, nc;      /* operand register numbers (relative path only) */
+    uint8_t  op, msk, flags;  /* flags bit0/1/2: operand a/b/c is state-relative */
+    uint8_t  rel_a, rel_b, rel_c;
+    uint8_t  n, idx, dpn, dph, cmp0, cmp1;
+} PvsPlan;
+/* t_45ee02dd: 64 slots, not 8.  The city and battle states upload EIGHT
+   distinct programs, and every mesh format change (0x2BD output mask,
+   0x4F/0x50..0x56 attribute maps) produces a new key for the same program,
+   so a 64-field state had > 8 live keys: `skipped_draws` was 26 814 of
+   45 000 draws on the field state, i.e. 60 % of the draws silently fell back
+   to the interpreter.  A full table still falls back (never evicts). */
+#define PVSP_MAX 64
+typedef struct {
+    uint64_t key;
+    unsigned n, gen;          /* program length, PVO_GEN entries */
+    unsigned long long verts; /* vertices executed with this plan */
+    PvsPlan *tab;
+    unsigned nsc;             /* output-map scatter entries */
+    struct { uint16_t off; uint8_t sem; } sc[40];
+} PvsProg;
+static PvsProg pvs_progs[PVSP_MAX];
+static int pvs_nprog;
+static int pvs_plan_on = -1;              /* DQ8_VSPLAN=0 restores the old path */
+static int pvs_stats_on = -1;             /* DQ8_VSPLAN_STATS=1 */
+static const PvsPlan *pvs_plan_cur;       /* plan for the draw being executed */
+static const PvsProg *pvs_prog_cur;
+/* t_e1773c51: the pool participant's plan snapshot.  pvs_plan_cur /
+   pvs_prog_cur above are published by the main thread once per draw; a worker
+   that is still executing the draw it was woken for must not read whatever
+   the main thread has published since.  pvs_body_run() copies the job's plan
+   pointer into these per-thread slots for the duration of the job, and every
+   reader below goes through the accessors.  Outside a job (serial path,
+   DQ8_VSPAR_VERIFY reference pass, tracing) the NULL TLS falls through to the
+   globals, so the single-threaded behaviour is unchanged. */
+static __thread const PvsPlan *pvs_tls_plan;
+static __thread const PvsProg *pvs_tls_prog;
+static inline const PvsPlan *pvs_plan_now(void) {
+    return pvs_tls_plan ? pvs_tls_plan : pvs_plan_cur;
+}
+static inline const PvsProg *pvs_prog_now(void) {
+    return pvs_tls_prog ? pvs_tls_prog : pvs_prog_cur;
+}
+static unsigned long long pvs_plan_build_n, pvs_plan_hit_n, pvs_gen_exec,
+                          pvs_plan_used, pvs_plan_skipped;
+static unsigned long long pvs_plan_hit_ns, pvs_plan_build_ns, pvs_plan_build_max_ns;
+static unsigned pvs_plan_progs_seen;
+static int pvs_vs4_on = -1;               /* DQ8_VS4=0 disables the 4-lane batch */
+/* t_e1773c51: the batch counters used to be process-global words incremented by
+   every pool participant on every batch (8 threads writing the same cache line
+   per 4 vertices: lost updates AND false sharing).  Each participant now counts
+   into its own slot and the report sums the registered slots. */
+typedef struct {
+    unsigned long long batches, verts, bail_div, bail_plan, scalar,
+                       bail_rel, bail_gen, bail_gate, bail_pc;
+    /* t_e1773c51 STEP 2: the 8-lane AVX2 batch keeps its own tallies so the
+       bail rate of the wider batch can be compared with the 4-lane one. */
+    unsigned long long b8_batches, b8_verts, b8_div, b8_plan, b8_rel,
+                       b8_gen, b8_pc, b8_gate, b8_fallback;
+} Pvs4Cnt;
+static __thread Pvs4Cnt pvs4_tls;
+#define PVS4_CNT_MAX 16
+static Pvs4Cnt *pvs4_cnt_slots[PVS4_CNT_MAX];
+static volatile unsigned pvs4_cnt_n;
+static void pvs4_cnt_register(void) {
+    static __thread int reg;
+    unsigned i;
+    if (reg) return;
+    reg = 1;
+    i = __atomic_fetch_add(&pvs4_cnt_n, 1u, __ATOMIC_ACQ_REL);
+    if (i < PVS4_CNT_MAX)
+        __atomic_store_n(&pvs4_cnt_slots[i], &pvs4_tls, __ATOMIC_RELEASE);
+}
+static void pvs4_cnt_total(Pvs4Cnt *t) {
+    unsigned i, n = __atomic_load_n(&pvs4_cnt_n, __ATOMIC_ACQUIRE);
+    memset(t, 0, sizeof *t);
+    if (n > PVS4_CNT_MAX) n = PVS4_CNT_MAX;
+    for (i = 0; i < n; ++i) {
+        Pvs4Cnt *s = __atomic_load_n(&pvs4_cnt_slots[i], __ATOMIC_ACQUIRE);
+        if (!s) continue;
+        t->batches += s->batches; t->verts += s->verts;
+        t->bail_div += s->bail_div; t->bail_plan += s->bail_plan;
+        t->scalar += s->scalar; t->bail_rel += s->bail_rel;
+        t->bail_gen += s->bail_gen; t->bail_gate += s->bail_gate;
+        t->bail_pc += s->bail_pc;
+        t->b8_batches += s->b8_batches; t->b8_verts += s->b8_verts;
+        t->b8_div += s->b8_div; t->b8_plan += s->b8_plan;
+        t->b8_rel += s->b8_rel; t->b8_gen += s->b8_gen;
+        t->b8_pc += s->b8_pc; t->b8_gate += s->b8_gate;
+        t->b8_fallback += s->b8_fallback;
+    }
+}
+static inline int pvs_vs4_gate(void) {
+    if (pvs_vs4_on < 0) {
+        /* t_45ee02dd: default ON.  The batch is bit-identical to the scalar
+           plan path on 8M-step deterministic runs of city/battle/field and on
+           `DQ8_VSPAR_VERIFY=1` over 13-20 M vertices per scene, which is the
+           condition this card set for enabling it.  DQ8_VS4=0 is the A/B
+           reference. */
+        const char *e = getenv("DQ8_VS4");
+        pvs_vs4_on = (e && e[0] == '0' && !e[1]) ? 0 : 1;
+        pvs4_cnt_register();
+    }
+    return pvs_vs4_on;
+}
+static int pvs4_norel = -1;   /* DQ8_VS4_NOREL=1: diagnostic, bail on relative */
+static inline int pvs4_norel_gate(void) {
+    if (pvs4_norel < 0) {
+        const char *e = getenv("DQ8_VS4_NOREL");
+        pvs4_norel = (e && e[0] == '1') ? 1 : 0;
+    }
+    return pvs4_norel;
+}
+static int pvs4_bm = -1;      /* DQ8_VS4_BAIL=<mask>: diagnostic per-opclass bail */
+static inline int pvs4_bailmask_gate(void) {
+    if (pvs4_bm < 0) {
+        const char *e = getenv("DQ8_VS4_BAIL");
+        pvs4_bm = (e && *e) ? (int)strtol(e, NULL, 0) : 0;
+    }
+    return pvs4_bm;
+}
+static inline unsigned pvs4_bailcls(unsigned o) {
+    switch (o) {
+    case PVO_CALLZ: case PVO_CALLNZ: case PVO_JMPC: case PVO_JMPZ:
+    case PVO_IFU: case PVO_IFC: return 1u;      /* conditional flow */
+    case PVO_MOVA: return 2u;
+    case PVO_DP: return 4u;
+    case PVO_MIN: case PVO_MAX: case PVO_SLT: case PVO_SGE: return 8u;
+    case PVO_RCP: case PVO_RSQ: return 16u;
+    case PVO_CMP: return 32u;
+    case PVO_MAD: return 64u;
+    default: return 0u;
+    }
+}
+/* Operand resolution: state register n (0..31) is 16*n bytes into the state's
+   flat float block; 32..127 are uniform slots (or the constant 1,1,1,1 block
+   the interpreter returns beyond slot 95).  A relative index (MOVA) stays on
+   the interpreter's own source helper. */
+static void pvs_plan_opnd(PvsPlan *p, unsigned slot, unsigned n, unsigned rel) {
+    uintptr_t addr;
+    if (n < 32u) {
+        addr = (uintptr_t)n * 16u;
+        p->flags |= (uint8_t)(1u << slot);
+    } else {
+        unsigned i = n - 32u;
+        addr = (i < 96u) ? (uintptr_t)(const void *)&vs_uniform_f[i][0]
+                         : (uintptr_t)(const void *)pvs_ones_f;
+    }
+    switch (slot) {
+    case 0: p->a = addr; p->na = (int16_t)n; p->rel_a = (uint8_t)rel; break;
+    case 1: p->b = addr; p->nb = (int16_t)n; p->rel_b = (uint8_t)rel; break;
+    default: p->c = addr; p->nc = (int16_t)n; p->rel_c = (uint8_t)rel; break;
+    }
+}
+static int pvs_plan_build_one(PvsPlan *p, uint32_t w, unsigned pc) {
+    unsigned op = w >> 26, desc, rel, dst;
+    int mad = op >= 0x30, inv;
+    (void)pc;
+    memset(p, 0, sizeof *p);
+    inv = (op >= 0x18 && op <= 0x1b) || (op >= 0x30 && op < 0x38);
+    /* Flow control carries no swizzle descriptor: classify it first. */
+    if (!mad && (op == 0x22 || op == 0x21 || (op >= 0x24 && op <= 0x28) ||
+                 op == 0x2c || op == 0x2d)) {
+        p->idx = (uint8_t)((w >> 22) & 15u);
+        if (op >= 0x24 && op <= 0x28) {
+            p->tgt = (uint16_t)((w >> 10) & 4095u);
+            p->n = (uint8_t)(w & 255u);
+        } else if (op == 0x2c || op == 0x2d) {
+            p->tgt = (uint16_t)((w >> 10) & 4095u);
+        }
+        p->op = op == 0x22 ? PVO_END : op == 0x21 ? PVO_JMP :
+                op == 0x24 ? PVO_CALL : op == 0x25 ? PVO_CALLZ :
+                op == 0x26 ? PVO_CALLNZ : op == 0x27 ? PVO_JMPC :
+                op == 0x28 ? PVO_JMPZ : op == 0x2c ? PVO_IFU : PVO_IFC;
+        return 0;
+    }
+    if (!mad && !(op == 0x00 || op == 0x01 || op == 0x02 || op == 0x03 ||
+                  op == 0x08 || op == 0x0b || op == 0x13 || op == 0x18 ||
+                  op == 0x09 || op == 0x0a || op == 0x0c || op == 0x0d ||
+                  op == 0x0e || op == 0x0f || op == 0x12 ||
+                  op == 0x1a || op == 0x1b || op == 0x2e || op == 0x2f))
+        return 1;                          /* PVO_GEN */
+    desc = w & (uint32_t)(mad ? 31 : 127);
+    if (desc >= vs_swizzle_size) return 1; /* GEN reports detail 2 */
+    rel = (w >> (mad ? 22 : 19)) & 3u;
+    p->msk = (uint8_t)(vs_swizzle[desc] & 15u);
+    p->sw_a = (uint16_t)(desc * 3u);
+    p->sw_b = (uint16_t)(desc * 3u + 1u);
+    p->sw_c = (uint16_t)(desc * 3u + 2u);
+    if (mad) {
+        pvs_plan_opnd(p, 0, (w >> 17) & 31u, 0);
+        pvs_plan_opnd(p, 1, inv ? ((w >> 12) & 31u) : ((w >> 10) & 127u),
+                      inv ? 0u : rel);
+        pvs_plan_opnd(p, 2, inv ? ((w >> 5) & 127u) : ((w >> 5) & 31u),
+                      inv ? rel : 0u);
+        dst = (w >> 24) & 31u;
+        p->op = PVO_MAD;
+    } else {
+        pvs_plan_opnd(p, 0, inv ? ((w >> 14) & 31u) : ((w >> 12) & 127u),
+                      inv ? 0u : rel);
+        pvs_plan_opnd(p, 1, inv ? ((w >> 7) & 127u) : ((w >> 7) & 31u),
+                      inv ? rel : 0u);
+        dst = (w >> 21) & 31u;
+        if (op == 0x01 || op == 0x02 || op == 0x03 || op == 0x18) {
+            p->op = PVO_DP;
+            p->dpn = (uint8_t)(op == 0x02 ? 4 : 3);
+            p->dph = (uint8_t)((op == 0x03 || op == 0x18) ? 1 : 0);
+        } else if (op == 0x2e || op == 0x2f) {
+            p->op = PVO_CMP;
+            p->cmp0 = (uint8_t)((w >> 24) & 7u);
+            p->cmp1 = (uint8_t)((w >> 21) & 7u);
+            return 0;                      /* no destination write */
+        } else {
+            p->op = op == 0x13 ? PVO_MOV : op == 0x00 ? PVO_ADD :
+                    op == 0x08 ? PVO_MUL : op == 0x0b ? PVO_FLR :
+                    op == 0x0c ? PVO_MAX : op == 0x0d ? PVO_MIN :
+                    op == 0x0e ? PVO_RCP : op == 0x0f ? PVO_RSQ :
+                    op == 0x12 ? PVO_MOVA :
+                    (op == 0x09 || op == 0x1a) ? PVO_SGE : PVO_SLT;
+        }
+    }
+    /* input[16] | temp[16] | output[16] are adjacent in PicaVsState:
+       dst < 16 selects output[dst] (offset 512 + 16*dst), else temp[dst-16]
+       (offset 16*dst). */
+    p->dst = (uint16_t)(dst < 16u ? 512u + dst * 16u : dst * 16u);
+    return 0;
+}
+static uint64_t pvs_plan_key(unsigned n) {
+    uint64_t h = 1469598103934665603ULL;
+    unsigned i;
+    for (i = 0; i < n; ++i) { h ^= vs_program[i]; h *= 1099511628211ULL; }
+    h ^= pvs_swz_fp; h *= 1099511628211ULL;
+    h ^= (uint64_t)n; h *= 1099511628211ULL;
+    h ^= (uint64_t)vs_swizzle_size; h *= 1099511628211ULL;
+    /* Everything else that changes the program's semantics: the input-register
+       mapping (0x2BB/0x2BC), the output mask (0x2BD), OUTMAP_TOTAL (0x4F) and
+       the packed attribute maps (0x50..0x56).  A mid-program guest write to
+       any of these changes the key, so the next draw builds a new entry. */
+    for (i = 0x2bbu; i <= 0x2bdu; ++i) { h ^= pica_regs[i]; h *= 1099511628211ULL; }
+    h ^= pica_regs[0x4fu]; h *= 1099511628211ULL;
+    for (i = 0; i < 7u; ++i) { h ^= pica_regs[0x50 + i]; h *= 1099511628211ULL; }
+    return h ? h : 1u;
+}
+/* Output-map scatter (also folded into the plan): the old per-vertex loop
+   walked the mask/maps with bitfield decoding and wrote every semantic id,
+   but pica_load_vertex only ever reads ids 0..15 (clip position, colour, two
+   uv pairs and the isfinite checks).  Build the (destination float, semantic)
+   pairs once per draw, in the same order, so the per-vertex cost is one copy
+   per mapped lane instead of a decode per lane, and only ids that are read
+   are copied at all. */
+static unsigned pvs_plan_scatter(PvsProg *g) {
+    unsigned packed = 0, mask = pica_regs[0x2bd] & 65535u,
+             attribs = pica_regs[0x4f] & 7u, reg, k, ns = 0;
+    for (reg = 0; reg < 16u && packed < attribs && packed < 7u; ++reg) {
+        if (!(mask & (1u << reg))) continue;
+        for (k = 0; k < 4u; ++k) {
+            unsigned id = (pica_regs[0x50 + packed] >> (8 * k)) & 31u;
+            if (id >= 16u || ns >= sizeof g->sc / sizeof g->sc[0]) continue;
+            g->sc[ns].off = (uint16_t)(512u + reg * 16u + k * 4u);
+            g->sc[ns].sem = (uint8_t)id;
+            ++ns;
+        }
+        ++packed;
+    }
+    g->nsc = ns;
+    return ns;
+}
+/* Build (or find) the plan for the program uploaded right now.  Runs once per
+   draw on the main thread, before the vertex pool is published. */
+static void pvs_plan_sync(void) {
+    unsigned n = vs_program_size, i;
+    uint64_t key, t0, tb = 0;
+    PvsProg *g = NULL;
+    int hit = 0;
+    if (pvs_plan_on < 0) {
+        const char *e = getenv("DQ8_VSPLAN");
+        pvs_plan_on = (e && e[0] == '0' && !e[1]) ? 0 : 1;
+    }
+    if (pvs_stats_on < 0) {
+        const char *e = getenv("DQ8_VSPLAN_STATS");
+        pvs_stats_on = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    pvs_plan_cur = NULL;
+    pvs_prog_cur = NULL;
+    if (!pvs_plan_on || !n) { pvs_plan_skipped++; return; }
+    /* The cost of a cache HIT is what the draw pays instead of a build: the key
+       hash over the program words (n FNV steps) plus one table compare.  It is
+       timed and reported (VSPLAN hit_us) so "a hit is free" is a measurement,
+       not a claim. */
+    t0 = pvs_stats_on ? pica_pqt_now_ns() : 0;
+    key = pvs_plan_key(n);
+    for (i = 0; i < (unsigned)pvs_nprog; ++i)
+        if (pvs_progs[i].key == key) { g = &pvs_progs[i]; hit = 1; break; }
+    if (hit) ++pvs_plan_hit_n;
+    if (!g) {
+        unsigned gen = 0;
+        PvsPlan *tab;
+        if (pvs_stats_on) tb = pica_pqt_now_ns();
+        if (pvs_nprog >= PVSP_MAX) {
+            /* Never evict: a rebuild costs more than it saves and the
+               interpreter is the reference path.  Counted, so a table that is
+               too small shows up in the report instead of in the frame rate. */
+            pvs_plan_skipped++;
+            return;
+        }
+        g = &pvs_progs[pvs_nprog];
+        tab = (PvsPlan *)malloc((size_t)n * sizeof *tab);
+        if (!tab) { pvs_plan_skipped++; return; }
+        for (i = 0; i < n; ++i) gen += (unsigned)pvs_plan_build_one(&tab[i], vs_program[i], i);
+        g->key = key;
+        g->n = n;
+        g->gen = gen;
+        g->tab = tab;
+        g->verts = 0;
+        /* The output-map scatter is a pure function of registers that are part
+           of the key (0x2BD mask, 0x4F count, 0x50..0x56 maps), so it is built
+           with the plan: a hit does no per-draw decode at all. */
+        pvs_plan_scatter(g);
+        ++pvs_nprog;
+        ++pvs_plan_build_n;
+        ++pvs_plan_progs_seen;
+        if (pvs_stats_on) {
+            uint64_t d = pica_pqt_now_ns() - tb;
+            if (d > pvs_plan_build_max_ns) pvs_plan_build_max_ns = d;
+            fprintf(stderr, "VSPLAN build prog=%d n=%u generic=%u key=%016llX\n",
+                    pvs_nprog - 1, n, gen, (unsigned long long)key);
+        }
+    }
+    pvs_plan_cur = g->tab;
+    pvs_prog_cur = g;
+    {   /* per-program vertex accounting: draw granularity on the main thread,
+           so the shared counters are never written from the pool */
+        unsigned cnt = pica_regs[0x228] & 0xffffu;
+        g->verts += cnt;
+        pvs_plan_used += cnt;
+    }
+    if (t0) {
+        uint64_t d = pica_pqt_now_ns() - t0;
+        if (hit) pvs_plan_hit_ns += d;
+        else pvs_plan_build_ns += d;
+    }
+}
+static void pvs_plan_report(void) {
+    if (pvs_stats_on)
+        fprintf(stderr, "VSPLAN programs=%d builds=%llu hits=%llu verts=%llu "
+                        "generic_exec=%llu skipped_draws=%llu hit_rate=%.4f%% "
+                        "hit_us=%.4f build_us=%.2f build_max_us=%.1f\n",
+                pvs_nprog, pvs_plan_build_n, pvs_plan_hit_n, pvs_plan_used,
+                pvs_gen_exec, pvs_plan_skipped,
+                (pvs_plan_hit_n + pvs_plan_build_n)
+                    ? 100.0 * (double)pvs_plan_hit_n /
+                      (double)(pvs_plan_hit_n + pvs_plan_build_n) : 0.0,
+                pvs_plan_hit_n ? (double)pvs_plan_hit_ns / 1e3 / (double)pvs_plan_hit_n : 0.0,
+                pvs_plan_build_n ? (double)pvs_plan_build_ns / 1e3 / (double)pvs_plan_build_n : 0.0,
+                (double)pvs_plan_build_max_ns / 1e3);
+    if (pvs_stats_on) {
+        Pvs4Cnt t;
+        pvs4_cnt_total(&t);
+        fprintf(stderr, "VS4 batches=%llu verts=%llu bail_div=%llu gate=%llu gen=%llu "
+                        "rel=%llu pc=%llu stack=%llu fallback=%llu\n",
+                t.batches, t.verts, t.bail_div, t.bail_gate, t.bail_gen,
+                t.bail_rel, t.bail_pc, t.bail_plan, t.scalar);
+        fprintf(stderr, "VS8 batches=%llu verts=%llu bail_div=%llu gate=%llu gen=%llu "
+                        "rel=%llu pc=%llu stack=%llu fallback=%llu rate=%.2f%%\n",
+                t.b8_batches, t.b8_verts, t.b8_div, t.b8_gate, t.b8_gen,
+                t.b8_rel, t.b8_pc, t.b8_plan, t.b8_fallback,
+                (t.b8_batches + t.b8_fallback)
+                    ? 100.0 * (double)t.b8_fallback /
+                      (double)(t.b8_batches + t.b8_fallback) : 0.0);
+    }
+}
 #endif /* __SSE4_1__ */
 static void pica_vs_source(PicaVsState *s, unsigned n, unsigned rel,
                            uint32_t sw, unsigned operand, float v[4]) {
@@ -618,6 +1035,14 @@ static unsigned pica_draw_log_nfdrop; /* rsn=7 nonfinite drops this draw (t_0746
 static unsigned pica_draw_log_arej;   /* alpha-test rejections this draw (t_074669f7) */
 static unsigned pica_draw_log_drej;   /* depth-test rejections this draw (t_074669f7) */
 static unsigned pica_draw_log_frw;    /* fragments written this draw (t_074669f7) */
+/* t_0bf6793d (DIAGNOSTIC): triangle winding tally for the current draw, so a
+   face-culling defect can be seen directly: fcw = signed area < 0 (the order
+   the rasterizer would have to reverse), fccw = signed area > 0. */
+static unsigned pica_draw_log_fcw, pica_draw_log_fccw;
+/* t_150574cd: face-culling accounting (triangles the GPUREG 0x40 filter kept
+   and dropped).  Defined here, in the same amalgamation TU as the runtime, so
+   the DQ8_TRACE_TEXDRAW / DQ8_TRACE_CULL dumps can print them. */
+static unsigned long long pica_cull_kept_tris, pica_cull_dropped_tris;
 static unsigned pica_thist[6]; /* triangle centroid buckets over sx (t_074669f7) */
 /* DQ8_TRACE_CLIPSTAT (t_da76454a): per-draw clip classification.  Where does a
    draw's geometry actually go?  Counts primitives that are fully inside the
@@ -648,9 +1073,28 @@ static void pica_clst_reset(void) {
     clst_fx0 = clst_fy0 = clst_cx0 = clst_cy0 = 1e30f;
     clst_fx1 = clst_fy1 = clst_cx1 = clst_cy1 = -1e30f;
 }
+/* t_fdc40e6f: one operand load from the prepared plan.  `addr` is either an
+   absolute pointer (uniform / constant-ones operand) or a byte offset from the
+   vertex state, and `smask` is all-ones for the latter, so the base select is
+   an AND+ADD instead of a branch. */
+static inline __m128 pvs_plan_ld(uintptr_t addr, const PvsSwzVec *w) {
+    __m128 v = _mm_loadu_ps((const float *)addr);
+    return _mm_xor_ps(_mm_castsi128_ps(_mm_shuffle_epi8(_mm_castps_si128(v), w->perm)),
+                      w->sign);
+}
 static int pica_execute_vs(PicaVsState *s) {
     struct {unsigned end, ret;} calls[16], branches[16];
     unsigned nc=0, nb=0, pc=pica_regs[0x2ba] & 65535, boundary=UINT32_MAX;
+    /* t_fdc40e6f: these four gates used to be re-read FROM GLOBALS for every
+       microcode instruction.  None of them can change during one vertex
+       (pvs_plan_cur / pvs_dec_ready are published by the main thread before
+       the pool job, pvs_trace is set per vertex in pica_load_vertex and the
+       two instrumentation switches are resolved once per process), so read
+       them once here.  `plan` is NULL while tracing, which keeps the trace
+       path on the interpreter that emits it. */
+    const int ghist = pvs_ghist_on > 0;
+    const int ptrap = pf_trap_on > 0;
+    const PvsPlan *plan = pvs_trace ? NULL : pvs_plan_now();
     for (unsigned step=0;step<16384;step++) {
         /* Scope ends compare the preceding instruction's sequential successor,
            so a branch on the last instruction cannot escape a call/if scope. */
@@ -662,9 +1106,177 @@ static int pica_execute_vs(PicaVsState *s) {
         if(nb && boundary==branches[nb-1].end)pc=branches[--nb].ret;
         if (pc>=vs_program_size) {pica_vs_fail_detail=0x01000000u|(pc&0xFFFFFFu);return 0;}
         boundary=pc+1;
-        if (pvs_ghist_on > 0) ++pvs_ghist_all;
-        if (pf_trap_on > 0) pf_vs_step();
-        if (pvs_dec_ready && !pvs_trace) {
+        if (ghist) ++pvs_ghist_all;
+        if (ptrap) pf_vs_step();
+        if (plan) {
+            /* t_fdc40e6f: prepared-plan dispatch.  Every operand address,
+               swizzle vector, destination offset, write mask and flow target
+               was resolved once per program (pvs_plan_sync); the per-vertex
+               loop does no bitfield decode and no register lookup. */
+            const PvsPlan *p = &plan[pc];
+            unsigned o = p->op;
+            if (o) {
+                if (o >= PVO_END) {
+                    uint32_t w = vs_program[pc];
+                    unsigned nx = pc + 1;
+                    if (o == PVO_END) { pvs_flow(pc, w, nx); return 1; }
+                    if (o == PVO_JMP) { pvs_flow(pc, w, nx); pc = nx; continue; }
+                    if (o <= PVO_JMPZ) {          /* 0x24..0x28 */
+                        unsigned target = p->tgt, nn = p->n;
+                        int yes;
+                        if (o == PVO_CALL) yes = 1;
+                        else if (o == PVO_CALLZ || o == PVO_JMPZ)
+                            yes = pica_vs_condition(s, w);
+                        else
+                            yes = (int)((pica_regs[0x2b0] >> p->idx) & 1);
+                        if (o <= PVO_CALLNZ) {    /* call type: 0x24..0x26 */
+                            if (yes) {
+                                if (nc == 16) { pica_vs_fail_detail = 0x03000000u; return 0; }
+                                calls[nc].end = target + nn;
+                                calls[nc++].ret = nx;
+                                nx = target;
+                            }
+                        } else if (yes) {         /* branch type: 0x27/0x28 */
+                            if (nb == 16) { pica_vs_fail_detail = 0x04000000u; return 0; }
+                            branches[nb].end = target;
+                            branches[nb++].ret = target + nn;
+                        } else nx = target;
+                        pvs_flow(pc, w, nx);
+                        pc = nx;
+                        continue;
+                    }
+                    {   /* 0x2C / 0x2D */
+                        int yes = (o == PVO_IFU)
+                            ? pica_vs_condition(s, w)
+                            : (((pica_regs[0x2b0] >> p->idx) & 1) == !(w & 1));
+                        pvs_flow(pc, w, yes ? p->tgt : nx);
+                        pc = yes ? p->tgt : nx;
+                        continue;
+                    }
+                }
+                {
+                    const uintptr_t SS = (uintptr_t)s;
+                    uintptr_t ma = (uintptr_t)0 - (uintptr_t)(p->flags & 1u);
+                    uintptr_t mb = (uintptr_t)0 - (uintptr_t)((p->flags >> 1) & 1u);
+                    uintptr_t mc = (uintptr_t)0 - (uintptr_t)((p->flags >> 2) & 1u);
+                    const PvsSwzVec *wa = &pvs_swzv[p->sw_a];
+                    const PvsSwzVec *wb = &pvs_swzv[p->sw_b];
+                    __m128 va, vb, vr;
+                    if (o == PVO_MOVA) {
+                        /* 0x12: no destination write, only address registers. */
+                        float al[4];
+                        unsigned k2;
+                        va = p->rel_a ? pvs_vec_apply(s, p->na, p->rel_a, wa)
+                                      : pvs_plan_ld(p->a + (SS & ma), wa);
+                        _mm_storeu_ps(al, va);
+                        for (k2 = 0; k2 < 2; k2++)
+                            if ((p->msk & (8 >> k2)) && isfinite(al[k2]) &&
+                                al[k2] >= -2147483648.0f && al[k2] < 2147483648.0f)
+                                s->address[k2] = (int)al[k2];
+                        pc = pc + 1u;
+                        continue;
+                    }
+                    if (o == PVO_CMP) {
+                        float al[4], bl[4];
+                        va = p->rel_a ? pvs_vec_apply(s, p->na, p->rel_a, wa)
+                                      : pvs_plan_ld(p->a + (SS & ma), wa);
+                        vb = p->rel_b ? pvs_vec_apply(s, p->nb, p->rel_b, wb)
+                                      : pvs_plan_ld(p->b + (SS & mb), wb);
+                        _mm_storeu_ps(al, va);
+                        _mm_storeu_ps(bl, vb);
+                        s->cc[0] = pica_vs_compare(al[0], bl[0], p->cmp0);
+                        s->cc[1] = pica_vs_compare(al[1], bl[1], p->cmp1);
+                        pc = pc + 1u;
+                        continue;
+                    }
+                    va = p->rel_a ? pvs_vec_apply(s, p->na, p->rel_a, wa)
+                                  : pvs_plan_ld(p->a + (SS & ma), wa);
+                    vb = p->rel_b ? pvs_vec_apply(s, p->nb, p->rel_b, wb)
+                                  : pvs_plan_ld(p->b + (SS & mb), wb);
+                    switch (o) {
+                    case PVO_MOV:
+                        vr = va;
+                        break;
+                    case PVO_ADD:
+                        vr = _mm_add_ps(va, vb);
+                        break;
+                    case PVO_MUL:
+                        vr = pvs_vec_mul(va, vb);
+                        break;
+                    case PVO_FLR:
+                        vr = _mm_floor_ps(va);
+                        break;
+                    case PVO_RCP: {
+                        /* same scalar expression as the interpreter, so the
+                           rounding is identical */
+                        float al[4];
+                        _mm_storeu_ps(al, va);
+                        vr = _mm_set1_ps(1.0f / al[0]);
+                        break;
+                    }
+                    case PVO_RSQ: {
+                        float al[4];
+                        _mm_storeu_ps(al, va);
+                        vr = _mm_set1_ps(1.0f / sqrtf(al[0]));
+                        break;
+                    }
+                    case PVO_MIN:
+                    case PVO_MAX: {
+                        float al[4], bl[4];
+                        unsigned k2;
+                        _mm_storeu_ps(al, va);
+                        _mm_storeu_ps(bl, vb);
+                        for (k2 = 0; k2 < 4; k2++)
+                            al[k2] = (o == PVO_MIN) ? fminf(al[k2], bl[k2])
+                                                    : fmaxf(al[k2], bl[k2]);
+                        vr = _mm_loadu_ps(al);
+                        break;
+                    }
+                    case PVO_SLT:
+                    case PVO_SGE: {
+                        float al[4], bl[4];
+                        unsigned k2;
+                        _mm_storeu_ps(al, va);
+                        _mm_storeu_ps(bl, vb);
+                        for (k2 = 0; k2 < 4; k2++)
+                            al[k2] = (o == PVO_SLT) ? (al[k2] < bl[k2])
+                                                    : (al[k2] >= bl[k2]);
+                        vr = _mm_loadu_ps(al);
+                        break;
+                    }
+                    case PVO_MAD: {
+                        __m128 vc = p->rel_c ? pvs_vec_apply(s, p->nc, p->rel_c,
+                                                             &pvs_swzv[p->sw_c])
+                                             : pvs_plan_ld(p->c + (SS & mc),
+                                                           &pvs_swzv[p->sw_c]);
+                        vr = _mm_add_ps(pvs_vec_mul(va, vb), vc);
+                        break;
+                    }
+                    default: {          /* PVO_DP: 0 + p0 + p1 + p2 [+ p3] [+ b3] */
+                        float p4[4], dot = 0.0f;
+                        _mm_storeu_ps(p4, pvs_vec_mul(va, vb));
+                        dot += p4[0]; dot += p4[1]; dot += p4[2];
+                        if (p->dpn == 4) dot += p4[3];
+                        if (p->dph) { float bl[4]; _mm_storeu_ps(bl, vb); dot += bl[3]; }
+                        vr = _mm_set1_ps(dot);
+                        break;
+                    }
+                    }
+                    {
+                        float *dp = (float *)((char *)s + p->dst);
+                        if (p->msk == 15u) _mm_storeu_ps(dp, vr);
+                        else {
+                            __m128 vm = pvs_wmask[p->msk];
+                            __m128 old = _mm_loadu_ps(dp);
+                            _mm_storeu_ps(dp, _mm_or_ps(_mm_and_ps(vm, vr),
+                                                        _mm_andnot_ps(vm, old)));
+                        }
+                    }
+                    pc = pc + 1u;
+                    continue;
+                }
+            }
+        } else if (pvs_dec_ready && !pvs_trace) {
             /* Pre-decoded dispatch (t_469b3d92): every field this instruction
                needs was classified once per program upload. */
             const PvsDec *d = &pvs_dec_tab[pc];
@@ -955,15 +1567,26 @@ static void pica_rgba(uint32_t packed,float c[4]) {
     for(unsigned k=0;k<4;k++)c[k]=((packed>>(8*k))&255)/255.0f;
 }
 static void pica_tev_source(unsigned source,const float primary[4],const float texture[4],
-                            const float previous[4],const float buffer[4],const float constant[4],float v[4]) {
-    const float *p=source==0?primary:source==3?texture:source==13?buffer:source==14?constant:source==15?previous:NULL;
+                            const float texture1[4],const float previous[4],
+                            const float buffer[4],const float constant[4],float v[4]) {
+    /* TEV source codes (Azahar regs_texturing.h TevStageConfig::Source):
+       0  primary color (the interpolated vertex color here; this runtime has
+          no fragment lighting, so 1 primary-fragment and 2 secondary-fragment
+          color stay 0 as they always have),
+       3/4/5 texture0/1/2, 13 previous buffer, 14 constant, 15 previous stage.
+       t_e216fc37: source 4 (texture1) used to fall through to 0.0 — the ground
+       "shadow/decal" draws cross-fade texture0 and texture1 by the vertex alpha
+       (stage 0: sources=03300043 mods=00000200 ops=00010004), so a bound unit-1
+       texture was multiplied in as black and the whole quad rendered black. */
+    const float *p = source==0 ? primary : source==3 ? texture : source==4 ? texture1
+                   : source==13 ? buffer : source==14 ? constant : source==15 ? previous : NULL;
     for(unsigned k=0;k<4;k++)v[k]=p?p[k]:0.0f;
 }
 static float pica_tev_op(unsigned op,float a,float b,float c) {
     switch(op) {case 0:return a;case 1:return a*b;case 2:return a+b;case 3:return a+b-0.5f;
     case 4:return a*c+b*(1-c);case 5:return a-b;case 8:return a*b+c;case 9:return fminf(a+b,1)*c;default:return 0;}
 }
-static void pica_tev(const float primary[4],const float texture[4],float out[4]) {
+static void pica_tev(const float primary[4],const float texture[4],const float texture1[4],float out[4]) {
     static const unsigned bases[6]={0xc0,0xc8,0xd0,0xd8,0xf0,0xf8};
     float previous[4],buffer[4],pending[4];
     memcpy(previous,primary,sizeof previous);pica_rgba(pica_regs[0xfd],buffer);memcpy(pending,buffer,sizeof buffer);
@@ -971,13 +1594,13 @@ static void pica_tev(const float primary[4],const float texture[4],float out[4])
         unsigned base=bases[stage];uint32_t sources=pica_regs[base],mods=pica_regs[base+1],ops=pica_regs[base+2];
         float constant[4],col[3][4],alpha[3];pica_rgba(pica_regs[base+3],constant);
         for(unsigned i=0;i<3;i++) {
-            float v[4];pica_tev_source((sources>>(4*i))&15,primary,texture,previous,buffer,constant,v);
+            float v[4];pica_tev_source((sources>>(4*i))&15,primary,texture,texture1,previous,buffer,constant,v);
             unsigned m=(mods>>(4*i))&15;
             for(unsigned k=0;k<3;k++) {
                 unsigned channel=m<2?k:m<4?3:m<6?0:m<10?1:2;
                 col[i][k]=(m&1)?1-v[channel]:v[channel];
             }
-            pica_tev_source((sources>>(16+4*i))&15,primary,texture,previous,buffer,constant,v);
+            pica_tev_source((sources>>(16+4*i))&15,primary,texture,texture1,previous,buffer,constant,v);
             m=(mods>>(12+4*i))&7;unsigned channel=m<2?3:(m/2-1);
             alpha[i]=(m&1)?1-v[channel]:v[channel];
         }
@@ -1189,14 +1812,119 @@ static void pica_write_fragment(int x,int y,const float source[4],float zw,float
     pica_put_pixel(x,my,result[0],result[1],result[2],result[3]);
     pica_rect_log(x,my,srcc,result);
 }
-static void pica_fragment(int x,int y,const float primary[4],float u,float v,float zw,float iwv) {
-    float texture[4]={0,0,0,0},source[4],dest[4],constant[4];
+/* ---- DQ8_TRACE_FRAGPX=x,y[;x,y...] per-fragment probe (t_e216fc37) -------
+   Prints the full per-fragment inputs and outputs (interpolated primary,
+   interpolated uv, the tex0 sample, the TEV result) for the listed RASTER
+   pixels, for every draw, with no per-draw limit.  DQ8_TRACE_LAYER's FRAG line
+   stops after 6 fragments per draw and only below x<240, so it cannot be
+   aimed at a pixel; this one can.  Inert (one cached getenv) when unset. */
+static int pica_fragpx_n;
+static int pica_fragpx_x[16], pica_fragpx_y[16];
+static unsigned pica_fragpx_printed;
+static void pica_fragpx_init(void) {
+    static int done;
+    const char *e;
+    if (done) return;
+    done = 1;
+    e = getenv("DQ8_TRACE_FRAGPX");
+    while (e && *e && pica_fragpx_n < 16) {
+        char *end;
+        long x = strtol(e, &end, 10);
+        if (end == e || *end != ',') break;
+        long y = strtol(end + 1, &end, 10);
+        pica_fragpx_x[pica_fragpx_n] = (int)x;
+        pica_fragpx_y[pica_fragpx_n] = (int)y;
+        pica_fragpx_n++;
+        e = end;
+        while (*e == ' ' || *e == ';' || *e == ',') e++;
+    }
+}
+static int pica_fragpx_hit(int x, int y) {
+    pica_fragpx_init();
+    for (int i = 0; i < pica_fragpx_n; i++)
+        if (pica_fragpx_x[i] == x && pica_fragpx_y[i] == y) return 1;
+    return 0;
+}
+/* Does any TEV stage read texture unit 1 / 2 (source code 4 / 5)?  The answer
+   is constant per draw, so pica_fragment() caches it and skips the second
+   sampler call for the (majority of) draws that never touch unit 1. */
+static int pica_tev_reads_texunit(unsigned unit) {
+    static const unsigned bases[6] = {0xc0,0xc8,0xd0,0xd8,0xf0,0xf8};
+    unsigned code = unit == 1u ? 4u : 5u;
+    for (unsigned s = 0; s < 6; ++s) {
+        static const unsigned nib[6] = {0,1,2,4,5,6}; /* color1-3, alpha1-3 */
+        uint32_t sources = pica_regs[bases[s]];
+        for (unsigned i = 0; i < 6; ++i)
+            if (((sources >> (4u * nib[i])) & 15u) == code) return 1;
+    }
+    return 0;
+}
+/* DQ8_TEV_TEX1 (default on): sample texture unit 1 for TEV source 4.  =0
+   restores the pre-fix behaviour (source 4 reads 0.0), i.e. the black ground
+   quad, so the A/B runs can use ONE binary and cannot differ by build. */
+static int pica_tev_tex1_gate = -1;
+static int pica_tev_tex1_on(void) {
+    if (pica_tev_tex1_gate < 0) {
+        const char *e = getenv("DQ8_TEV_TEX1");
+        pica_tev_tex1_gate = !(e && e[0] == '0');
+    }
+    return pica_tev_tex1_gate;
+}
+/* DQ8_GL_TEV_TEX1 (default OFF): also make the GL backend REFUSE draws whose
+   TEV chain reads texture unit 1/2 and rasterize them in software.  Off by
+   default: the software draw does not survive the deferred GL episode
+   write-back yet (the ground then shows the sky colour), so the GL renderer
+   keeps its previous output instead of trading one artifact for another.
+   t_e216fc37 §5. */
+static int pica_gl_tev_tex1_gate = -1;
+static int pica_gl_tev_tex1_on(void) {
+    if (pica_gl_tev_tex1_gate < 0) {
+        const char *e = getenv("DQ8_GL_TEV_TEX1");
+        pica_gl_tev_tex1_gate = (e && e[0] && e[0] != '0');
+    }
+    return pica_gl_tev_tex1_gate;
+}
+static int pica_fragpx_in(int lx, int ly, int hx, int hy) {
+    pica_fragpx_init();
+    for (int i = 0; i < pica_fragpx_n; i++)
+        if (pica_fragpx_x[i] >= lx && pica_fragpx_x[i] <= hx &&
+            pica_fragpx_y[i] >= ly && pica_fragpx_y[i] <= hy) return 1;
+    return 0;
+}
+static void pica_fragment(int x,int y,const float primary[4],float u,float v,
+                          float u1,float v1,float zw,float iwv) {
+    float texture[4]={0,0,0,0},texture1[4]={0,0,0,0},source[4],dest[4],constant[4];
     uint8_t tr=0,tg=0,tb=0,ta=0;
+    uint8_t t1r=0,t1g=0,t1b=0,t1a=0;
+    static uint64_t frag_u1_draw = ~0ull;
+    static int frag_u1_ref;
     if((pica_regs[0x80]&1) && pica_sample_tex0(u,v,&tr,&tg,&tb,&ta)) {
         texture[0]=tr/255.0f;texture[1]=tg/255.0f;texture[2]=tb/255.0f;texture[3]=ta/255.0f;
     }
-    pica_tev(primary,texture,source);
+    /* Texture unit 1 (TEV source 4, sampled with texcoord1).  Only when the
+       unit is enabled AND some stage actually reads it: the second sampler
+       call is not free and almost no draw uses it. */
+    if (frag_u1_draw != pica_draw_count) {
+        frag_u1_draw = pica_draw_count;
+        frag_u1_ref = pica_tev_reads_texunit(1u);
+    }
+    if (frag_u1_ref && pica_tev_tex1_on() && (pica_regs[0x80]&2u) &&
+        pica_sample_tex1(u1,v1,&t1r,&t1g,&t1b,&t1a)) {
+        texture1[0]=t1r/255.0f;texture1[1]=t1g/255.0f;
+        texture1[2]=t1b/255.0f;texture1[3]=t1a/255.0f;
+    }
+    pica_tev(primary,texture,texture1,source);
     pica_draw_tev_a=source[3];
+    if (pica_fragpx_hit(x,y) && pica_fragpx_printed < 400u) {
+        ++pica_fragpx_printed;
+        fprintf(stderr, "FRAGPX t=%.2f draw=%llu px=%d,%d uv=%.6f,%.6f uv1=%.6f,%.6f "
+                "tex=%u,%u,%u,%u tex1=%u,%u,%u,%u "
+                "pri=%.4f,%.4f,%.4f,%.4f tev=%.4f,%.4f,%.4f,%.4f\n",
+                dq8_layer_t(), (unsigned long long)pica_draw_count, x, y, u, v, u1, v1,
+                tr, tg, tb, ta, t1r, t1g, t1b, t1a,
+                primary[0], primary[1], primary[2], primary[3],
+                source[0], source[1], source[2], source[3]);
+    }
     { /* t_074669f7: trace first few fragments per draw to diagnose terrain invisibility */
         static unsigned frag_trace_draw, frag_trace_n;
         static int frag_trace_on = -1; /* t_bc6b4eb7: getenv out of the
@@ -1217,7 +1945,7 @@ static void pica_fragment(int x,int y,const float primary[4],float u,float v,flo
     }
     pica_write_fragment(x,y,source,zw,iwv);
 }
-typedef struct {float x,y,iw,zw,color[4],u,v,cx,cy,cz,cw;} PicaVertex;
+typedef struct {float x,y,iw,zw,color[4],u,v,u1,v1,cx,cy,cz,cw;} PicaVertex;
 /* pica_flush_triangles() memcpy's sizeof(PicaGlVertex) bytes out of a
    PicaVertex, so the two structs MUST stay layout-identical field for field.
    They did not (PicaGlVertex lacked zw) which shifted color/u/v by one float
@@ -1228,7 +1956,9 @@ _Static_assert(sizeof(PicaGlVertex) == sizeof(PicaVertex),
 _Static_assert(offsetof(PicaGlVertex, iw) == offsetof(PicaVertex, iw) &&
                offsetof(PicaGlVertex, color) == offsetof(PicaVertex, color) &&
                offsetof(PicaGlVertex, u) == offsetof(PicaVertex, u) &&
-               offsetof(PicaGlVertex, v) == offsetof(PicaVertex, v),
+               offsetof(PicaGlVertex, v) == offsetof(PicaVertex, v) &&
+               offsetof(PicaGlVertex, u1) == offsetof(PicaVertex, u1) &&
+               offsetof(PicaGlVertex, v1) == offsetof(PicaVertex, v1),
                "PicaGlVertex field offsets must match PicaVertex");
 static float pica_edge(const PicaVertex *a,const PicaVertex *b,float x,float y) {
     return (b->x-a->x)*(y-a->y)-(b->y-a->y)*(x-a->x);
@@ -1251,6 +1981,57 @@ static float pica_edge_canon(const PicaVertex *u,const PicaVertex *v,float x,flo
 static int pica_edge_in(float e,const PicaVertex *a,const PicaVertex *b) {
     return e>0 || (e==0 && (b->y>a->y || (b->y==a->y && b->x<a->x)));
 }
+/* ---- PICA face culling: GPUREG_FACECULLING_CONFIG (register 0x40) -------
+   t_150574cd.  The guest selects which screen-space winding the rasterizer
+   keeps; neither backend read this register before, so every triangle was
+   rewound by pica_raster_triangle() and drawn, including the back faces the
+   hardware drops (the cape's inner/outline shell painted over the front one).
+
+   Register layout (Azahar RasterizerRegs, first field of the block that also
+   holds viewport_size_x at 0x41, so the register index is the raw command
+   index): bits 0-1 = cull mode
+       0 KeepAll 1 KeepClockWise 2 KeepCounterClockWise 3 KeepAll2.
+
+   Reference semantics (azahar-master renderer_software/sw_rasterizer.cpp:246):
+       KeepAll/KeepAll2     -> keep both sides (normalised to the positive
+                               winding, hence the rewind),
+       KeepClockWise        -> reverse and draw, i.e. keep area <  0,
+       KeepCounterClockWise -> cull `SignedArea(v0,v1,v2) <= 0`, keep area > 0.
+   `area` here is pica_edge(&a,&b,c), bit-for-bit the value the rasteriser's
+   own rewind test uses, and the screen coordinates are produced by the same
+   viewport transform Azahar uses (v = (c/w + 1)*halfsize + corner, y down),
+   so Azahar's SignedArea convention applies unchanged.
+
+   Applied in pica_queue_triangle(), i.e. on every triangle that actually
+   reaches a backend: the clip stage fans straddling primitives into it too,
+   exactly like Azahar (clipping in AddTriangle, culling in ProcessTriangle).
+   Both backends therefore receive an identical triangle set - the software
+   rasteriser directly, the GL backend (which rasterises these same triangles
+   in its fragment shader) through pica_tri_buf.
+
+   Knobs: DQ8_CULL=0 disables the filter (pre-change behaviour, for A/B);
+   DQ8_CULL_FLIP=1 inverts the winding test - a diagnostic used to prove the
+   sign against a reference capture, not a shipping option. */
+static int pica_cull_gate = -1, pica_cull_flip;
+static int pica_cull_on(void) {
+    if (pica_cull_gate < 0) {
+        const char *e = getenv("DQ8_CULL");
+        const char *f = getenv("DQ8_CULL_FLIP");
+        pica_cull_gate = !(e && e[0] == '0');
+        pica_cull_flip = (f && f[0] && f[0] != '0');
+    }
+    return pica_cull_gate;
+}
+/* 1 = this triangle is drawn, 0 = the guest's cull mode drops it. */
+static int pica_cull_keep(float area) {
+    unsigned mode;
+    int ccw;
+    if (!pica_cull_on()) return 1;
+    mode = pica_regs[0x40] & 3u;
+    if (mode != 1u && mode != 2u) return 1;   /* KeepAll / KeepAll2 */
+    ccw = pica_cull_flip ? (area < 0.0f) : (area > 0.0f);
+    return (mode == 2u) ? ccw : !ccw;
+}
 static void pica_raster_triangle(PicaVertex a,PicaVertex b,PicaVertex c) {
     float area=pica_edge(&a,&b,c.x,c.y);
     if(!isfinite(area) || fabsf(area)<1e-7f)return;
@@ -1271,6 +2052,24 @@ static void pica_raster_triangle(PicaVertex a,PicaVertex b,PicaVertex c) {
     }
     pica_bb_add(lx,ly); pica_bb_add(hx,hy);
     pica_db_add(lx,ly); pica_db_add(hx,hy);
+    if (pica_fragpx_in(lx,ly,hx,hy)) {
+        static uint64_t fv_draw;
+        static unsigned fv_n, fv_total;
+        if (fv_draw != pica_draw_count) { fv_draw = pica_draw_count; fv_n = 0; }
+        if (fv_n < 8u && fv_total < 200u) {
+            ++fv_n; ++fv_total;
+            fprintf(stderr, "FRAGVTX t=%.2f draw=%llu area=%.4f "
+                    "a=(%.2f,%.2f u=%.6f,%.6f c=%.3f,%.3f,%.3f,%.3f) "
+                    "b=(%.2f,%.2f u=%.6f,%.6f c=%.3f,%.3f,%.3f,%.3f) "
+                    "c=(%.2f,%.2f u=%.6f,%.6f c=%.3f,%.3f,%.3f,%.3f) "
+                    "iw=%.6g,%.6g,%.6g\n",
+                    dq8_layer_t(), (unsigned long long)pica_draw_count, area,
+                    a.x,a.y,a.u,a.v,a.color[0],a.color[1],a.color[2],a.color[3],
+                    b.x,b.y,b.u,b.v,b.color[0],b.color[1],b.color[2],b.color[3],
+                    c.x,c.y,c.u,c.v,c.color[0],c.color[1],c.color[2],c.color[3],
+                    a.iw,b.iw,c.iw);
+        }
+    }
     /* DQ8_TRACE_PX: nearest distance from each probe to this triangle's edge
        lines — a probe sitting ON a triangle edge (seam candidate) gets ~0. */
     pica_px_init();
@@ -1292,7 +2091,7 @@ static void pica_raster_triangle(PicaVertex a,PicaVertex b,PicaVertex c) {
     int constant_color=!(pica_regs[0x80]&7) &&
         !memcmp(a.color,b.color,sizeof a.color) && !memcmp(a.color,c.color,sizeof a.color);
     float solid[4];
-    if(constant_color) {const float zero[4]={0};pica_tev(a.color,zero,solid);pica_draw_tev_a=solid[3];}
+    if(constant_color) {const float zero[4]={0};pica_tev(a.color,zero,zero,solid);pica_draw_tev_a=solid[3];}
     for(int y=ly;y<=hy;y++)for(int x=lx;x<=hx;x++) {
         float e0=pica_edge_canon(&b,&c,x+0.5f,y+0.5f),e1=pica_edge_canon(&c,&a,x+0.5f,y+0.5f),e2=pica_edge_canon(&a,&b,x+0.5f,y+0.5f);
         if(!pica_edge_in(e0,&b,&c)||!pica_edge_in(e1,&c,&a)||!pica_edge_in(e2,&a,&b))continue;
@@ -1307,7 +2106,8 @@ static void pica_raster_triangle(PicaVertex a,PicaVertex b,PicaVertex c) {
         { float lsum=e0+e1+e2;
           float zwl=lsum!=0.0f?(e0*a.zw+e1*b.zw+e2*c.zw)/lsum:a.zw;
           float iwl=lsum!=0.0f?(e0*a.iw+e1*b.iw+e2*c.iw)/lsum:a.iw;
-          pica_fragment(x,y,color,w0*a.u+w1*b.u+w2*c.u,w0*a.v+w1*b.v+w2*c.v,zwl,iwl); }
+          pica_fragment(x,y,color,w0*a.u+w1*b.u+w2*c.u,w0*a.v+w1*b.v+w2*c.v,
+                        w0*a.u1+w1*b.u1+w2*c.u1,w0*a.v1+w1*b.v1+w2*c.v1,zwl,iwl); }
     }
 }
 /* ---- DQ8_TRACE_VSDUMP: full VS-state + per-instruction trace (t_664244f9
@@ -1700,79 +2500,28 @@ static void pica_vs_attr_fill(PicaVsAttr *attr) {
 static void pica_vs_attr_ensure(void) {
     if (!pica_vs_attr_ready) { pica_vs_attr_fill(pica_vs_attr); pica_vs_attr_ready = 1; }
 }
-static int pica_load_vertex(uint32_t base,uint32_t index,PicaVertex *v) {
-    PicaVsAttr local_attr[12], *attr;
-    uint64_t pf_a0 = pf_trap_armed() ? pica_pqt_now_ns() : 0;
-    pica_vs_fail_reason=0;pica_vs_fail_detail=0;
-    if (pica_vsfast < 0) {
-        const char *e = getenv("DQ8_VSFAST");
-        pica_vsfast = (e && e[0] == '0' && !e[1]) ? 0 : 1;
-    }
-    if (pica_vsfast) {
-        pica_vs_attr_ensure();   /* t_968a1fa9: one builder, not five racers */
-        attr = pica_vs_attr;
-    } else {
-        pica_vs_attr_fill(local_attr);
-        attr = local_attr;
-    }
-    PicaVsState s={0};unsigned max=(pica_regs[0x2b9]&15);
-    if(max>=12){pica_vs_fail_reason=2;pica_vs_fail_detail=max;return 0;}
-    for(unsigned i=0;i<=max;i++) {
-        float value[4]={0,0,0,1};
-        if(pica_regs[0x202]&(1u<<(16+i)))memcpy(value,vs_default_attrib[i],sizeof value);
-        else {
-            if(!attr[i].valid){pica_vs_fail_reason=3;pica_vs_fail_detail=i;return 0;}
-            uint64_t address=(uint64_t)base+attr[i].off+(uint64_t)index*attr[i].stride;uint32_t mapped;
-            if(address>UINT32_MAX || !guest_memory_range((uint32_t)address,attr[i].bytes*attr[i].n,&mapped)){pica_vs_fail_reason=4;pica_vs_fail_detail=i;return 0;}
-            for(unsigned k=0;k<attr[i].n;k++) {
-                const uint8_t *p=ram+mapped+k*attr[i].bytes;
-                if(attr[i].type==3)memcpy(&value[k],p,4);
-                else if(attr[i].type==2) {int16_t n;memcpy(&n,p,2);value[k]=n;}
-                else value[k]=attr[i].type==1?(float)*p:(float)(int8_t)*p;
-            }
-        }
-        unsigned reg=(pica_regs[i<8?0x2bb:0x2bc]>>(4*(i<8?i:i-8)))&15;
-        memcpy(s.input[reg],value,sizeof value);
-    }
-    pvs_trace = (pvs_f && pvs_vert < pvs_max_vert) ? 1u : 0u;
-    if (pvs_f && pvs_trace) {
-        unsigned i, k;
-        fprintf(pvs_f, "VSVERTEX idx=%u base=%08X\n", index, base);
-        fprintf(pvs_f, "VSATTRCFG");
-        for (i = 0; i < 12; i++)
-            fprintf(pvs_f, " %u:o=%08X,s=%u,n=%u,b=%u,t=%u,v=%u", i,
-                    attr[i].off, attr[i].stride, attr[i].n, attr[i].bytes,
-                    attr[i].type, attr[i].valid);
-        fprintf(pvs_f, "\n");
-        for (i = 0; i < 16; i++) {
-            fprintf(pvs_f, "VSIN %u", i);
-            for (k = 0; k < 4; k++) fprintf(pvs_f, " %+.9g", s.input[i][k]);
-            fprintf(pvs_f, "\n");
-        }
-    }
-    if (pf_a0) pf_shim(PF_SH_ATTR, pica_pqt_now_ns() - pf_a0);
-    if(!pica_execute_vs(&s)){pica_vs_fail_reason=5;return 0;}
-    if (pf_a0) pf_shim(PF_SH_VSEXEC, pica_pqt_now_ns() - pf_a0);
-    /* Hardware output mapping (azahar output_vertex.cpp + shader_unit.cpp
-       WriteOutput, GPUREG_SH_OUTMAP_*): the 0x2BD output mask PACKS the set VS
-       output registers into compact order; then GPUREG_SH_OUTMAP_TOTAL (0x4F)
-       packed attributes are mapped to semantic slots through the maps at
-       0x50+attrib.  Slots the map does not cover read as ONE on hardware
-       ("Attributes can be used without being set ... initialized to 1") —
-       NOT zero.  t_07e30915: the old code consumed a map entry for every set
-       mask bit and zero-filled unmapped slots, which both mis-mapped shaders
-       where popcount(mask) != OUTMAP_TOTAL (a stale Oi entry could overwrite
-       POSITION_W with garbage — the all-clipped character batches) and turned
-       w=1 pass-through shaders into w=0 draw-everything-clipped. */
+/* t_fdc40e6f: the output-map scatter, the finite checks and the projection
+   of pica_load_vertex, split out so the 4-lane batch can finish four
+   vertices with exactly this code (semantics unchanged). */
+static int pica_vs_finish(PicaVsState *s, PicaVertex *v) {
     float semantic[32];unsigned k;
     for(k=0;k<32;k++)semantic[k]=1.0f;
-    {
+    if (pvs_plan_now() && pvs_prog_now()) {
+        /* t_fdc40e6f: the output mask/map decode is done once per draw
+           (pvs_plan_scatter), so this is a copy per mapped lane.  pica_load_vertex
+           reads ids 0..15 only (clip position, colour, two uv pairs, and the
+           isfinite checks on 0..3), so ids >= 16 are not copied at all. */
+        const PvsProg *pg = pvs_prog_now();
+        for (k = 0; k < pg->nsc; ++k)
+            semantic[pg->sc[k].sem] =
+                *(const float *)((const char *)s + pg->sc[k].off);
+    } else {
         unsigned packed=0,mask=pica_regs[0x2bd]&65535u,attribs=pica_regs[0x4f]&7u,reg;
         for(reg=0;reg<16 && packed<attribs && packed<7u;reg++) {
             if(!(mask&(1u<<reg)))continue;
             for(k=0;k<4;k++) {
                 unsigned id=(pica_regs[0x50+packed]>>(8*k))&31;
-                if(id<31)semantic[id]=s.output[reg][k];
+                if(id<31)semantic[id]=s->output[reg][k];
             }
             packed++;
         }
@@ -1781,7 +2530,7 @@ static int pica_load_vertex(uint32_t base,uint32_t index,PicaVertex *v) {
         unsigned r, k;
         for (r = 0; r < 16; r++) {
             fprintf(pvs_f, "VSOUT %u", r);
-            for (k = 0; k < 4; k++) fprintf(pvs_f, " %+.9g", s.output[r][k]);
+            for (k = 0; k < 4; k++) fprintf(pvs_f, " %+.9g", s->output[r][k]);
             fprintf(pvs_f, "\n");
         }
         fprintf(pvs_f, "VSSEM");
@@ -1794,12 +2543,17 @@ static int pica_load_vertex(uint32_t base,uint32_t index,PicaVertex *v) {
     if(!isfinite(semantic[0])||!isfinite(semantic[1])||!isfinite(semantic[2])||!isfinite(semantic[3])){pica_vs_fail_reason=7;memcpy(&pica_vs_fail_detail,&semantic[3],4);return 0;}
     v->cx=semantic[0];v->cy=semantic[1];v->cz=semantic[2];v->cw=semantic[3];
     memcpy(v->color,semantic+8,sizeof v->color);v->u=semantic[12];v->v=semantic[13];
+    v->u1=semantic[14];v->v1=semantic[15];
     if(semantic[3]<=PICA_W_EPS) {
         /* Clip-invalid position (w at/behind the eye plane): keep the
            clip-space position and let the primitive clipper cut the triangle
            at the w=EPSILON plane like the hardware (t_0b95f1a7).  The screen
            fields are derived after clipping. */
-        ++pica_vs_fail_totals[6];
+        /* t_e1773c51: this runs on every participant for every clipped vertex,
+           so it was a cross-worker RMW on one global word (lost counts, and a
+           cache line bouncing between 8 cores).  Relaxed add: the value is a
+           diagnostic total, the ordering does not matter. */
+        __atomic_add_fetch(&pica_vs_fail_totals[6], 1ull, __ATOMIC_RELAXED);
         if (pvs_f && pvs_proj_trace) {
             pvs_proj_trace = 0;
             fprintf(pvs_f, "VSPROJ clipped hw=%+.9g hh=%+.9g xoff=%u yoff=%u\n",
@@ -1841,6 +2595,734 @@ static int pica_load_vertex(uint32_t base,uint32_t index,PicaVertex *v) {
     if(v->y>1e6f)v->y=1e6f;else if(v->y<-1e6f)v->y=-1e6f;
     return 1;
 }
+
+/* t_fdc40e6f: the attribute-fetch half of pica_load_vertex, split out so four
+   vertices can be fetched and then executed together.  Same checks, same fail
+   codes, same order as the original in-line code. */
+static int pica_vs_fetch(uint32_t base, uint32_t index, PicaVsAttr *attr,
+                         PicaVsState *s) {
+    unsigned max = (pica_regs[0x2b9] & 15);
+    if (max >= 12) { pica_vs_fail_reason = 2; pica_vs_fail_detail = max; return 0; }
+    for (unsigned i = 0; i <= max; i++) {
+        float value[4] = {0, 0, 0, 1};
+        if (pica_regs[0x202] & (1u << (16 + i))) memcpy(value, vs_default_attrib[i], sizeof value);
+        else {
+            if (!attr[i].valid) { pica_vs_fail_reason = 3; pica_vs_fail_detail = i; return 0; }
+            uint64_t address = (uint64_t)base + attr[i].off + (uint64_t)index * attr[i].stride;
+            uint32_t mapped;
+            if (address > UINT32_MAX ||
+                !guest_memory_range((uint32_t)address, attr[i].bytes * attr[i].n, &mapped)) {
+                pica_vs_fail_reason = 4; pica_vs_fail_detail = i; return 0;
+            }
+            for (unsigned k = 0; k < attr[i].n; k++) {
+                const uint8_t *p = ram + mapped + k * attr[i].bytes;
+                if (attr[i].type == 3) memcpy(&value[k], p, 4);
+                else if (attr[i].type == 2) { int16_t n; memcpy(&n, p, 2); value[k] = n; }
+                else value[k] = attr[i].type == 1 ? (float)*p : (float)(int8_t)*p;
+            }
+        }
+        unsigned reg = (pica_regs[i < 8 ? 0x2bb : 0x2bc] >> (4 * (i < 8 ? i : i - 8))) & 15;
+        memcpy(s->input[reg], value, sizeof value);
+    }
+    return 1;
+}
+
+static int pica_load_vertex(uint32_t base,uint32_t index,PicaVertex *v) {
+    PicaVsAttr local_attr[12], *attr;
+    uint64_t pf_a0 = pf_trap_armed() ? pica_pqt_now_ns() : 0;
+    PicaVsState s;
+    pica_vs_fail_reason=0;pica_vs_fail_detail=0;
+    if (pica_vsfast < 0) {
+        const char *e = getenv("DQ8_VSFAST");
+        pica_vsfast = (e && e[0] == '0' && !e[1]) ? 0 : 1;
+    }
+    if (pica_vsfast) {
+        pica_vs_attr_ensure();   /* t_968a1fa9: one builder, not five racers */
+        attr = pica_vs_attr;
+    } else {
+        pica_vs_attr_fill(local_attr);
+        attr = local_attr;
+    }
+    memset(&s, 0, sizeof s);
+    if (!pica_vs_fetch(base, index, attr, &s)) return 0;
+    pvs_trace = (pvs_f && pvs_vert < pvs_max_vert) ? 1u : 0u;
+    if (pvs_f && pvs_trace) {
+        unsigned i, k;
+        fprintf(pvs_f, "VSVERTEX idx=%u base=%08X\n", index, base);
+        fprintf(pvs_f, "VSATTRCFG");
+        for (i = 0; i < 12; i++)
+            fprintf(pvs_f, " %u:o=%08X,s=%u,n=%u,b=%u,t=%u,v=%u", i,
+                    attr[i].off, attr[i].stride, attr[i].n, attr[i].bytes,
+                    attr[i].type, attr[i].valid);
+        fprintf(pvs_f, "\n");
+        for (i = 0; i < 16; i++) {
+            fprintf(pvs_f, "VSIN %u", i);
+            for (k = 0; k < 4; k++) fprintf(pvs_f, " %+.9g", s.input[i][k]);
+            fprintf(pvs_f, "\n");
+        }
+    }
+    if (pf_a0) pf_shim(PF_SH_ATTR, pica_pqt_now_ns() - pf_a0);
+    if(!pica_execute_vs(&s)){pica_vs_fail_reason=5;return 0;}
+    if (pf_a0) pf_shim(PF_SH_VSEXEC, pica_pqt_now_ns() - pf_a0);
+    return pica_vs_finish(&s, v);
+}
+
+/* ---- t_fdc40e6f step 2: four vertices per pass over the plan -------------
+   The VS is independent per vertex, so four consecutive vertices run through
+   the plan TOGETHER: one pass over the instruction list, with component c of
+   the four vertices packed into one __m128 lane vector.  The flat register
+   block is 48 registers (input 0..15, temp 16..31, output 32..47 -- the plan
+   already addresses registers by byte offset >> 4), each with 4 component
+   vectors.
+
+   Divergence: the four lanes share one pc, so every flow instruction is
+   evaluated for all four; if they disagree the batch is abandoned BEFORE
+   anything is written back and the caller re-runs those four vertices on the
+   scalar plan path.  The same fallback covers PVO_GEN, relative uniform
+   addressing, stack overflow, a pc out of range and the instrumentation
+   gates -- the batch never silently changes a result.
+
+   DQ8_VS4=0 disables it; counters in the VSPLAN report. */
+#define PVS4_NREG 48
+typedef struct { __m128 c[PVS4_NREG][4]; } PvsSoa;
+static inline int pvs4_cond(const int cc[4][2], unsigned lane, uint32_t w) {
+    int x = cc[lane][0] == (int)((w >> 25) & 1), y = cc[lane][1] == (int)((w >> 24) & 1);
+    switch ((w >> 22) & 3) { case 0: return x || y; case 1: return x && y; case 2: return x; default: return y; }
+}
+/* Operand fetch for four lanes.  `addr` is the plan's operand word: a byte
+   offset into the vertex state (flag set) or an absolute uniform pointer.
+   The swizzle is applied per component (its pshufb perm bytes are the source
+   component index times 4), so no cross-lane shuffle is needed. */
+static inline void pvs4_swz(const PvsSoa *o, uintptr_t addr, unsigned flag,
+                            unsigned rel, int nreg, unsigned swi,
+                            const int addrv[4][3], __m128 out[4]) {
+    const PvsSwzVec *w = &pvs_swzv[swi];
+    unsigned char pm[16];
+    unsigned c, lane;
+    /* Negate-SWIZZLE ("sign").  pvs_swzv[].sign holds -0.0f for a negated
+       operand -- exactly the mask the scalar pvs_vec_apply() xors in -- so it
+       is xored in directly.  The previous code rebuilt the mask from the float
+       with a cast, and `(unsigned)-0.0f == 0`, so every negated swizzle in a
+       batched program was silently dropped: a-b became |a|+|b|.  That is the
+       whole 792-mismatch field defect (uv/uv1 wrong, clip position right, only
+       on the programs that use a negate swizzle AND got batched). */
+    _mm_storeu_si128((__m128i *)pm, w->perm);
+    if (rel && nreg >= 32) {
+        /* Relative uniform addressing (MOVA): the bank index is per vertex.
+           Same arithmetic as pvs_vec_src -> pvs_vec_apply (unsigned wrap, the
+           [-128,127] clamp and the 96-slot/ones boundary), evaluated per lane
+           and transposed into component vectors -- bit-identical to the scalar
+           helper by construction.  `nreg < 32` means the plan named a state
+           register (input/temp), and the scalar helper ignores the rel bits for
+           those (pvs_vec_src tests n<16 / n<32 before it looks at rel), so they
+           are ignored here too. */
+        float t[4][4];
+        for (lane = 0; lane < 4; ++lane) {
+            int off = addrv[lane][rel - 1];
+            unsigned ix = (unsigned)(nreg - 32);
+            const float *src;
+            __m128 v;
+            float tv[4];
+            if (off < -128 || off > 127) off = 0;
+            ix = (ix + (unsigned)off) & 127u;
+            src = ix < 96u ? vs_uniform_f[ix] : pvs_ones_f;
+            v = _mm_loadu_ps(src);
+            v = _mm_xor_ps(_mm_castsi128_ps(_mm_shuffle_epi8(_mm_castps_si128(v), w->perm)),
+                           w->sign);
+            _mm_storeu_ps(tv, v);
+            for (c = 0; c < 4; ++c) t[c][lane] = tv[c];
+        }
+        for (c = 0; c < 4; ++c) out[c] = _mm_loadu_ps(t[c]);
+    } else if (flag) {
+        const __m128 *rb = o->c[(unsigned)(addr >> 4)];
+        for (c = 0; c < 4; ++c)
+            out[c] = _mm_xor_ps(rb[pm[c * 4] >> 2], w->sign);
+    } else {
+        const float *u = (const float *)addr;
+        for (c = 0; c < 4; ++c)
+            out[c] = _mm_xor_ps(_mm_set1_ps(u[pm[c * 4] >> 2]), w->sign);
+    }
+}
+static int pica_execute_vs4(PicaVsState *const st[4]) {
+    struct { unsigned end, ret; } calls[16], branches[16];
+    unsigned nc = 0, nb = 0, pc = pica_regs[0x2ba] & 65535, boundary = UINT32_MAX;
+    const PvsPlan *plan;
+    PvsSoa soa;
+    PvsSoa *o = &soa;
+    int cc[4][2], addr[4][3];
+    unsigned lane, c, r, step;
+    int ended = 0;
+    plan = pvs_plan_now();
+    if (!pvs_vs4_gate() || !plan || pvs_trace || pvs_ghist_on > 0 || pf_trap_on > 0) {
+        ++pvs4_tls.bail_gate;
+        return 0;
+    }
+    for (lane = 0; lane < 4; ++lane) {
+        cc[lane][0] = st[lane]->cc[0];
+        cc[lane][1] = st[lane]->cc[1];
+        addr[lane][0] = st[lane]->address[0];
+        addr[lane][1] = st[lane]->address[1];
+        addr[lane][2] = st[lane]->address[2];
+    }
+    for (r = 0; r < 16; ++r)
+        for (c = 0; c < 4; ++c)
+            o->c[r][c] = _mm_set_ps(st[3]->input[r][c], st[2]->input[r][c],
+                                    st[1]->input[r][c], st[0]->input[r][c]);
+    for (r = 16; r < PVS4_NREG; ++r)
+        for (c = 0; c < 4; ++c) o->c[r][c] = _mm_setzero_ps();
+    for (step = 0; step < 16384; step++) {
+        unsigned call_boundary = boundary;
+        for (unsigned pops = 0; pops < 4 && nc && call_boundary == calls[nc-1].end; pops++) {
+            --nc;
+            if (pops < 3) pc = call_boundary = calls[nc].ret;
+        }
+        if (nb && boundary == branches[nb-1].end) pc = branches[--nb].ret;
+        if (pc >= vs_program_size) { ++pvs4_tls.bail_pc; return 0; }
+        boundary = pc + 1;
+        {
+            const PvsPlan *p = &plan[pc];
+            unsigned o4 = p->op;
+            if (!o4) { ++pvs4_tls.bail_gen; return 0; }
+            if ((p->rel_a || p->rel_b || p->rel_c) && pvs4_norel_gate()) { ++pvs4_tls.bail_rel; return 0; }
+            if (pvs4_bailmask_gate() && (pvs4_bailmask_gate() & pvs4_bailcls(o4))) {
+                ++pvs4_tls.bail_rel;
+                return 0;
+            }
+            if (o4 >= PVO_END) {
+                uint32_t w = vs_program[pc];
+                unsigned nx = pc + 1;
+                if (o4 == PVO_END) { ended = 1; break; }
+                if (o4 == PVO_JMP) { pc = nx; continue; }
+                if (o4 <= PVO_JMPZ) {
+                    unsigned target = p->tgt, nn = p->n;
+                    int yes[4], y0;
+                    if (o4 == PVO_CALL) { yes[0]=yes[1]=yes[2]=yes[3]=1; }
+                    else if (o4 == PVO_CALLZ || o4 == PVO_JMPZ)
+                        for (lane = 0; lane < 4; ++lane) yes[lane] = pvs4_cond(cc, lane, w);
+                    else { int u = (int)((pica_regs[0x2b0] >> p->idx) & 1);
+                           yes[0]=yes[1]=yes[2]=yes[3]=u; }
+                    y0 = yes[0];
+                    if (yes[1] != y0 || yes[2] != y0 || yes[3] != y0) { ++pvs4_tls.bail_div; return 0; }
+                    if (o4 <= PVO_CALLNZ) {
+                        if (y0) {
+                            if (nc == 16) { ++pvs4_tls.bail_plan; return 0; }
+                            calls[nc].end = target + nn;
+                            calls[nc++].ret = nx;
+                            nx = target;
+                        }
+                    } else if (y0) {
+                        if (nb == 16) { ++pvs4_tls.bail_plan; return 0; }
+                        branches[nb].end = target;
+                        branches[nb++].ret = target + nn;
+                    } else nx = target;
+                    pc = nx;
+                    continue;
+                }
+                {   /* 0x2C / 0x2D */
+                    int yes[4], y0;
+                    if (o4 == PVO_IFU)
+                        for (lane = 0; lane < 4; ++lane) yes[lane] = pvs4_cond(cc, lane, w);
+                    else { int u = (int)(((pica_regs[0x2b0] >> p->idx) & 1) == !(w & 1));
+                           yes[0]=yes[1]=yes[2]=yes[3]=u; }
+                    y0 = yes[0];
+                    if (yes[1] != y0 || yes[2] != y0 || yes[3] != y0) { ++pvs4_tls.bail_div; return 0; }
+                    pc = y0 ? p->tgt : nx;
+                    continue;
+                }
+            }
+            {
+                unsigned fa = p->flags & 1u, fb = (p->flags >> 1) & 1u, fc = (p->flags >> 2) & 1u;
+                __m128 va[4], vb[4], vr[4], vc[4];
+                pvs4_swz(o, p->a, fa, p->rel_a, p->na, p->sw_a, addr, va);
+                if (o4 == PVO_MOVA) {
+                    unsigned k2;
+                    for (k2 = 0; k2 < 2; ++k2) {
+                        float al[4];
+                        if (!(p->msk & (8 >> k2))) continue;
+                        _mm_storeu_ps(al, va[k2]);
+                        for (lane = 0; lane < 4; ++lane)
+                            if (isfinite(al[lane]) && al[lane] >= -2147483648.0f &&
+                                al[lane] < 2147483648.0f)
+                                addr[lane][k2] = (int)al[lane];
+                    }
+                    pc = pc + 1u;
+                    continue;
+                }
+                pvs4_swz(o, p->b, fb, p->rel_b, p->nb, p->sw_b, addr, vb);
+                if (o4 == PVO_CMP) {
+                    float al[4], bl[4];
+                    _mm_storeu_ps(al, va[0]); _mm_storeu_ps(bl, vb[0]);
+                    for (lane = 0; lane < 4; ++lane)
+                        cc[lane][0] = pica_vs_compare(al[lane], bl[lane], p->cmp0);
+                    _mm_storeu_ps(al, va[1]); _mm_storeu_ps(bl, vb[1]);
+                    for (lane = 0; lane < 4; ++lane)
+                        cc[lane][1] = pica_vs_compare(al[lane], bl[lane], p->cmp1);
+                    pc = pc + 1u;
+                    continue;
+                }
+                switch (o4) {
+                case PVO_MOV: for (c = 0; c < 4; ++c) vr[c] = va[c]; break;
+                case PVO_ADD: for (c = 0; c < 4; ++c) vr[c] = _mm_add_ps(va[c], vb[c]); break;
+                case PVO_MUL: for (c = 0; c < 4; ++c) vr[c] = pvs_vec_mul(va[c], vb[c]); break;
+                case PVO_FLR: for (c = 0; c < 4; ++c) vr[c] = _mm_floor_ps(va[c]); break;
+                case PVO_RCP: {
+                    float al[4];
+                    _mm_storeu_ps(al, va[0]);
+                    vr[0] = vr[1] = vr[2] = vr[3] =
+                        _mm_set_ps(1.0f / al[3], 1.0f / al[2], 1.0f / al[1], 1.0f / al[0]);
+                    break;
+                }
+                case PVO_RSQ: {
+                    float al[4];
+                    _mm_storeu_ps(al, va[0]);
+                    vr[0] = vr[1] = vr[2] = vr[3] =
+                        _mm_set_ps(1.0f / sqrtf(al[3]), 1.0f / sqrtf(al[2]),
+                                   1.0f / sqrtf(al[1]), 1.0f / sqrtf(al[0]));
+                    break;
+                }
+                case PVO_MIN:
+                case PVO_MAX: {
+                    float al[4], bl[4];
+                    for (c = 0; c < 4; ++c) {
+                        _mm_storeu_ps(al, va[c]); _mm_storeu_ps(bl, vb[c]);
+                        for (lane = 0; lane < 4; ++lane)
+                            al[lane] = (o4 == PVO_MIN) ? fminf(al[lane], bl[lane])
+                                                       : fmaxf(al[lane], bl[lane]);
+                        vr[c] = _mm_loadu_ps(al);
+                    }
+                    break;
+                }
+                case PVO_SLT:
+                case PVO_SGE: {
+                    for (c = 0; c < 4; ++c) {
+                        __m128 cmp = (o4 == PVO_SLT) ? _mm_cmplt_ps(va[c], vb[c])
+                                                     : _mm_cmpge_ps(va[c], vb[c]);
+                        vr[c] = _mm_and_ps(cmp, _mm_set1_ps(1.0f));
+                    }
+                    break;
+                }
+                case PVO_MAD: {
+                    pvs4_swz(o, p->c, fc, p->rel_c, p->nc, p->sw_c, addr, vc);
+                    for (c = 0; c < 4; ++c) vr[c] = _mm_add_ps(pvs_vec_mul(va[c], vb[c]), vc[c]);
+                    break;
+                }
+                default: {   /* PVO_DP: 0 + p0 + p1 + p2 [+ p3] [+ b3], per lane */
+                    __m128 pv[4], dot;
+                    for (c = 0; c < 4; ++c) pv[c] = pvs_vec_mul(va[c], vb[c]);
+                    dot = _mm_add_ps(_mm_setzero_ps(), pv[0]);
+                    dot = _mm_add_ps(dot, pv[1]);
+                    dot = _mm_add_ps(dot, pv[2]);
+                    if (p->dpn == 4) dot = _mm_add_ps(dot, pv[3]);
+                    if (p->dph) dot = _mm_add_ps(dot, vb[3]);
+                    vr[0] = vr[1] = vr[2] = vr[3] = dot;
+                    break;
+                }
+                }
+                {
+                    unsigned dreg = (unsigned)(p->dst >> 4);
+                    for (c = 0; c < 4; ++c)
+                        if (p->msk & (8u >> c)) o->c[dreg][c] = vr[c];
+                }
+                pc = pc + 1u;
+                continue;
+            }
+        }
+    }
+    if (!ended) { ++pvs4_tls.bail_plan; return 0; }
+    /* END reached with all four lanes on the same path: publish the output
+       registers and the per-vertex cc/address state. */
+    for (c = 0; c < 4; ++c) {
+        float t[4];
+        for (r = 32; r < PVS4_NREG; ++r) {
+            _mm_storeu_ps(t, o->c[r][c]);
+            for (lane = 0; lane < 4; ++lane) st[lane]->output[r - 32][c] = t[lane];
+        }
+    }
+    for (lane = 0; lane < 4; ++lane) {
+        st[lane]->cc[0] = cc[lane][0];
+        st[lane]->cc[1] = cc[lane][1];
+        st[lane]->address[0] = addr[lane][0];
+        st[lane]->address[1] = addr[lane][1];
+        st[lane]->address[2] = addr[lane][2];
+    }
+    ++pvs4_tls.batches;
+    pvs4_tls.verts += 4;
+    return 1;
+}
+
+/* ---- t_e1773c51 STEP 2: eight vertices per pass over the plan (AVX2) -----
+   The 4-lane batch (t_fdc40e6f) runs four vertices through one pass over the
+   prepared plan with one __m128 per component.  This is the same executor
+   widened to eight lanes with one __m256 per component: same plan, same
+   operand form (state byte offset / absolute uniform pointer + swizzle index
+   + destination offset + write mask), same fallback contract.
+
+   Divergence: the eight lanes share one pc, so every flow instruction is
+   evaluated for all eight; if they disagree the batch is abandoned BEFORE
+   anything is written back and the caller re-runs those vertices on the
+   4-lane path (which itself falls back to the scalar reference).  PVO_GEN,
+   relative addressing, stack overflow, pc out of range and the
+   instrumentation gates bail the same way, so the batch can never change a
+   result -- DQ8_VSPAR_VERIFY proves that per vertex.
+
+   DQ8_VS8=0 disables it; enabled only when the CPU reports AVX2.  The bail
+   counters are reported next to the 4-lane ones (VS8 line, VSPLAN_STATS). */
+typedef struct { __m256 c[PVS4_NREG][4]; } PvsSoa8;
+static int pvs_vs8_on = -1;
+static int pvs_vs8_gate(void) {
+    if (pvs_vs8_on < 0) {
+        const char *e = getenv("DQ8_VS8");
+        int ok = __builtin_cpu_supports("avx2") ? 1 : 0;
+        pvs_vs8_on = (e && e[0] == '0' && !e[1]) ? 0 : ok;
+        if (pvs_vs8_on) pvs4_cnt_register();
+    }
+    return pvs_vs8_on;
+}
+__attribute__((target("avx2")))
+static void pvs8_swz(const PvsSoa8 *o, uintptr_t addr, unsigned flag,
+                     unsigned rel, int nreg, unsigned swi,
+                     const int addrv[8][3], __m256 out[4]) {
+    const PvsSwzVec *w = &pvs_swzv[swi];
+    unsigned char pm[16];
+    __m128 sgn = _mm_loadu_ps((const float *)&w->sign);
+    __m256 sign = _mm256_insertf128_ps(_mm256_castps128_ps256(sgn), sgn, 1);
+    unsigned c, lane;
+    _mm_storeu_si128((__m128i *)pm, w->perm);
+    if (rel && nreg >= 32) {
+        /* Relative uniform addressing (MOVA): the bank index is per vertex,
+           so this is the scalar helper's arithmetic evaluated per lane and
+           transposed into component vectors -- bit-identical by construction
+           (same clamp, same 96-slot/ones boundary). */
+        float t[4][8];
+        for (lane = 0; lane < 8; ++lane) {
+            int off = addrv[lane][rel - 1];
+            unsigned ix = (unsigned)(nreg - 32);
+            const float *src;
+            __m128 v;
+            float tv[4];
+            if (off < -128 || off > 127) off = 0;
+            ix = (ix + (unsigned)off) & 127u;
+            src = ix < 96u ? vs_uniform_f[ix] : pvs_ones_f;
+            v = _mm_loadu_ps(src);
+            v = _mm_xor_ps(_mm_castsi128_ps(_mm_shuffle_epi8(_mm_castps_si128(v), w->perm)),
+                           w->sign);
+            _mm_storeu_ps(tv, v);
+            for (c = 0; c < 4; ++c) t[c][lane] = tv[c];
+        }
+        for (c = 0; c < 4; ++c) out[c] = _mm256_loadu_ps(t[c]);
+    } else if (flag) {
+        const __m256 *rb = o->c[(unsigned)(addr >> 4)];
+        for (c = 0; c < 4; ++c)
+            out[c] = _mm256_xor_ps(rb[pm[c * 4] >> 2], sign);
+    } else {
+        const float *u = (const float *)addr;
+        for (c = 0; c < 4; ++c)
+            out[c] = _mm256_xor_ps(_mm256_set1_ps(u[pm[c * 4] >> 2]), sign);
+    }
+}
+__attribute__((target("avx2")))
+static inline __m256 pvs8_mul(__m256 a, __m256 b) {
+    /* pvs_vec_mul for eight lanes: 0 * anything is a signed zero, exactly like
+       the scalar helper (the sign of the zero operand is preserved). */
+    __m256 zero = _mm256_setzero_ps();
+    __m256 r = _mm256_mul_ps(a, b);
+    __m256 z = _mm256_or_ps(_mm256_cmp_ps(a, zero, _CMP_EQ_OQ),
+                            _mm256_cmp_ps(b, zero, _CMP_EQ_OQ));
+    __m256 s = _mm256_and_ps(r, _mm256_set1_ps(-0.0f));
+    return _mm256_or_ps(_mm256_andnot_ps(z, r), _mm256_and_ps(z, s));
+}
+static inline int pvs8_cond(const int cc[8][2], unsigned lane, uint32_t w) {
+    int x = cc[lane][0] == (int)((w >> 25) & 1), y = cc[lane][1] == (int)((w >> 24) & 1);
+    switch ((w >> 22) & 3) { case 0: return x || y; case 1: return x && y; case 2: return x; default: return y; }
+}
+__attribute__((target("avx2")))
+static int pica_execute_vs8(PicaVsState *const st[8]) {
+    struct { unsigned end, ret; } calls[16], branches[16];
+    unsigned nc = 0, nb = 0, pc = pica_regs[0x2ba] & 65535, boundary = UINT32_MAX;
+    const PvsPlan *plan;
+    PvsSoa8 soa;
+    PvsSoa8 *o = &soa;
+    int cc[8][2], addr[8][3];
+    unsigned lane, c, r, step;
+    int ended = 0;
+    plan = pvs_plan_now();
+    if (!pvs_vs8_gate() || !pvs_vs4_gate() || !plan || pvs_trace ||
+        pvs_ghist_on > 0 || pf_trap_on > 0) {
+        ++pvs4_tls.b8_gate;
+        return 0;
+    }
+    for (lane = 0; lane < 8; ++lane) {
+        cc[lane][0] = st[lane]->cc[0];
+        cc[lane][1] = st[lane]->cc[1];
+        addr[lane][0] = st[lane]->address[0];
+        addr[lane][1] = st[lane]->address[1];
+        addr[lane][2] = st[lane]->address[2];
+    }
+    for (r = 0; r < 16; ++r)
+        for (c = 0; c < 4; ++c)
+            o->c[r][c] = _mm256_set_ps(st[7]->input[r][c], st[6]->input[r][c],
+                                       st[5]->input[r][c], st[4]->input[r][c],
+                                       st[3]->input[r][c], st[2]->input[r][c],
+                                       st[1]->input[r][c], st[0]->input[r][c]);
+    for (r = 16; r < PVS4_NREG; ++r)
+        for (c = 0; c < 4; ++c) o->c[r][c] = _mm256_setzero_ps();
+    for (step = 0; step < 16384; step++) {
+        unsigned call_boundary = boundary;
+        for (unsigned pops = 0; pops < 4 && nc && call_boundary == calls[nc-1].end; pops++) {
+            --nc;
+            if (pops < 3) pc = call_boundary = calls[nc].ret;
+        }
+        if (nb && boundary == branches[nb-1].end) pc = branches[--nb].ret;
+        if (pc >= vs_program_size) { ++pvs4_tls.b8_pc; return 0; }
+        boundary = pc + 1;
+        {
+            const PvsPlan *p = &plan[pc];
+            unsigned o8 = p->op;
+            if (!o8) { ++pvs4_tls.b8_gen; return 0; }
+            if ((p->rel_a || p->rel_b || p->rel_c) && pvs4_norel_gate()) { ++pvs4_tls.b8_rel; return 0; }
+            if (pvs4_bailmask_gate() && (pvs4_bailmask_gate() & pvs4_bailcls(o8))) {
+                ++pvs4_tls.b8_rel;
+                return 0;
+            }
+            if (o8 >= PVO_END) {
+                uint32_t w = vs_program[pc];
+                unsigned nx = pc + 1;
+                if (o8 == PVO_END) { ended = 1; break; }
+                if (o8 == PVO_JMP) { pc = nx; continue; }
+                if (o8 <= PVO_JMPZ) {
+                    unsigned target = p->tgt, nn = p->n;
+                    int yes[8], y0;
+                    if (o8 == PVO_CALL) { for (lane = 0; lane < 8; ++lane) yes[lane] = 1; }
+                    else if (o8 == PVO_CALLZ || o8 == PVO_JMPZ)
+                        for (lane = 0; lane < 8; ++lane) yes[lane] = pvs8_cond(cc, lane, w);
+                    else { int u = (int)((pica_regs[0x2b0] >> p->idx) & 1);
+                           for (lane = 0; lane < 8; ++lane) yes[lane] = u; }
+                    y0 = yes[0];
+                    for (lane = 1; lane < 8; ++lane)
+                        if (yes[lane] != y0) { ++pvs4_tls.b8_div; return 0; }
+                    if (o8 <= PVO_CALLNZ) {
+                        if (y0) {
+                            if (nc == 16) { ++pvs4_tls.b8_plan; return 0; }
+                            calls[nc].end = target + nn;
+                            calls[nc++].ret = nx;
+                            nx = target;
+                        }
+                    } else if (y0) {
+                        if (nb == 16) { ++pvs4_tls.b8_plan; return 0; }
+                        branches[nb].end = target;
+                        branches[nb++].ret = target + nn;
+                    } else nx = target;
+                    pc = nx;
+                    continue;
+                }
+                {   /* 0x2C / 0x2D */
+                    int yes[8], y0;
+                    if (o8 == PVO_IFU)
+                        for (lane = 0; lane < 8; ++lane) yes[lane] = pvs8_cond(cc, lane, w);
+                    else { int u = (int)(((pica_regs[0x2b0] >> p->idx) & 1) == !(w & 1));
+                           for (lane = 0; lane < 8; ++lane) yes[lane] = u; }
+                    y0 = yes[0];
+                    for (lane = 1; lane < 8; ++lane)
+                        if (yes[lane] != y0) { ++pvs4_tls.b8_div; return 0; }
+                    pc = y0 ? p->tgt : nx;
+                    continue;
+                }
+            }
+            {
+                unsigned fa = p->flags & 1u, fb = (p->flags >> 1) & 1u, fc = (p->flags >> 2) & 1u;
+                __m256 va[4], vb[4], vr[4], vc[4];
+                pvs8_swz(o, p->a, fa, p->rel_a, p->na, p->sw_a, addr, va);
+                if (o8 == PVO_MOVA) {
+                    unsigned k2;
+                    for (k2 = 0; k2 < 2; ++k2) {
+                        float al[8];
+                        if (!(p->msk & (8 >> k2))) continue;
+                        _mm256_storeu_ps(al, va[k2]);
+                        for (lane = 0; lane < 8; ++lane)
+                            if (isfinite(al[lane]) && al[lane] >= -2147483648.0f &&
+                                al[lane] < 2147483648.0f)
+                                addr[lane][k2] = (int)al[lane];
+                    }
+                    pc = pc + 1u;
+                    continue;
+                }
+                pvs8_swz(o, p->b, fb, p->rel_b, p->nb, p->sw_b, addr, vb);
+                if (o8 == PVO_CMP) {
+                    float al[8], bl[8];
+                    _mm256_storeu_ps(al, va[0]); _mm256_storeu_ps(bl, vb[0]);
+                    for (lane = 0; lane < 8; ++lane)
+                        cc[lane][0] = pica_vs_compare(al[lane], bl[lane], p->cmp0);
+                    _mm256_storeu_ps(al, va[1]); _mm256_storeu_ps(bl, vb[1]);
+                    for (lane = 0; lane < 8; ++lane)
+                        cc[lane][1] = pica_vs_compare(al[lane], bl[lane], p->cmp1);
+                    pc = pc + 1u;
+                    continue;
+                }
+                switch (o8) {
+                case PVO_MOV: for (c = 0; c < 4; ++c) vr[c] = va[c]; break;
+                case PVO_ADD: for (c = 0; c < 4; ++c) vr[c] = _mm256_add_ps(va[c], vb[c]); break;
+                case PVO_MUL: for (c = 0; c < 4; ++c) vr[c] = pvs8_mul(va[c], vb[c]); break;
+                case PVO_FLR: for (c = 0; c < 4; ++c) vr[c] = _mm256_floor_ps(va[c]); break;
+                case PVO_RCP: {
+                    float al[8];
+                    _mm256_storeu_ps(al, va[0]);
+                    vr[0] = vr[1] = vr[2] = vr[3] =
+                        _mm256_set_ps(1.0f / al[7], 1.0f / al[6], 1.0f / al[5], 1.0f / al[4],
+                                      1.0f / al[3], 1.0f / al[2], 1.0f / al[1], 1.0f / al[0]);
+                    break;
+                }
+                case PVO_RSQ: {
+                    float al[8];
+                    _mm256_storeu_ps(al, va[0]);
+                    vr[0] = vr[1] = vr[2] = vr[3] =
+                        _mm256_set_ps(1.0f / sqrtf(al[7]), 1.0f / sqrtf(al[6]),
+                                      1.0f / sqrtf(al[5]), 1.0f / sqrtf(al[4]),
+                                      1.0f / sqrtf(al[3]), 1.0f / sqrtf(al[2]),
+                                      1.0f / sqrtf(al[1]), 1.0f / sqrtf(al[0]));
+                    break;
+                }
+                case PVO_MIN:
+                case PVO_MAX: {
+                    float al[8], bl[8];
+                    for (c = 0; c < 4; ++c) {
+                        _mm256_storeu_ps(al, va[c]); _mm256_storeu_ps(bl, vb[c]);
+                        for (lane = 0; lane < 8; ++lane)
+                            al[lane] = (o8 == PVO_MIN) ? fminf(al[lane], bl[lane])
+                                                       : fmaxf(al[lane], bl[lane]);
+                        vr[c] = _mm256_loadu_ps(al);
+                    }
+                    break;
+                }
+                case PVO_SLT:
+                case PVO_SGE: {
+                    for (c = 0; c < 4; ++c) {
+                        __m256 cmp = (o8 == PVO_SLT)
+                            ? _mm256_cmp_ps(va[c], vb[c], _CMP_LT_OQ)
+                            : _mm256_cmp_ps(va[c], vb[c], _CMP_GE_OQ);
+                        vr[c] = _mm256_and_ps(cmp, _mm256_set1_ps(1.0f));
+                    }
+                    break;
+                }
+                case PVO_MAD: {
+                    pvs8_swz(o, p->c, fc, p->rel_c, p->nc, p->sw_c, addr, vc);
+                    for (c = 0; c < 4; ++c) vr[c] = _mm256_add_ps(pvs8_mul(va[c], vb[c]), vc[c]);
+                    break;
+                }
+                default: {   /* PVO_DP: 0 + p0 + p1 + p2 [+ p3] [+ b3], per lane */
+                    __m256 pv[4], dot;
+                    for (c = 0; c < 4; ++c) pv[c] = pvs8_mul(va[c], vb[c]);
+                    dot = _mm256_add_ps(_mm256_setzero_ps(), pv[0]);
+                    dot = _mm256_add_ps(dot, pv[1]);
+                    dot = _mm256_add_ps(dot, pv[2]);
+                    if (p->dpn == 4) dot = _mm256_add_ps(dot, pv[3]);
+                    if (p->dph) dot = _mm256_add_ps(dot, vb[3]);
+                    vr[0] = vr[1] = vr[2] = vr[3] = dot;
+                    break;
+                }
+                }
+                {
+                    unsigned dreg = (unsigned)(p->dst >> 4);
+                    for (c = 0; c < 4; ++c)
+                        if (p->msk & (8u >> c)) o->c[dreg][c] = vr[c];
+                }
+                pc = pc + 1u;
+                continue;
+            }
+        }
+    }
+    if (!ended) { ++pvs4_tls.b8_plan; return 0; }
+    for (c = 0; c < 4; ++c) {
+        float t[8];
+        for (r = 32; r < PVS4_NREG; ++r) {
+            _mm256_storeu_ps(t, o->c[r][c]);
+            for (lane = 0; lane < 8; ++lane) st[lane]->output[r - 32][c] = t[lane];
+        }
+    }
+    for (lane = 0; lane < 8; ++lane) {
+        st[lane]->cc[0] = cc[lane][0];
+        st[lane]->cc[1] = cc[lane][1];
+        st[lane]->address[0] = addr[lane][0];
+        st[lane]->address[1] = addr[lane][1];
+        st[lane]->address[2] = addr[lane][2];
+    }
+    ++pvs4_tls.b8_batches;
+    pvs4_tls.b8_verts += 8;
+    return 1;
+}
+/* Eight vertices with the same draw state, eight lanes at a time.  Returns -1
+   when the batch declined (the caller then runs them on the 4-lane path, which
+   falls back to the scalar reference), else a bitmask of the vertices that
+   finished (bit j clear = v[j] untouched, reason[j]/detail[j] set exactly as
+   the scalar path would have). */
+__attribute__((target("avx2")))
+static int pica_load_vertex8(uint32_t base, const uint32_t index[8],
+                             PicaVertex *const v[8], uint8_t reason[8],
+                             uint32_t detail[8]) {
+    PicaVsAttr local_attr[12], *attr;
+    PicaVsState st[8];
+    PicaVsState *sp[8];
+    uint64_t pf_a0 = pf_trap_armed() ? pica_pqt_now_ns() : 0;
+    unsigned j, mask = 0;
+    if (pica_vsfast < 0) {
+        const char *e = getenv("DQ8_VSFAST");
+        pica_vsfast = (e && e[0] == '0' && !e[1]) ? 0 : 1;
+    }
+    if (pica_vsfast) { pica_vs_attr_ensure(); attr = pica_vs_attr; }
+    else { pica_vs_attr_fill(local_attr); attr = local_attr; }
+    for (j = 0; j < 8; ++j) {
+        pica_vs_fail_reason = 0; pica_vs_fail_detail = 0;
+        memset(&st[j], 0, sizeof st[j]);
+        if (!pica_vs_fetch(base, index[j], attr, &st[j])) return -1;
+        sp[j] = &st[j];
+    }
+    if (pf_a0) pf_shim(PF_SH_ATTR, pica_pqt_now_ns() - pf_a0);
+    if (!pica_execute_vs8(sp)) return -1;
+    if (pf_a0) pf_shim(PF_SH_VSEXEC, pica_pqt_now_ns() - pf_a0);
+    for (j = 0; j < 8; ++j) {
+        pica_vs_fail_reason = 0; pica_vs_fail_detail = 0;
+        if (pica_vs_finish(&st[j], v[j])) { mask |= 1u << j; reason[j] = 0; detail[j] = 0; }
+        else { reason[j] = (uint8_t)pica_vs_fail_reason; detail[j] = (uint32_t)pica_vs_fail_detail; }
+    }
+    return (int)mask;
+}
+
+/* t_fdc40e6f step 2: four vertices with the same draw state, executed four
+   lanes at a time.  Returns -1 when the batch declined (the caller then runs
+   the four vertices through the scalar path, so every failure and every
+   unrepresentable instruction still ends up on the reference code), else a
+   bitmask of the vertices that finished (bit j clear = v[j] untouched, with
+   reason[j]/detail[j] set exactly as the scalar path would have). */
+static int pica_load_vertex4(uint32_t base, const uint32_t index[4],
+                             PicaVertex *const v[4], uint8_t reason[4],
+                             uint32_t detail[4]) {
+    PicaVsAttr local_attr[12], *attr;
+    PicaVsState st[4];
+    PicaVsState *sp[4];
+    uint64_t pf_a0 = pf_trap_armed() ? pica_pqt_now_ns() : 0;
+    unsigned j, mask = 0;
+    if (pica_vsfast < 0) {
+        const char *e = getenv("DQ8_VSFAST");
+        pica_vsfast = (e && e[0] == '0' && !e[1]) ? 0 : 1;
+    }
+    if (pica_vsfast) { pica_vs_attr_ensure(); attr = pica_vs_attr; }
+    else { pica_vs_attr_fill(local_attr); attr = local_attr; }
+    for (j = 0; j < 4; ++j) {
+        pica_vs_fail_reason = 0; pica_vs_fail_detail = 0;
+        memset(&st[j], 0, sizeof st[j]);
+        if (!pica_vs_fetch(base, index[j], attr, &st[j])) return -1;
+        sp[j] = &st[j];
+    }
+    if (pf_a0) pf_shim(PF_SH_ATTR, pica_pqt_now_ns() - pf_a0);
+    if (!pica_execute_vs4(sp)) return -1;
+    if (pf_a0) pf_shim(PF_SH_VSEXEC, pica_pqt_now_ns() - pf_a0);
+    for (j = 0; j < 4; ++j) {
+        pica_vs_fail_reason = 0; pica_vs_fail_detail = 0;
+        if (pica_vs_finish(&st[j], v[j])) { mask |= 1u << j; reason[j] = 0; detail[j] = 0; }
+        else { reason[j] = (uint8_t)pica_vs_fail_reason; detail[j] = pica_vs_fail_detail; }
+    }
+    return (int)mask;
+}
+
 /* ---- OpenGL backend glue (see src/pica_gl.c). Buffers the draw's decoded
    triangles, then rasterizes them on the GPU when the draw state is
    expressible there; otherwise the software rasterizer runs unchanged. ---- */
@@ -1853,12 +3335,12 @@ static int pica_gl_draw_prepared;
 enum {
     SWF_GL_INACTIVE = 1, SWF_DEPTH_UNMAPPABLE, SWF_TEX_STAGE_FAIL,
     SWF_MODE_UNSUPPORTED, SWF_NOT_TEV, SWF_SOLID_NONCONST, SWF_UV_OUTSIDE,
-    SWF_GL_DRAW_FAIL, SWF_REASONS
+    SWF_TEV_TEX1, SWF_GL_DRAW_FAIL, SWF_REASONS
 };
 static const char *const pica_swfall_name[SWF_REASONS] = {
     "?", "gl-inactive", "depth-unmappable", "tex-stage-fail",
     "mode-unsupported", "mode-not-tev", "solid-nonconst-color", "uv-outside-0..1",
-    "gl-draw-fail"
+    "tev-reads-texunit1", "gl-draw-fail"
 };
 static unsigned long long pica_swfall_count[SWF_REASONS];
 static unsigned long long pica_swfall_tris[SWF_REASONS];
@@ -2007,7 +3489,9 @@ static void pica_gl_capture_ep(void) {
 static void pica_gl_flush_guest_rt(void) {
     uint32_t a, f, da;
     unsigned w, h, db;
+    uint64_t pgl_dl_t0;
     if (!pica_gl_pending()) return;
+    pgl_dl_t0 = pica_pqt_now_ns();   /* t_dd830a74: download-boundary cost */
     a = pica_rt_addr; w = pica_rt_w; h = pica_rt_h; f = pica_rt_format;
     da = pica_depth_addr; db = pica_depth_bpp;
     PF_ENTER(PF_GL); /* FRAMEPROF: deferred write-back = GL submit + worker wait */
@@ -2026,7 +3510,9 @@ static void pica_gl_flush_guest_rt(void) {
     pica_rt_addr = a; pica_rt_w = w; pica_rt_h = h; pica_rt_format = f;
     pica_depth_addr = da; pica_depth_bpp = db;
     PF_EXIT();
-    if (pf_w0) pf_shim(PF_SH_WB, pica_pqt_now_ns() - pf_w0); }
+    if (pf_w0) pf_shim(PF_SH_WB, pica_pqt_now_ns() - pf_w0);
+    pgl_dl_ns += pica_pqt_now_ns() - pgl_dl_t0;
+    ++pgl_dl_calls; }
 }
 
 /* Depth testing/writing is not implemented in the GL backend; a draw that
@@ -2456,7 +3942,29 @@ static int pica_gl_stage_texture(void) {
                      tb = ta + (uint64_t)w * h * 4u,
                      ra = (uint64_t)pica_rt_addr,
                      rb = ra + (uint64_t)pica_rt_w * pica_rt_h * 4u;
-            if (ta < rb && ra < tb) pica_gl_flush_guest_rt();
+            if (ta < rb && ra < tb) {
+                /* t_05281b89: the guest is sampling the CURRENT render target
+                   as a texture.  t_dd830a74 item 2: with the Azahar surface
+                   model the target keeps its scaled backing and unit 0 is
+                   bound to a full-resolution copy of it (normalised UVs need
+                   no change).  The publish still happens (guest memory current,
+                   item 3's download), it is just no longer the sample source. */
+                int scaled = 0;
+                pica_gl_note_target_sampled(pica_rt_w, pica_rt_h);
+                scaled = pica_gl_sample_scaled_target(w, h, fmt, tva);
+                pgl_diag_stage_want = (scaled == 0);
+                pica_gl_flush_guest_rt();
+                if (scaled) {
+                    pica_gl_st.tex_is_rt = 1;
+                    pica_gl_st.tex_w = (int)w;
+                    pica_gl_st.tex_h = (int)h;
+                    pica_gl_st.tex_rgba = NULL;   /* nothing to upload */
+                    pica_gl_st.tex_slot = ~0u;
+                    pica_gl_st.tex_gen = 0;
+                    pica_gl_st.tex_hash = 0;
+                    return 1;
+                }
+            }
         }
     }
     raw_len = pica_stage_raw_len(w, h, fmt);
@@ -2671,7 +4179,7 @@ static int pica_gl_stage_texture(void) {
                         for (c = 0; c < w; ++c) {
                             uint8_t rr, gg, bb, aa;
                             unsigned char *q;
-                            if (!pica_sample_tex0(((float)c + 0.5f) / (float)w,
+                            if (!pica_sample_tex0_exact(((float)c + 0.5f) / (float)w,
                                                   ((float)r + 0.5f) / (float)h,
                                                   &rr, &gg, &bb, &aa)) { ok = 0; break; }
                             q = chk + ((size_t)r * w + c) * 4u;
@@ -2701,7 +4209,7 @@ static int pica_gl_stage_texture(void) {
                 for (c = 0; c < w; ++c) {
                     uint8_t rr, gg, bb, aa;
                     unsigned char *p;
-                    if (!pica_sample_tex0(((float)c + 0.5f) / (float)w,
+                    if (!pica_sample_tex0_exact(((float)c + 0.5f) / (float)w,
                                           ((float)r + 0.5f) / (float)h,
                                           &rr, &gg, &bb, &aa))
                         return 0;
@@ -2776,6 +4284,155 @@ static int pica_gl_stage_texture(void) {
         }
         ++stage_n;
     }
+    return 1;
+}
+
+
+/* ---- t_e216fc37: staging for PICA TEXTURE UNIT 1 (TEV source 4) --------
+   The unit-0 cache above is hard-wired to the unit-0 register block
+   (0x81/0x82/0x83/0x85/0x8E) and to its fast decoder / content-addressed
+   alias table / budget accounting.  Unit 1 has its own registers
+   (0x91/0x92/0x93/0x95/0x96), so it gets a small independent slot cache that
+   decodes through the reference sampler pica_sample_tex_unit(1, ...): exact
+   for every texture format by construction (no second fast path that could
+   disagree).  Draws whose TEV chain reads source 4 are rare (a handful of
+   ground decals per frame) and a slot is re-decoded only when the raw Morton
+   bytes of its source image change, so the reference-speed decode is paid
+   once per distinct image, not per draw.
+
+   Identity for the GL upload cache is (slot, generation), exactly like
+   unit 0: a generation bump means the staged bytes changed. */
+#define PICA_STAGE1_SLOTS 4
+typedef struct {
+    int used;
+    uint32_t paddr_field, mapped, w, h, fmt;
+    size_t raw_len;
+    unsigned char *raw;      /* source Morton bytes (dirty check) */
+    unsigned char *staged;   /* decoded RGBA8, row 0 = GL v=0 */
+    size_t staged_len;
+    uint32_t hash;
+    unsigned long long gen;
+    unsigned long long lru;
+} PicaStage1Slot;
+static PicaStage1Slot pica_stage1_slots[PICA_STAGE1_SLOTS];
+static unsigned long long pica_stage1_lru_tick;
+static unsigned long long pica_stage1_decodes, pica_stage1_hits;
+
+static int pica_gl_stage_texture1(void) {
+    uint32_t w = (pica_regs[0x92] >> 16) & 0x7FFu;
+    uint32_t h = pica_regs[0x92] & 0x7FFu;
+    uint32_t addr_field = pica_regs[0x95] & 0x0FFFFFFFu;
+    uint32_t fmt = pica_regs[0x96] & 0xFu;
+    uint32_t wrap_s = (pica_regs[0x93] >> 12) & 7u;
+    uint32_t wrap_t = (pica_regs[0x93] >> 8) & 7u;
+    size_t need, raw_len;
+    uint32_t va, mapped = 0;
+    uint32_t hash = 2166136261u;
+    PicaStage1Slot *slot = NULL;
+    unsigned i, r, c;
+    if (!w || !h || w > 1024u || h > 1024u || !addr_field) return 0;
+    /* The image can alias the render target: deferred GL content must land in
+       guest memory before the staging reads texels from it. */
+    if (pica_gl_pending()) {
+        uint32_t tva = guest_memory_address(addr_field * 8u);
+        uint64_t ta = (uint64_t)tva,
+                 tb = ta + (uint64_t)w * h * 4u,
+                 ra = (uint64_t)pica_rt_addr,
+                 rb = ra + (uint64_t)pica_rt_w * pica_rt_h * 4u;
+        if (ta < rb && ra < tb) {
+            /* t_05281b89: unit-1 staging sampling the current target. */
+            pica_gl_note_target_sampled(pica_rt_w, pica_rt_h);
+            pica_gl_flush_guest_rt();
+        }
+    }
+    raw_len = pica_stage_raw_len(w, h, fmt);
+    if (!raw_len) return 0;
+    va = guest_memory_address(addr_field * 8u);
+    if (!guest_memory_range(va, 4u, &mapped)) return 0;
+    if ((uint64_t)mapped + raw_len > GUEST_RAM_SIZE) return 0;
+    /* Hit: same key AND unchanged source bytes. */
+    for (i = 0; i < PICA_STAGE1_SLOTS; ++i) {
+        PicaStage1Slot *s = &pica_stage1_slots[i];
+        if (!s->used || s->paddr_field != addr_field || s->mapped != mapped ||
+            s->w != w || s->h != h || s->fmt != fmt || s->raw_len != raw_len)
+            continue;
+        if (memcmp(s->raw, ram + mapped, raw_len) == 0) {
+            slot = s;
+            ++pica_stage1_hits;
+            slot->lru = ++pica_stage1_lru_tick;
+            break;
+        }
+    }
+    if (!slot) {
+        /* A dirty re-decode of the same key keeps its slot (stable staging
+           pointer and GL object); a new key takes a free slot, else the LRU
+           one. */
+        for (i = 0; i < PICA_STAGE1_SLOTS; ++i) {
+            PicaStage1Slot *s = &pica_stage1_slots[i];
+            if (s->used && s->paddr_field == addr_field &&
+                s->mapped == mapped && s->w == w && s->h == h && s->fmt == fmt) {
+                slot = s;
+                break;
+            }
+        }
+        if (!slot) {
+            slot = &pica_stage1_slots[0];
+            for (i = 0; i < PICA_STAGE1_SLOTS; ++i) {
+                if (!pica_stage1_slots[i].used) { slot = &pica_stage1_slots[i]; break; }
+                if (pica_stage1_slots[i].lru < slot->lru) slot = &pica_stage1_slots[i];
+            }
+        }
+        /* A queued GL draw may still read this slot's staged bytes. */
+        pica_gl_split_sync();
+        need = (size_t)w * h * 4u;
+        if (slot->staged_len < need) {
+            unsigned char *grown = (unsigned char *)realloc(slot->staged, need);
+            if (!grown) return 0;
+            slot->staged = grown;
+            slot->staged_len = need;
+        }
+        if (slot->raw_len != raw_len) {
+            unsigned char *grown = (unsigned char *)realloc(slot->raw, raw_len);
+            if (!grown) return 0;
+            slot->raw = grown;
+            slot->raw_len = raw_len;
+        }
+        for (r = 0; r < h; ++r) {
+            for (c = 0; c < w; ++c) {
+                uint8_t rr = 0, gg = 0, bb = 0, aa = 0;
+                unsigned char *p = slot->staged + ((size_t)r * w + c) * 4u;
+                if (!pica_sample_tex_unit_exact(1u, ((float)c + 0.5f) / (float)w,
+                                          ((float)r + 0.5f) / (float)h,
+                                          &rr, &gg, &bb, &aa))
+                    return 0;
+                p[0] = rr; p[1] = gg; p[2] = bb; p[3] = aa;
+                hash = (hash ^ rr) * 16777619u;
+                hash = (hash ^ gg) * 16777619u;
+                hash = (hash ^ bb) * 16777619u;
+                hash = (hash ^ aa) * 16777619u;
+            }
+        }
+        memcpy(slot->raw, ram + mapped, raw_len);
+        slot->used = 1;
+        slot->paddr_field = addr_field;
+        slot->mapped = mapped;
+        slot->w = w; slot->h = h; slot->fmt = fmt;
+        slot->hash = hash ? hash : 1u;
+        ++slot->gen;
+        ++pica_stage1_decodes;
+        slot->lru = ++pica_stage1_lru_tick;
+    }
+    pica_gl_st.tex1_rgba = slot->staged;
+    pica_gl_st.tex1_w = (int)w;
+    pica_gl_st.tex1_h = (int)h;
+    pica_gl_st.tex1_hash = slot->hash;
+    pica_gl_st.tex1_slot = (unsigned)(slot - pica_stage1_slots);
+    pica_gl_st.tex1_gen = slot->gen;
+    pica_gl_st.wrap_s1 = wrap_s;
+    pica_gl_st.wrap_t1 = wrap_t;
+    pica_gl_st.mag_filter1 = (pica_regs[0x93] >> 1) & 1u;
+    pica_gl_st.min_filter1 = (pica_regs[0x93] >> 2) & 1u;
+    pica_gl_st.mip_filter1 = (pica_regs[0x93] >> 24) & 1u;
     return 1;
 }
 
@@ -2888,10 +4545,25 @@ static int pica_gl_prepare_draw(void) {
            like pica_tev (see pgl_fs_src). */
         unsigned ws, wt;
         pica_gl_build_tev(&pica_gl_st.tev);
+        /* t_e216fc37: the GL fragment shader translates the whole TEV chain
+           but can only sample TEXTURE UNIT 0 (one staged image, one sampler,
+           one set of wrap registers).  A chain that reads unit 1/2 (TEV
+           source 4/5) is refused in pica_flush_triangles() so the draw is
+           rasterized by the software path (which samples both units); the
+           refusal is NOT done here because a prepare-time refusal leaves the
+           draw ordered against the deferred GL episode differently and the
+           ground quad then disappeared behind the sky pass. */
         ws = (pica_regs[0x83] >> 12) & 7u;
         wt = (pica_regs[0x83] >> 8) & 7u;
         pica_gl_st.wrap_s = ws;
         pica_gl_st.wrap_t = wt;
+        /* t_c043d7f7: the guest's mag/min/mip filter bits, applied to the GL
+           sampler per draw (the upload cache is keyed on image bytes, not on
+           filter state, so these are set on every bind, not only on upload). */
+        pica_gl_st.mag_filter = (pica_regs[0x83] >> 1) & 1u;
+        pica_gl_st.min_filter = (pica_regs[0x83] >> 2) & 1u;
+        pica_gl_st.mip_filter = (pica_regs[0x83] >> 24) & 1u;
+        pica_gl_st.lod_word = pica_regs[0x84];
         /* PICA wrap codes 0/2/3 are exactly what the GL sampler does with the
            NEAREST-filtered staged texture (the shader's uniform sampling lands
            on identical texels), so u,v are free to leave [0,1]. */
@@ -2900,6 +4572,30 @@ static int pica_gl_prepare_draw(void) {
         if (pica_gl_st.tev.tex_en && !pica_gl_stage_texture()) {
             pica_swfall(SWF_TEX_STAGE_FAIL, 0);
             return 0;
+        }
+        /* t_e216fc37: TEXTURE UNIT 1 (TEV source 4).  Staged from the unit-1
+           register block (0x91/0x92/0x93/0x95/0x96) and sampled with
+           texcoord1 by the GL fragment shader (GL texture unit 3).  Only when
+           the unit is enabled AND this draw's chain actually reads source 4,
+           so draws that never touch it pay one register test. */
+        pica_gl_st.tex1_en = 0;
+        if ((pica_regs[0x80] & 2u) && pica_tev_reads_texunit(1u) &&
+            pica_tev_tex1_on()) {
+            unsigned ws1 = (pica_regs[0x93] >> 12) & 7u;
+            unsigned wt1 = (pica_regs[0x93] >> 8) & 7u;
+            if ((ws1 == 0u || ws1 == 2u || ws1 == 3u) &&
+                (wt1 == 0u || wt1 == 2u || wt1 == 3u) &&
+                pica_gl_stage_texture1()) {
+                pica_gl_st.tex1_en = 1;
+            } else {
+                /* A sampler mode the staged-image GL sampling cannot
+                   reproduce (border colour / repeat-2 / repeat-3) or a
+                   staging failure: keep this draw on the software
+                   rasterizer, which samples unit 1 through
+                   pica_sample_tex_unit(1, ...) exactly. */
+                pica_swfall(SWF_TEV_TEX1, 0);
+                return 0;
+            }
         }
         /* t_fa78ea1f: staged-texture census for the UI-overlay investigation.
            Prints the texture identity plus how much of the staged image is
@@ -3417,7 +5113,16 @@ static void elide_verify_hit(const PicaVertex *tri, uint32_t n, const ElideEntry
 static void pica_flush_triangles(void);
 
 static void pica_queue_triangle(PicaVertex a, PicaVertex b, PicaVertex c) {
+    float area;
     ++pica_draw_log_tris;
+    /* t_150574cd: face culling.  The winding tally is taken on every triangle
+       the draw submits (pre-filter), so DQ8_TRACE_TEXDRAW still reports the
+       guest's own cw/ccw mix; the filter below then drops the back faces the
+       guest's GPUREG 0x40 mode culls. */
+    area = pica_edge(&a, &b, c.x, c.y);
+    if (area > 0.0f) ++pica_draw_log_fccw; else ++pica_draw_log_fcw;
+    if (!pica_cull_keep(area)) { ++pica_cull_dropped_tris; return; }
+    ++pica_cull_kept_tris;
     if (pica_clst() && pica_draw_log_count >= 1000u) {
         static unsigned seen[8]; static int nseen;
         int k;
@@ -3485,6 +5190,7 @@ static PicaVertex pica_vertex_lerp(const PicaVertex *a,const PicaVertex *b,float
     o.cz=a->cz+(b->cz-a->cz)*t;o.cw=a->cw+(b->cw-a->cw)*t;
     for(k=0;k<4;k++)o.color[k]=a->color[k]+(b->color[k]-a->color[k])*t;
     o.u=a->u+(b->u-a->u)*t;o.v=a->v+(b->v-a->v)*t;
+    o.u1=a->u1+(b->u1-a->u1)*t;o.v1=a->v1+(b->v1-a->v1)*t;
     return o;
 }
 /* plane: 0 = w>=EPS, 1 = cx<=cw, 2 = cx>=-cw, 3 = cy<=cw, 4 = cy>=-cw */
@@ -3636,6 +5342,17 @@ static void pica_flush_triangles(void) {
                 }
             }
         }
+        if (gl_ok && pica_gl_tev_tex1_on() &&
+            (pica_tev_reads_texunit(1u) || pica_tev_reads_texunit(2u))) {
+            /* t_e216fc37: the GL fragment shader can only sample texture unit
+               0; a chain reading unit 1/2 (TEV source 4/5) would multiply in
+               0.0 and paint the quad black (the ground "shadow" decals do
+               exactly that).  Refuse here, where the software fallback has
+               already flushed the deferred GL episode, so the software
+               rasterizer - which now samples unit 1 - draws it in order. */
+            gl_ok = 0;
+            swf_reason = SWF_TEV_TEX1;
+        }
         if (gl_ok && pica_gl_st.tev.tex_en && !pica_gl_tex_wrap_ok) {
             /* Only clamp-to-border (PICA wrap 1) still needs the software
                sampler here: the staged texture reproduces pica_sample_tex0
@@ -3685,6 +5402,8 @@ static void pica_flush_triangles(void) {
                            sizeof verts[i].color);
                     verts[i].u = pica_tri_buf[i].u;
                     verts[i].v = pica_tri_buf[i].v;
+                    verts[i].u1 = pica_tri_buf[i].u1;
+                    verts[i].v1 = pica_tri_buf[i].v1;
                     verts[i].cx = pica_tri_buf[i].cx;
                     verts[i].cy = pica_tri_buf[i].cy;
                     verts[i].cz = pica_tri_buf[i].cz;
@@ -3695,7 +5414,7 @@ static void pica_flush_triangles(void) {
                     for (i = 0; i < n; i += 3u) {
                         float solid[4];
                         unsigned k;
-                        pica_tev(pica_tri_buf[i].color, zero, solid);
+                        pica_tev(pica_tri_buf[i].color, zero, zero, solid);
                         for (k = 0; k < 3u; ++k)
                             memcpy(verts[i+k].color, solid, sizeof solid);
                     }
@@ -3790,7 +5509,7 @@ static void pica_trace_tev_state(void) {
     if (h == pica_tev_state_hash_last) return;
     pica_tev_state_hash_last = h;
     if (pica_tev_state_logs++ >= 8u) return; /* per-epoch cap */
-    sampled = (pica_regs[0x80]&1u) && pica_sample_tex0(0.5f,0.5f,&sr,&sg,&sb,&sa);
+    sampled = (pica_regs[0x80]&1u) && pica_sample_tex0_exact(0.5f,0.5f,&sr,&sg,&sb,&sa);
     if (sampled) { tex[0]=sr/255.0f;tex[1]=sg/255.0f;tex[2]=sb/255.0f;tex[3]=sa/255.0f; }
     /* 4x4 probe across the whole texture: how many texels are non-black.
        A font/glyph atlas is mostly black; the center texel alone lies. */
@@ -3798,15 +5517,15 @@ static void pica_trace_tev_state(void) {
         for (probe = 0; probe < 16u; ++probe) {
             uint8_t pr,pg,pb,pa;
             unsigned px = probe & 3u, py = probe >> 2;
-            if (pica_sample_tex0(((float)px + 0.5f) / 4.0f, ((float)py + 0.5f) / 4.0f,
+            if (pica_sample_tex0_exact(((float)px + 0.5f) / 4.0f, ((float)py + 0.5f) / 4.0f,
                                  &pr,&pg,&pb,&pa) && (pr|pg|pb)) {
                 ++probe_nz;
                 if (!fr && !fg && !fb) { fr=pr;fg=pg;fb=pb;fa=pa; }
             }
         }
     }
-    pica_tev(white,tex,out_tex);
-    pica_tev(white,zero4,out_black);
+    pica_tev(white,tex,zero4,out_tex);
+    pica_tev(white,zero4,zero4,out_black);
     fprintf(stderr,"TEVSTATE draw=%llu tex_en=%c addr=%08X dim=%08X fmt=%u sample=%s rgba=%u/%u/%u/%u probe4x4_nz=%u first_nz=%u/%u/%u/%u "
             "tev(white, tex)=(%u,%u,%u,%u) tev(white,0)=(%u,%u,%u,%u) "
             "stages=%08X/%08X/%08X %08X/%08X/%08X %08X/%08X/%08X %08X/%08X/%08X %08X/%08X/%08X %08X/%08X/%08X "
@@ -3920,39 +5639,105 @@ static void pqt_account(long long t0, unsigned long long gl_before) {
  * DQ8_VSPAR=N selects the worker count (default 4; 0 disables).  Workers are
  * created lazily on the first parallel draw.
  *
- * Dispatch is SPIN-THEN-SLEEP, not a per-draw condition-variable handshake.
- * The first version broadcast/woke the pool once per draw and only bought
- * 1.08x (t_5a3c517a A/B, RX 570): a 3D frame is ~220 draws of ~250 vertices,
- * so each job is ~70 us of work per worker while a futex sleep/wake pair
- * costs tens of microseconds — the wake latency, not the transform, set the
- * pace.  Now the main thread publishes a job with one atomic store, every
- * participant (workers and the main thread itself) pulls chunks off a shared
- * atomic cursor, and the main thread waits on a second atomic counter.  No
- * mutex or futex on the in-frame path; only the idle path (no job published
- * for DQ8_VSPAR_SPIN us) touches the condition variable, so an idle emulator
- * still costs nothing.
+ * Idle discipline (t_f40374bc).  The pool used to spin-then-sleep on a
+ * condition variable with a 2 ms budget, and the main thread SPUN on the
+ * completion counter for its own job.  Measured on the operator's city state
+ * (`perf -e cycles:u`, per thread) that idle spin was 46-48 % of ALL host
+ * cycles: `pvs_par_worker` was 99.4 % the `pause; mov gen; inc; cmp` loop
+ * because draws arrive every ~150 us and the 2 ms budget never expired, and
+ * the main thread spent 45.97 % of its own cycles in the same kind of loop.
+ *
+ * Now: a worker spins for DQ8_VSPAR_SPIN us (default 0) looking for a new
+ * generation, then BLOCKS in FUTEX_WAIT on the generation word; the publisher
+ * wakes the pool with one FUTEX_WAKE.  The old 50 us spin was there to hide
+ * wake latency while the main thread spun too; with the main thread blocking
+ * as well, the spin no longer buys guest time (see reports/VSPAR_BLOCKING.md,
+ * a 3-round sweep: spin 0/25/50 = 12.96/12.88/12.86 ms guest, i.e. inside the
+ * noise, at 2.95/3.38/3.57 cores), so the default is 0.  The spin loop samples
+ * the clock every 256 PAUSE instructions, so "0" means at most a few us of
+ * pacing before the futex wait, not a hard floor of zero.
+ * The main thread does a bounded
+ * DQ8_VSPAR_WAIT_SPIN us spin (default 20) and then blocks in FUTEX_WAIT on the
+ * completion counter, which the last participant wakes.  The futex value is
+ * the token, so a wake that lands between the load and the wait makes the wait
+ * return EAGAIN instead of sleeping — no lost wakeup, no mutex, no condvar on
+ * either path.  Jobs below DQ8_VSPAR_MIN_VERTS vertices (default 0 = always
+ * dispatch) run inline on the main thread: at ~250 vertices, publishing a job
+ * and waking eight workers can cost more than the transform itself.
  * ========================================================================= */
-#define PVS_PAR_MAX 8
+#define PVS_PAR_MAX 12
 #define PVS_ST_INDEX_FAIL 0xFFu
 #if defined(__x86_64__) || defined(__i386__)
 #define PVS_PAUSE() __builtin_ia32_pause()
 #else
 #define PVS_PAUSE() ((void)0)
 #endif
+/* t_f40374bc: blocking wait primitive.  One syscall, no lock; the futex value
+   is the token, so a store between the load and the wait returns EAGAIN
+   instead of sleeping (no lost wakeup). */
+#if defined(__linux__)
+#  include <linux/futex.h>
+#  include <sys/syscall.h>
+#  define PVS_HAVE_FUTEX 1
+#else
+#  define PVS_HAVE_FUTEX 0
+#endif
+static void pvs_park(volatile unsigned *p, unsigned val) {
+#if PVS_HAVE_FUTEX
+    syscall(SYS_futex, (unsigned *)p, FUTEX_WAIT_PRIVATE, val,
+            (void *)0, (void *)0, 0);
+#else
+    struct timespec ts = {0, 50000};
+    while (__atomic_load_n(p, __ATOMIC_ACQUIRE) == val) nanosleep(&ts, NULL);
+#endif
+}
+/* Bounded variant: a park that cannot outlive `ns` even if the token was
+   already consumed by the store it is waiting for.  Used by the publisher's
+   completion wait, where an unbounded park converts one lost wakeup into a
+   permanent freeze (t_e1773c51 step 1b). */
+static void pvs_park_to(volatile unsigned *p, unsigned val, uint64_t ns) {
+#if PVS_HAVE_FUTEX
+    struct timespec ts;
+    ts.tv_sec = (time_t)(ns / 1000000000ull);
+    ts.tv_nsec = (long)(ns % 1000000000ull);
+    syscall(SYS_futex, (unsigned *)p, FUTEX_WAIT_PRIVATE, val,
+            &ts, (void *)0, 0);
+#else
+    struct timespec ts = {0, 50000};
+    uint64_t end = pica_pqt_now_ns() + ns;
+    while (__atomic_load_n(p, __ATOMIC_ACQUIRE) == val &&
+           pica_pqt_now_ns() < end) nanosleep(&ts, NULL);
+#endif
+}
+static void pvs_unpark(volatile unsigned *p) {
+#if PVS_HAVE_FUTEX
+    syscall(SYS_futex, (unsigned *)p, FUTEX_WAKE_PRIVATE, 0x7fffffff,
+            (void *)0, (void *)0, 0);
+#else
+    (void)p;
+#endif
+}
 static int pvs_par = -1;                 /* -1 unknown, else worker count */
 static PicaVertex *pvs_vout;             /* [65536] */
 static uint8_t *pvs_vst;                 /* per-vertex status (0 = ok) */
 static uint32_t *pvs_vdet;               /* per-vertex pica_vs_fail_detail */
 static unsigned pvs_vcap;
-static uint32_t pvs_job_base, pvs_job_count, pvs_job_chunk;
-static int pvs_job_indexed;
-static volatile unsigned pvs_job_next, pvs_job_nchunks, pvs_job_gen;
-static volatile unsigned pvs_job_done;   /* participants that left the job */
 static volatile int pvs_par_stop;
 static unsigned pvs_par_nw;              /* workers actually started */
-static uint64_t pvs_spin_ns = 2000000u;  /* spin budget before blocking (2 ms) */
-static pthread_mutex_t pvs_par_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t pvs_par_cv = PTHREAD_COND_INITIALIZER;
+static uint64_t pvs_spin_ns = 0u;         /* worker spin before blocking (0 us) */
+/* t_45ee02dd item 3: main-thread bounded spin 20 us -> 100 us.  From the
+   8-CPU sweep recorded on this card (rig, taskset 0-7, DQ8_VBLANK_WALLCLOCK=1):
+   spin=100 + vspar=8 -> 20.9/19.9 fps, spin=20 -> 19.9/19.5, spin=300 ->
+   20.0/15.5 (unstable), vspar=4 -> 15.0/15.8.  Eight workers with a 100 us
+   bound is the stable point, and it removes the 16-20 fps fluctuation the
+   operator sees. */
+static uint64_t pvs_wait_spin_ns = 100000u; /* main-thread spin before blocking */
+static unsigned pvs_min_verts;           /* inline below this vertex count */
+/* Idle accounting (DQ8_VSPAR_STATS=1): how many times a participant actually
+   had to block vs how many jobs were dispatched, so a regression back to
+   spinning shows up as blk=0 with a full proc_cpu. */
+static uint64_t pvs_block_count, pvs_wake_count, pvs_wait_blocks,
+                pvs_inline_jobs;
 static int pvs_par_injob;                /* re-entrancy guard (main thread) */
 static uint64_t pvs_par_jobs, pvs_par_ms_saved_probe;
 /* -------------------------------------------------------------------------
@@ -3970,28 +5755,327 @@ static uint32_t *pvs_vdref;
 static unsigned long long pvs_verify_jobs, pvs_verify_verts, pvs_verify_bad,
                           pvs_verify_reports;
 static double pvs_verify_next_rep;
-/* Generic parallel job: any (fn, ctx, item range) can reuse the pool
-   (t_5a3c517a: the render-target write-back uses it). */
-static void (*pvs_job_run)(unsigned c) = NULL;
-static void (*pvs_gfn)(void *, unsigned, unsigned);
-static void *pvs_gctx;
-static unsigned pvs_gbase, pvs_gchunk, pvs_gn;
-static void pvs_par_chunk_gen(unsigned c) {
-    unsigned i0 = pvs_gbase + c * pvs_gchunk;
-    unsigned i1 = i0 + pvs_gchunk;
-    unsigned end = pvs_gbase + pvs_gn;
-    if (i1 > end) i1 = end;
-    pvs_gfn(pvs_gctx, i0, i1);
+/* =========================================================================
+ * t_e1773c51 STEP 1 — generation-tagged job descriptors.
+ *
+ * The old handshake was one process-global {gen, next, nchunks, done} set plus
+ * one global `done` word that was RESET on publish and incremented once by
+ * every worker and once by the main thread; the main thread returned from
+ * pvs_job_wait() as soon as `done >= nparts` (nparts = workers + 1, a fixed
+ * participant count).  Three things were wrong with it:
+ *
+ *  (a) the increment carried no generation identity, so an increment that
+ *      belonged to an older generation (a worker that observed gen g, was
+ *      descheduled, and only reached its `done++` after the main thread had
+ *      already published g+1 and reset the word) was counted for g+1.  One
+ *      such stray increment makes `done >= nparts` true while another worker
+ *      is still inside its chunk for g+1: the main thread then starts
+ *      assembling pvs_vout[] -- and publishes the next draw's plan into
+ *      pvs_plan_cur -- under a live writer.
+ *  (b) `pvs_nparts` was a fixed participation count, not a per-generation
+ *      attribute, and nothing tied a participant to the job it counted for.
+ *  (c) the chunk cursor and the job arguments were globals too, so a late
+ *      participant pulled chunks from whatever job was current, with whatever
+ *      `run` the main thread had restored in the meantime, and a generic job's
+ *      `ctx` is a STACK object (pgl_wb_*_blocks passes &c) -- a participant
+ *      that outlives pvs_par_run() writes guest RAM through a dead stack
+ *      frame.  That is how a broken run can leave guest memory (the colour /
+ *      depth write-back target) corrupted, which is why a savestate taken
+ *      during it stays broken on every build.
+ *
+ * The replacement is a published descriptor per generation:
+ *
+ *   - a ring of PVS_JOB_RING descriptors; publishing stamps `gen`, fills the
+ *     immutable half, and release-stores pvs_job_gen (the futex word);
+ *   - every participant (main + workers) copies the immutable half into its
+ *     own stack (`PvsJobDesc job`) and re-validates `gen` after the copy, so
+ *     it can never mix two generations' arguments;
+ *   - participation is counted per generation, in ONE 64-bit word `live` as
+ *     {joined:32, done:32}: join is a CAS increment of the high half, leave a
+ *     CAS increment of the low half, so a reader always sees a consistent cut
+ *     (a join can never appear without its matching leave);
+ *   - the main thread returns from wait when done == joined, i.e. when every
+ *     participant that joined has left -- not when a fixed number of
+ *     increments happened.  A participant that arrives late finds the cursor
+ *     exhausted, does no work, and cannot move the check for a generation it
+ *     did not run;
+ *   - the chunk cursor and the `run` pointer live in the descriptor, so a
+ *     late participant can only pull chunks of its own generation;
+ *   - per-generation wake token (b->wake) so the futex wait has no lost
+ *     wakeup and no cross-generation token confusion.
+ * ========================================================================= */
+typedef struct PvsJobDesc {
+    unsigned gen;
+    unsigned nchunks;
+    void (*run)(const struct PvsJobDesc *d, unsigned c);
+    uint32_t base, count, chunk;      /* vertex job */
+    int indexed;
+    const PvsPlan *plan;              /* vertex job: plan snapshot */
+    const PvsProg *prog;
+    uint64_t plan_key;                /* DQ8_VS4_STRESS: key the plan was built for */
+    void (*gfn)(void *, unsigned, unsigned);   /* generic job */
+    void *gctx;
+    unsigned gbase, gchunk, gn;
+} PvsJobDesc;
+typedef struct PvsJobBuf {
+    PvsJobDesc d;                     /* immutable once published */
+    unsigned next;                    /* atomic chunk cursor, per generation */
+    unsigned wake;                    /* leave token (futex word for the waiter) */
+    uint64_t live;                    /* {joined:32, done:32} */
+} PvsJobBuf;
+#define PVS_JOB_RING 32768u
+static PvsJobBuf *pvs_job_ring;
+static volatile unsigned pvs_job_gen;   /* futex word: last published gen */
+static unsigned pvs_gen_pub;            /* main thread's last published gen */
+static __thread unsigned pvs_wgen;      /* participant: generation it is running */
+static __thread const PvsJobDesc *pvs_wjob;  /* participant: its own snapshot */
+static uint64_t pvs_in_body;            /* participants inside a job (diagnostic) */
+/* t_e1773c51 step 1b: the publisher's completion wait and its failure modes.
+   `pvs_wait_lostwake` counts the race the pre-fix ordering slept through: the
+   last participant left between the publisher's condition check and its read
+   of the leave token, so the token it then parked on already contained that
+   leave -- futex_wait(value == expected) never returns and the publisher is
+   stuck until the ring slot is reused (32768 jobs later).  `pvs_wait_stall`
+   counts waits that ran past PVS_WAIT_STALL_NS. */
+static uint64_t pvs_wait_lostwake, pvs_wait_stall, pvs_wait_slow;
+static int pvs_wait_oldorder = -1;
+#define PVS_WAIT_STALL_NS   50000000ull      /* 50 ms: a chunk is microseconds */
+#define PVS_WAIT_PARK_NS     1000000ull      /* 1 ms bound on a completion park */
+static inline unsigned pvs_live_joined(uint64_t v) { return (unsigned)((v >> 32) & 0x7fffffffu); }
+static inline unsigned pvs_live_done(uint64_t v) { return (unsigned)(v & 0xffffffffu); }
+#define PVS_LIVE_CLOSED (1ull << 63)
+/* Join is conditional on the generation still accepting participants.  The
+   publisher sets PVS_LIVE_CLOSED after its own leave and before it waits, so a
+   participant that arrives later is refused and runs nothing -- otherwise a
+   join landing between the publisher's leave and its read of `live` would make
+   joined > done with nobody left to close it (a hang that needs a one-
+   instruction window).  Join, close and leave are CAS/RMW on the SAME word, so
+   no join can slip past the close.  Returns 1 when the caller may run the job
+   (and owes a leave), 0 when the job is closed. */
+static inline int pvs_job_join(PvsJobBuf *b) {
+    uint64_t v;
+    for (;;) {
+        v = __atomic_load_n(&b->live, __ATOMIC_ACQUIRE);
+        if (v & PVS_LIVE_CLOSED) return 0;
+        if (__atomic_compare_exchange_n(&b->live, &v, v + 0x100000000ull, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            __atomic_add_fetch(&pvs_in_body, 1u, __ATOMIC_RELAXED);
+            return 1;
+        }
+    }
+}
+static inline void pvs_job_close(PvsJobBuf *b) {
+    __atomic_fetch_or(&b->live, PVS_LIVE_CLOSED, __ATOMIC_ACQ_REL);
+}
+static inline void pvs_job_leave(PvsJobBuf *b) {
+    uint64_t v = __atomic_add_fetch(&b->live, 1u, __ATOMIC_ACQ_REL);
+    __atomic_add_fetch(&b->wake, 1u, __ATOMIC_RELEASE);
+    __atomic_sub_fetch(&pvs_in_body, 1u, __ATOMIC_RELAXED);
+    if (pvs_live_done(v) >= pvs_live_joined(v)) pvs_unpark(&b->wake);
 }
 /* Phase split of the job total: time the MAIN thread spent waiting for the
    pool at the end of a draw, vs the chunks it pulled itself.  DQ8_VSPAR_STATS=1
    prints it every 10 s. */
 static uint64_t pvs_par_wait_ns, pvs_par_mainwork_ns;
 
-static void pvs_par_chunk(unsigned c) {
-    uint32_t i0 = c * pvs_job_chunk, i1 = i0 + pvs_job_chunk;
-    if (i1 > pvs_job_count) i1 = pvs_job_count;
-    for (uint32_t i = i0; i < i1; ++i) {
+/* DQ8_VS4_STRESS=1: exercise the handshake.  Forces working participants to
+   park between jobs (spin budget 0), one-chunk jobs (so the publish rate and
+   the number of wake/park transitions go up by ~20x), and delays a fraction of
+   the joins by 20-200 us, which is exactly the "late waker" window the old
+   protocol needed.  Level 2 delays every join.  While it is on, each chunk
+   validates that the descriptor it runs is still the published one and, for a
+   vertex job, that pvs_plan_cur is still the job's plan and that the plan's
+   key still matches the live VS program. */
+static int pvs_stress = -1;
+static unsigned long long pvs_stress_chunks, pvs_stress_stale,
+                          pvs_stress_plan_bad, pvs_stress_key_bad,
+                          pvs_stress_reports;
+static inline unsigned long long pvs_stress_rand(void) {
+    static __thread unsigned long long s;
+    if (!s) s = 0x9E3779B97F4A7C15ull ^ (unsigned long long)(uintptr_t)&s;
+    s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+    return s;
+}
+static inline int pvs_stress_on(void) {
+    if (pvs_stress < 0) {
+        const char *e = getenv("DQ8_VS4_STRESS");
+        pvs_stress = (e && *e && *e != '0') ? atoi(e) : 0;
+        if (pvs_stress > 2) pvs_stress = 2;
+    }
+    return pvs_stress;
+}
+static void pvs_stress_check(const PvsJobDesc *d, unsigned c) {
+    unsigned g;
+    __atomic_add_fetch(&pvs_stress_chunks, 1ull, __ATOMIC_RELAXED);
+    g = __atomic_load_n(&pvs_job_gen, __ATOMIC_ACQUIRE);
+    if (g != pvs_wgen) {
+        __atomic_add_fetch(&pvs_stress_stale, 1ull, __ATOMIC_RELAXED);
+        if (__atomic_fetch_add(&pvs_stress_reports, 1ull, __ATOMIC_RELAXED) < 16u)
+            fprintf(stderr, "VSPARSTRESS STALE job gen=%u live_gen=%u chunk=%u "
+                            "draw=%llu -- the main thread retired this job "
+                            "while a participant was still in it\n",
+                    pvs_wgen, g, c, (unsigned long long)pica_draw_count);
+    }
+    if (d->plan) {
+        if ((const PvsPlan *)__atomic_load_n((const void **)&pvs_plan_cur,
+                                             __ATOMIC_ACQUIRE) != d->plan) {
+            __atomic_add_fetch(&pvs_stress_plan_bad, 1ull, __ATOMIC_RELAXED);
+            if (__atomic_fetch_add(&pvs_stress_reports, 1ull, __ATOMIC_RELAXED) < 16u)
+                fprintf(stderr, "VSPARSTRESS PLAN job gen=%u plan=%p live=%p "
+                                "draw=%llu chunk=%u\n", pvs_wgen, (const void *)d->plan,
+                        (const void *)pvs_plan_cur,
+                        (unsigned long long)pica_draw_count, c);
+        }
+        if (d->plan_key && pvs_plan_key(vs_program_size) != d->plan_key) {
+            __atomic_add_fetch(&pvs_stress_key_bad, 1ull, __ATOMIC_RELAXED);
+            if (__atomic_fetch_add(&pvs_stress_reports, 1ull, __ATOMIC_RELAXED) < 16u)
+                fprintf(stderr, "VSPARSTRESS KEY job gen=%u key=%016llX live=%016llX "
+                                "draw=%llu\n", pvs_wgen,
+                        (unsigned long long)d->plan_key,
+                        (unsigned long long)pvs_plan_key(vs_program_size),
+                        (unsigned long long)pica_draw_count);
+        }
+    }
+}
+static void pvs_stress_report(void) {
+    if (!pvs_stress_on()) return;
+    fprintf(stderr, "VSPARSTRESS chunks=%llu stale=%llu plan_bad=%llu key_bad=%llu "
+                    "lostwake=%llu stall=%llu gen=%u workers=%u chunk=1 spin=0\n",
+            pvs_stress_chunks, pvs_stress_stale, pvs_stress_plan_bad,
+            pvs_stress_key_bad, pvs_wait_lostwake, pvs_wait_stall,
+            pvs_job_gen, pvs_par_nw);
+}
+/* Publish `d` as generation pvs_gen_pub+1 and wake the pool.  The main thread
+   has already joined (live = {1,0}), so a worker that finishes before the main
+   thread even starts its own chunks cannot satisfy done == joined. */
+static PvsJobBuf *pvs_job_publish(const PvsJobDesc *d) {
+    unsigned g = ++pvs_gen_pub;
+    PvsJobBuf *b = &pvs_job_ring[g % PVS_JOB_RING];
+    b->d = *d;
+    b->d.gen = g;
+    __atomic_store_n(&b->next, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&b->wake, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&b->live, 0x100000000ull, __ATOMIC_RELAXED); /* main joined */
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(&pvs_job_gen, g, __ATOMIC_RELEASE);
+    ++pvs_wake_count;
+    pvs_unpark(&pvs_job_gen);
+    return b;
+}
+/* One participant's chunk pull loop.  `pub` supplies the cursor and the
+   completion counters, `d` the immutable arguments; pvs_tls_plan/prog hold
+   `d`'s plan for the duration so the vertex code cannot read the main
+   thread's newer plan. */
+static void pvs_body_run(PvsJobBuf *pub, const PvsJobDesc *d) {
+    const PvsPlan *sp = pvs_tls_plan;
+    const PvsProg *sg = pvs_tls_prog;
+    pvs_tls_plan = d->plan;
+    pvs_tls_prog = d->prog;
+    for (;;) {
+        unsigned c = __atomic_fetch_add(&pub->next, 1u, __ATOMIC_ACQ_REL);
+        if (c >= d->nchunks) break;
+        if (pvs_stress) pvs_stress_check(d, c);
+        d->run(d, c);
+    }
+    pvs_tls_plan = sp;
+    pvs_tls_prog = sg;
+}
+static void pvs_par_chunk_gen(const PvsJobDesc *d, unsigned c) {
+    unsigned i0 = d->gbase + c * d->gchunk;
+    unsigned i1 = i0 + d->gchunk;
+    unsigned end = d->gbase + d->gn;
+    if (i1 > end) i1 = end;
+    d->gfn(d->gctx, i0, i1);
+}
+static void pvs_par_chunk(const PvsJobDesc *d, unsigned c) {
+    uint32_t i0 = c * d->chunk, i1 = i0 + d->chunk;
+    uint32_t i;
+    if (i1 > d->count) i1 = d->count;
+    for (i = i0; i < i1; ) {
+        /* t_fdc40e6f step 2: run four vertices per pass over the plan.  Every
+           path the batch cannot take falls through to the single-vertex loop
+           below, which is byte-for-byte the pre-batch reference code. */
+        if (pvs_vs8_gate() && i + 8 <= i1) {
+            /* t_e1773c51 STEP 2: eight vertices, one pass over the plan. */
+            uint32_t idx[8];
+            PicaVertex *vp[8];
+            uint8_t rsn[8];
+            uint32_t det[8];
+            unsigned j, all = 1;
+            int r8;
+            for (j = 0; j < 8; ++j) {
+                memset(&pvs_vout[i + j], 0, sizeof pvs_vout[i + j]);
+                idx[j] = pica_regs[0x22a] + i + j;
+                vp[j] = &pvs_vout[i + j];
+                if (d->indexed) {
+                    unsigned bytes = (pica_regs[0x227] >> 31) ? 2u : 1u;
+                    uint32_t mapped;
+                    uint64_t addr = (uint64_t)d->base +
+                                    (pica_regs[0x227] & 0xfffffff) +
+                                    (uint64_t)(i + j) * bytes;
+                    if (addr > UINT32_MAX ||
+                        !guest_memory_range((uint32_t)addr, bytes, &mapped)) {
+                        pvs_vst[i + j] = PVS_ST_INDEX_FAIL;
+                        all = 0;
+                        break;
+                    }
+                    idx[j] = ram[mapped];
+                    if (bytes == 2u) idx[j] |= (uint32_t)ram[mapped + 1] << 8;
+                }
+            }
+            if (all) {
+                r8 = pica_load_vertex8(d->base, idx, vp, rsn, det);
+                if (r8 >= 0) {
+                    for (j = 0; j < 8; ++j) {
+                        if (r8 & (1u << j)) pvs_vst[i + j] = 0u;
+                        else { pvs_vst[i + j] = rsn[j]; pvs_vdet[i + j] = det[j]; }
+                    }
+                    i += 8;
+                    continue;
+                }
+            }
+            ++pvs4_tls.b8_fallback;
+        }
+        if (pvs_vs4_gate() && i + 4 <= i1) {
+            uint32_t idx[4];
+            PicaVertex *vp[4];
+            uint8_t reason[4];
+            uint32_t detail[4];
+            unsigned j, all = 1, r4;
+            for (j = 0; j < 4; ++j) {
+                memset(&pvs_vout[i + j], 0, sizeof pvs_vout[i + j]);
+                idx[j] = pica_regs[0x22a] + i + j;
+                vp[j] = &pvs_vout[i + j];
+                if (d->indexed) {
+                    unsigned bytes = (pica_regs[0x227] >> 31) ? 2u : 1u;
+                    uint32_t mapped;
+                    uint64_t addr = (uint64_t)d->base +
+                                    (pica_regs[0x227] & 0xfffffff) +
+                                    (uint64_t)(i + j) * bytes;
+                    if (addr > UINT32_MAX ||
+                        !guest_memory_range((uint32_t)addr, bytes, &mapped)) {
+                        pvs_vst[i + j] = PVS_ST_INDEX_FAIL;
+                        all = 0;
+                        break;
+                    }
+                    idx[j] = ram[mapped];
+                    if (bytes == 2u) idx[j] |= (uint32_t)ram[mapped + 1] << 8;
+                }
+            }
+            if (all) {
+                r4 = (unsigned)pica_load_vertex4(d->base, idx, vp, reason, detail);
+                if ((int)r4 >= 0) {
+                    for (j = 0; j < 4; ++j) {
+                        if (r4 & (1u << j)) pvs_vst[i + j] = 0u;
+                        else { pvs_vst[i + j] = reason[j]; pvs_vdet[i + j] = detail[j]; }
+                    }
+                    i += 4;
+                    continue;
+                }
+            }
+            ++pvs4_tls.scalar;
+        }
+        {
         uint32_t index = pica_regs[0x22a] + i;
         /* t_968a1fa9: pica_load_vertex returns *without* touching its output on
            every failure path, so the slot must be deterministic garbage-free
@@ -4000,10 +6084,10 @@ static void pvs_par_chunk(unsigned c) {
            instead of whatever the previous draw left there.  It also makes the
            DQ8_VSPAR_VERIFY byte comparison exact (no malloc junk). */
         memset(&pvs_vout[i], 0, sizeof pvs_vout[i]);
-        if (pvs_job_indexed) {
+        if (d->indexed) {
             unsigned bytes = (pica_regs[0x227] >> 31) ? 2u : 1u;
             uint32_t mapped;
-            uint64_t addr = (uint64_t)pvs_job_base + (pica_regs[0x227] & 0xfffffff) +
+            uint64_t addr = (uint64_t)d->base + (pica_regs[0x227] & 0xfffffff) +
                             (uint64_t)i * bytes;
             if (addr > UINT32_MAX ||
                 !guest_memory_range((uint32_t)addr, bytes, &mapped)) {
@@ -4013,12 +6097,14 @@ static void pvs_par_chunk(unsigned c) {
             index = ram[mapped];
             if (bytes == 2u) index |= (uint32_t)ram[mapped + 1] << 8;
         }
-        if (!pica_load_vertex(pvs_job_base, index, &pvs_vout[i])) {
+        if (!pica_load_vertex(d->base, index, &pvs_vout[i])) {
             pvs_vst[i] = (uint8_t)pica_vs_fail_reason;
             pvs_vdet[i] = pica_vs_fail_detail;
         } else {
             pvs_vst[i] = 0u;
         }
+        }
+        ++i;
     }
 }
 
@@ -4026,16 +6112,24 @@ static void pvs_par_chunk(unsigned c) {
    in index order, into pvs_vref/pvs_vsref, then byte-compare with the pool's
    result.  Runs on the main thread, so it also proves the pool agrees with the
    single-threaded path exactly. */
-static void pvs_par_verify(void) {
+static void pvs_par_verify(const PvsJobDesc *d) {
     uint32_t i;
     unsigned bad = 0;
-    for (i = 0; i < pvs_job_count; ++i) {
+    /* t_fdc40e6f: this reference pass must NOT use the prepared plan, so it
+       compares the plan's output against the pre-plan pre-decoded path.  Safe
+       on the main thread: the pool job has already completed and this runs
+       before the next pvs_plan_sync publishes a new plan. */
+    const PvsPlan *saved_plan = pvs_plan_cur;
+    const PvsProg *saved_prog = pvs_prog_cur;
+    pvs_plan_cur = NULL;
+    pvs_prog_cur = NULL;
+    for (i = 0; i < d->count; ++i) {
         uint32_t index = pica_regs[0x22a] + i;
         memset(&pvs_vref[i], 0, sizeof pvs_vref[i]);
-        if (pvs_job_indexed) {
+        if (d->indexed) {
             unsigned bytes = (pica_regs[0x227] >> 31) ? 2u : 1u;
             uint32_t mapped;
-            uint64_t addr = (uint64_t)pvs_job_base + (pica_regs[0x227] & 0xfffffff) +
+            uint64_t addr = (uint64_t)d->base + (pica_regs[0x227] & 0xfffffff) +
                             (uint64_t)i * bytes;
             if (addr > UINT32_MAX ||
                 !guest_memory_range((uint32_t)addr, bytes, &mapped)) {
@@ -4046,7 +6140,7 @@ static void pvs_par_verify(void) {
             index = ram[mapped];
             if (bytes == 2u) index |= (uint32_t)ram[mapped + 1] << 8;
         }
-        if (!pica_load_vertex(pvs_job_base, index, &pvs_vref[i])) {
+        if (!pica_load_vertex(d->base, index, &pvs_vref[i])) {
             pvs_vsref[i] = (uint8_t)pica_vs_fail_reason;
             pvs_vdref[i] = pica_vs_fail_detail;
         } else {
@@ -4064,19 +6158,31 @@ cmp:
                 fprintf(stderr,
                         "VSPARVERIFY MISMATCH draw=%llu vert=%u/%u status ser=%u par=%u "
                         "detail ser=%08X par=%08X\n"
-                        "  ser c=(%.9g,%.9g,%.9g,%.9g) s=(%.9g,%.9g) uv=(%.9g,%.9g)\n"
-                        "  par c=(%.9g,%.9g,%.9g,%.9g) s=(%.9g,%.9g) uv=(%.9g,%.9g)\n",
-                        (unsigned long long)pica_draw_count, i, pvs_job_count,
+                        "  ser c=(%.9g,%.9g,%.9g,%.9g) s=(%.9g,%.9g) uv=(%.9g,%.9g) "
+                        "uv1=(%.9g,%.9g) col=(%.9g,%.9g,%.9g,%.9g) zw=%.9g iw=%.9g\n"
+                        "  par c=(%.9g,%.9g,%.9g,%.9g) s=(%.9g,%.9g) uv=(%.9g,%.9g) "
+                        "uv1=(%.9g,%.9g) col=(%.9g,%.9g,%.9g,%.9g) zw=%.9g iw=%.9g\n",
+                        (unsigned long long)pica_draw_count, i, d->count,
                         pvs_vsref[i], pvs_vst[i], pvs_vdref[i], pvs_vdet[i],
                         pvs_vref[i].cx, pvs_vref[i].cy, pvs_vref[i].cz, pvs_vref[i].cw,
                         pvs_vref[i].x, pvs_vref[i].y, pvs_vref[i].u, pvs_vref[i].v,
+                        pvs_vref[i].u1, pvs_vref[i].v1,
+                        pvs_vref[i].color[0], pvs_vref[i].color[1],
+                        pvs_vref[i].color[2], pvs_vref[i].color[3],
+                        pvs_vref[i].zw, pvs_vref[i].iw,
                         pvs_vout[i].cx, pvs_vout[i].cy, pvs_vout[i].cz, pvs_vout[i].cw,
-                        pvs_vout[i].x, pvs_vout[i].y, pvs_vout[i].u, pvs_vout[i].v);
+                        pvs_vout[i].x, pvs_vout[i].y, pvs_vout[i].u, pvs_vout[i].v,
+                        pvs_vout[i].u1, pvs_vout[i].v1,
+                        pvs_vout[i].color[0], pvs_vout[i].color[1],
+                        pvs_vout[i].color[2], pvs_vout[i].color[3],
+                        pvs_vout[i].zw, pvs_vout[i].iw);
             }
         }
     }
+    pvs_plan_cur = saved_plan;
+    pvs_prog_cur = saved_prog;
     ++pvs_verify_jobs;
-    pvs_verify_verts += pvs_job_count;
+    pvs_verify_verts += d->count;
     {
         double now = (double)pica_pqt_now_ns() / 1e9;
         if (now >= pvs_verify_next_rep) {
@@ -4084,44 +6190,147 @@ cmp:
             fprintf(stderr, "VSPARVERIFY jobs=%llu verts=%llu mismatches=%llu "
                             "(this job: %u/%u) draw=%llu\n",
                     pvs_verify_jobs, pvs_verify_verts, pvs_verify_bad, bad,
-                    pvs_job_count, (unsigned long long)pica_draw_count);
+                    d->count, (unsigned long long)pica_draw_count);
         }
     }
 }
 
-/* One participant's chunk pull loop (main thread and workers run the same
-   code, which is what keeps the tail latency at one chunk). */
-static void pvs_par_body(void) {
+/* Main thread: wait until every participant that JOINED this generation has
+   left it.  `live` is one word, so the {joined,done} pair observed here is a
+   consistent cut: a join recorded after the cut has not been seen, and its
+   owner has not incremented `done` either, so the job is still open for it --
+   which is exactly what makes "done == joined" mean "nobody is inside a chunk
+   of this generation any more" instead of "n fixed increments happened".
+
+   t_e1773c51 step 1b -- the fix for the freeze the operator hit on b59: the
+   leave token MUST be read before the condition is checked a second time.
+   `wake` is a monotonically increasing count of leaves, so reading it after
+   the final leave yields the post-leave value; parking with that value as
+   `expected` matches the futex word and sleeps through the completion it is
+   waiting for, until the ring slot is reused PVS_JOB_RING jobs later.  Read
+   token, re-check condition, then park (a leave that lands after the re-check
+   bumps the token, so the park returns EAGAIN instead of sleeping).
+   DQ8_VSPAR_WAIT_OLD=1 restores the old order for one run; it is a probe, not
+   a supported mode.  The park is bounded (PVS_WAIT_PARK_NS) so no future
+   ordering mistake can turn into an indefinite freeze. */
+static void pvs_job_wait(PvsJobBuf *b) {
+    unsigned spins = 0;
+    uint64_t t0 = pica_pqt_now_ns();
+    uint64_t deadline = pvs_wait_spin_ns ? t0 + pvs_wait_spin_ns : t0;
+    int reported = 0, did_park = 0;
+    unsigned ptok = 0;
+    if (pvs_wait_oldorder < 0) {
+        const char *e = getenv("DQ8_VSPAR_WAIT_OLD");
+        pvs_wait_oldorder = (e && *e && *e != '0') ? 1 : 0;
+    }
     for (;;) {
-        unsigned c = __atomic_fetch_add(&pvs_job_next, 1u, __ATOMIC_ACQ_REL);
-        if (c >= pvs_job_nchunks) break;
-        pvs_job_run(c);
+        uint64_t v = __atomic_load_n(&b->live, __ATOMIC_ACQUIRE);
+        unsigned tok;
+        if (pvs_live_done(v) >= pvs_live_joined(v)) {
+            /* A park that returned with the condition true and the token
+               unchanged was a lost wakeup: the leave that satisfied the
+               condition happened before the token was read, so the unbounded
+               park of the pre-fix code would never have returned. */
+            if (did_park &&
+                __atomic_load_n(&b->wake, __ATOMIC_ACQUIRE) == ptok) {
+                if (__atomic_fetch_add(&pvs_wait_lostwake, 1ull, __ATOMIC_RELAXED) < 8u)
+                    fprintf(stderr, "VSPARWAIT LOSTWAKE gen=%u joined=%u done=%u "
+                                    "token=%u nchunks=%u next=%u -- the publisher "
+                                    "parked on a token that already contained the "
+                                    "last leave (pre-fix order)\n",
+                            b->d.gen, pvs_live_joined(v), pvs_live_done(v), ptok,
+                            b->d.nchunks, __atomic_load_n(&b->next, __ATOMIC_RELAXED));
+            }
+            return;
+        }
+        tok = __atomic_load_n(&b->wake, __ATOMIC_ACQUIRE);
+        if (!pvs_wait_oldorder) {
+            v = __atomic_load_n(&b->live, __ATOMIC_ACQUIRE);
+            if (pvs_live_done(v) >= pvs_live_joined(v)) return;
+        }
+        if (pica_pqt_now_ns() < deadline) {
+            if ((++spins & 0x3Fu) != 0) { PVS_PAUSE(); continue; }
+            continue;
+        }
+        {
+            uint64_t el = pica_pqt_now_ns() - t0;
+            if (!reported && el > PVS_WAIT_STALL_NS) {
+                reported = 1;
+                __atomic_fetch_add(&pvs_wait_stall, 1ull, __ATOMIC_RELAXED);
+                fprintf(stderr, "VSPARWAIT STALL gen=%u joined=%u done=%u next=%u "
+                                "nchunks=%u in_body=%llu waited_ms=%.1f\n",
+                        b->d.gen, pvs_live_joined(v), pvs_live_done(v),
+                        __atomic_load_n(&b->next, __ATOMIC_RELAXED), b->d.nchunks,
+                        (unsigned long long)__atomic_load_n(&pvs_in_body, __ATOMIC_RELAXED),
+                        (double)el / 1e6);
+            } else if (el > 1000000ull) {
+                __atomic_fetch_add(&pvs_wait_slow, 1ull, __ATOMIC_RELAXED);
+            }
+        }
+        ++pvs_wait_blocks;
+        ptok = tok;
+        did_park = 1;
+        pvs_park_to(&b->wake, tok, PVS_WAIT_PARK_NS);
     }
 }
 
 static void *pvs_par_worker(void *arg) {
-    unsigned seen = 0;
+    /* Do not run a generation that was published before this thread existed:
+       the main thread does not wait for participants that never joined, and a
+       worker that starts with a stale `seen` would otherwise "participate" in
+       a job that is already finished (the old protocol counted exactly those
+       increments). */
+    unsigned seen;
     (void)arg;
+    pvs4_cnt_register();
+    seen = __atomic_load_n(&pvs_job_gen, __ATOMIC_ACQUIRE);
     for (;;) {
+        unsigned g;
         unsigned spins = 0;
-        uint64_t deadline = pica_pqt_now_ns() + pvs_spin_ns;
-        while (__atomic_load_n(&pvs_job_gen, __ATOMIC_ACQUIRE) == seen) {
-            if (__atomic_load_n(&pvs_par_stop, __ATOMIC_RELAXED)) return NULL;
-            if ((++spins & 0xFFu) != 0) { PVS_PAUSE(); continue; }
-            if (pica_pqt_now_ns() > deadline) break;   /* spin budget spent */
+        uint64_t deadline;
+        if (__atomic_load_n(&pvs_par_stop, __ATOMIC_RELAXED)) return NULL;
+        g = __atomic_load_n(&pvs_job_gen, __ATOMIC_ACQUIRE);
+        if (g == seen) {
+            deadline = pica_pqt_now_ns() + pvs_spin_ns;
+            while (__atomic_load_n(&pvs_job_gen, __ATOMIC_ACQUIRE) == seen) {
+                if (__atomic_load_n(&pvs_par_stop, __ATOMIC_RELAXED)) return NULL;
+                if ((++spins & 0xFFu) != 0) { PVS_PAUSE(); continue; }
+                if (pica_pqt_now_ns() > deadline) break;   /* spin budget spent */
+            }
+            g = __atomic_load_n(&pvs_job_gen, __ATOMIC_ACQUIRE);
+            if (g == seen) {
+                /* Idle: block until the publisher bumps the generation.  A
+                   spurious wake (signal, or a store that lost the race with
+                   the wait) just re-checks from the top. */
+                ++pvs_block_count;
+                pvs_park(&pvs_job_gen, seen);
+                continue;
+            }
         }
-        if (__atomic_load_n(&pvs_job_gen, __ATOMIC_ACQUIRE) == seen) {
-            /* Idle: block on the condition variable.  The re-check under the
-               mutex is what makes the broadcast race-free. */
-            pthread_mutex_lock(&pvs_par_mu);
-            while (!pvs_par_stop && pvs_job_gen == seen)
-                pthread_cond_wait(&pvs_par_cv, &pvs_par_mu);
-            pthread_mutex_unlock(&pvs_par_mu);
-            if (__atomic_load_n(&pvs_par_stop, __ATOMIC_RELAXED)) return NULL;
+        seen = g;
+        {
+            PvsJobBuf *pub = &pvs_job_ring[g % PVS_JOB_RING];
+            PvsJobDesc job;
+            int level = pvs_stress_on();
+            /* Late-join window: in stress mode a participant that was woken
+               late is simulated by delaying the join itself. */
+            if (level == 2 || (level == 1 && (pvs_stress_rand() & 7u) == 0)) {
+                struct timespec ts;
+                ts.tv_sec = 0;
+                ts.tv_nsec = 20000 + (long)(pvs_stress_rand() % 180000u);
+                nanosleep(&ts, NULL);
+            }
+            if (__atomic_load_n(&pub->d.gen, __ATOMIC_ACQUIRE) != g) continue;
+            job = pub->d;                       /* per-thread argument snapshot */
+            if (__atomic_load_n(&pub->d.gen, __ATOMIC_ACQUIRE) != g) continue;
+            if (!pvs_job_join(pub)) continue;   /* job closed: run nothing */
+            pvs_wjob = &job;
+            pvs_wgen = g;
+            pvs_body_run(pub, &job);
+            pvs_wjob = NULL;
+            pvs_wgen = 0;
+            pvs_job_leave(pub);
         }
-        seen = __atomic_load_n(&pvs_job_gen, __ATOMIC_ACQUIRE);
-        pvs_par_body();
-        __atomic_fetch_add(&pvs_job_done, 1u, __ATOMIC_RELEASE);
     }
 }
 
@@ -4147,6 +6356,16 @@ static void pvs_par_init(void) {
             long us = atol(se);
             pvs_spin_ns = us > 0 ? (uint64_t)us * 1000u : 0u;
         }
+        se = getenv("DQ8_VSPAR_WAIT_SPIN");
+        if (se && *se) {
+            long us = atol(se);
+            pvs_wait_spin_ns = us > 0 ? (uint64_t)us * 1000u : 0u;
+        }
+        se = getenv("DQ8_VSPAR_MIN_VERTS");
+        if (se && *se) {
+            long n = atol(se);
+            pvs_min_verts = n > 0 ? (unsigned)n : 0u;
+        }
     }
     pvs_vcap = 65536u;
     pvs_vout = (PicaVertex *)malloc(pvs_vcap * sizeof *pvs_vout);
@@ -4171,9 +6390,25 @@ static void pvs_par_init(void) {
         ++pvs_par_nw;
     }
     if (!pvs_par_nw) pvs_par = 0;
-    fprintf(stderr, "VSPAR workers=%u chunk=%s spin_us=%llu\n", pvs_par_nw,
+    /* t_e1773c51: one descriptor ring for the whole run (never freed; the
+       workers hold snapshots of entries that a stuck participant could still
+       be reading).  PVS_JOB_RING generations of slack is minutes of run time. */
+    if (!pvs_job_ring) {
+        pvs_job_ring = (PvsJobBuf *)calloc(PVS_JOB_RING, sizeof *pvs_job_ring);
+        if (!pvs_job_ring) pvs_par = 0;
+    }
+    if (pvs_stress_on()) {          /* stress: park between jobs, one chunk */
+        pvs_spin_ns = 0;
+        pvs_wait_spin_ns = 0;
+    }
+    if (pvs_par < 0) pvs_par = 0;
+    fprintf(stderr, "VSPAR workers=%u chunk=%s spin_us=%llu wait_spin_us=%llu "
+            "min_verts=%u futex=%d job=%s stress=%d\n", pvs_par_nw,
             getenv("DQ8_VSPAR_CHUNK") ? getenv("DQ8_VSPAR_CHUNK") : "auto",
-            (unsigned long long)(pvs_spin_ns / 1000u));
+            (unsigned long long)(pvs_spin_ns / 1000u),
+            (unsigned long long)(pvs_wait_spin_ns / 1000u), pvs_min_verts,
+            PVS_HAVE_FUTEX, "gen-descriptor", pvs_stress_on());
+    pvs4_cnt_register();
 }
 
 /* ===========================================================================
@@ -4728,9 +6963,6 @@ static int pvs_par_begin(uint32_t base, uint32_t count, int indexed) {
     }
     if (pvs_par <= 0) return 0;
     pvs_par_injob = 1;
-    pvs_job_base = base;
-    pvs_job_count = count;
-    pvs_job_indexed = indexed;
     /* t_968a1fa9: build the per-draw attribute table HERE, on the main thread,
        before the job is published.  It used to be lazily filled by whichever
        participant reached its first vertex, i.e. all of them at once, and a
@@ -4761,38 +6993,56 @@ static int pvs_par_begin(uint32_t base, uint32_t count, int indexed) {
         if (chunk > 96u) chunk = 96u;
     }
     if (chunk > count) chunk = count;
-    pvs_job_chunk = chunk;
-    total = (count + chunk - 1u) / chunk;
-    pvs_job_nchunks = total;
-    pvs_job_next = 0;
-    pvs_par_jobs++;
-    if (!pvs_par_nw) {                   /* no workers: main thread does it all */
-        pvs_job_run = pvs_par_chunk;
-        for (c = 0; c < total; ++c) pvs_par_chunk(c);
+    if (pvs_stress) chunk = 1;           /* stress: maximum publish rate */
+    {
+        PvsJobDesc d;
+        PvsJobBuf *pub;
+        memset(&d, 0, sizeof d);
+        d.nchunks = (count + chunk - 1u) / chunk;
+        d.run = pvs_par_chunk;
+        d.base = base;
+        d.count = count;
+        d.chunk = chunk;
+        d.indexed = indexed;
+        d.plan = pvs_plan_cur;           /* snapshot: workers never read the
+                                            main thread's newer pvs_plan_cur */
+        d.prog = pvs_prog_cur;
+        if (pvs_stress) d.plan_key = pvs_plan_key(vs_program_size);
+        total = d.nchunks;
+        pvs_par_jobs++;
+        if (!pvs_par_nw || count < pvs_min_verts) {
+            /* Inline: either no workers, or a draw too small to pay for a wake. */
+            PvsJobBuf lb;
+            memset(&lb, 0, sizeof lb);
+            pvs_body_run(&lb, &d);
+            ++pvs_inline_jobs;
+            if (cache_key_ok) pvs_vc_store(cache_key, cache_hs, cache_hd, base, count);
+            return 1;
+        }
+        pub = pvs_job_publish(&d);
+        {
+            PvsJobDesc jd = pub->d;
+            pvs_wjob = &jd;
+            pvs_wgen = jd.gen;
+            t0 = pica_pqt_now_ns();
+            pvs_body_run(pub, &jd);      /* main thread participates */
+            t1 = pica_pqt_now_ns();
+            pvs_job_leave(pub);
+            pvs_job_close(pub);          /* no more joins: wait only for leavers */
+            pvs_job_wait(pub);           /* every joined participant has left */
+            pvs_wjob = NULL;
+            pvs_wgen = 0;
+            {
+                uint64_t t2 = pica_pqt_now_ns();
+                pvs_par_mainwork_ns += t1 - t0;
+                pvs_par_wait_ns += t2 - t1;
+            }
+            if (pvs_verify) pvs_par_verify(&jd);   /* t_968a1fa9 */
+        }
         if (cache_key_ok) pvs_vc_store(cache_key, cache_hs, cache_hd, base, count);
+        (void)c;
         return 1;
     }
-    pvs_job_run = pvs_par_chunk;
-    __atomic_store_n(&pvs_job_done, 0u, __ATOMIC_RELEASE);
-    __atomic_store_n(&pvs_job_gen, pvs_job_gen + 1u, __ATOMIC_RELEASE);
-    /* Wake workers that are blocked (no-op for the ones still spinning). */
-    pthread_mutex_lock(&pvs_par_mu);
-    pthread_cond_broadcast(&pvs_par_cv);
-    pthread_mutex_unlock(&pvs_par_mu);
-    t0 = pica_pqt_now_ns();
-    pvs_par_body();                      /* main thread participates */
-    t1 = pica_pqt_now_ns();
-    __atomic_fetch_add(&pvs_job_done, 1u, __ATOMIC_RELEASE);
-    while (__atomic_load_n(&pvs_job_done, __ATOMIC_ACQUIRE) < pvs_par_nw + 1u)
-        PVS_PAUSE();
-    {
-        uint64_t t2 = pica_pqt_now_ns();
-        pvs_par_mainwork_ns += t1 - t0;
-        pvs_par_wait_ns += t2 - t1;
-    }
-    if (pvs_verify) pvs_par_verify();    /* t_968a1fa9: DQ8_VSPAR_VERIFY=1 */
-    if (cache_key_ok) pvs_vc_store(cache_key, cache_hs, cache_hd, base, count);
-    return 1;
 }
 static void pvs_par_end(void) { pvs_par_injob = 0; }
 
@@ -4800,34 +7050,44 @@ static void pvs_par_end(void) { pvs_par_injob = 0; }
    parallel, 0 when it ran on the calling thread (pool off, nested, or tiny). */
 static int pvs_par_run(void (*fn)(void *, unsigned, unsigned), void *ctx,
                        unsigned lo, unsigned hi) {
-    unsigned parts, chunk, total;
+    unsigned parts, chunk;
     if (pvs_par < 0) pvs_par_init();
     if (pvs_par <= 0 || pvs_par_injob || hi <= lo + 1u) { fn(ctx, lo, hi); return 0; }
     pvs_par_injob = 1;
-    pvs_gfn = fn;
-    pvs_gctx = ctx;
-    pvs_gbase = lo;
-    pvs_gn = hi - lo;
-    parts = pvs_par_nw + 1u;
-    chunk = pvs_gn / (parts * 4u);
-    if (chunk < 1u) chunk = 1u;
-    if (chunk > 4u) chunk = 4u;
-    pvs_gchunk = chunk;
-    total = (pvs_gn + chunk - 1u) / chunk;
-    pvs_job_nchunks = total;
-    pvs_job_next = 0;
-    pvs_par_jobs++;
-    pvs_job_run = pvs_par_chunk_gen;
-    __atomic_store_n(&pvs_job_done, 0u, __ATOMIC_RELEASE);
-    __atomic_store_n(&pvs_job_gen, pvs_job_gen + 1u, __ATOMIC_RELEASE);
-    pthread_mutex_lock(&pvs_par_mu);
-    pthread_cond_broadcast(&pvs_par_cv);
-    pthread_mutex_unlock(&pvs_par_mu);
-    pvs_par_body();
-    __atomic_fetch_add(&pvs_job_done, 1u, __ATOMIC_RELEASE);
-    while (__atomic_load_n(&pvs_job_done, __ATOMIC_ACQUIRE) < pvs_par_nw + 1u)
-        PVS_PAUSE();
-    pvs_job_run = pvs_par_chunk;   /* restore for the next vertex job */
+    {
+        PvsJobDesc d;
+        PvsJobBuf *pub;
+        memset(&d, 0, sizeof d);
+        d.gfn = fn;
+        d.gctx = ctx;               /* NOTE: may be a caller stack frame
+                                       (pgl_wb_*_blocks passes &c).  It stays
+                                       valid because pvs_job_wait() below only
+                                       returns once every participant that
+                                       joined this generation has left it. */
+        d.gbase = lo;
+        d.gn = hi - lo;
+        parts = pvs_par_nw + 1u;
+        chunk = d.gn / (parts * 4u);
+        if (chunk < 1u) chunk = 1u;
+        if (chunk > 4u) chunk = 4u;
+        if (pvs_stress) chunk = 1;
+        d.gchunk = chunk;
+        d.nchunks = (d.gn + chunk - 1u) / chunk;
+        d.run = pvs_par_chunk_gen;
+        pvs_par_jobs++;
+        pub = pvs_job_publish(&d);
+        {
+            PvsJobDesc jd = pub->d;
+            pvs_wjob = &jd;
+            pvs_wgen = jd.gen;
+            pvs_body_run(pub, &jd);
+            pvs_job_leave(pub);
+            pvs_job_close(pub);
+            pvs_job_wait(pub);
+            pvs_wjob = NULL;
+            pvs_wgen = 0;
+        }
+    }
     pvs_par_injob = 0;
     return 1;
 }
@@ -4881,6 +7141,8 @@ static void pica_draw_arrays(uint32_t trigger,int indexed) {
     pica_draw_log_clip=0;pica_draw_log_wmin=1e30f;pica_draw_log_wmax=-1e30f;
     pica_draw_log_nfdrop=0;
     pica_draw_log_arej=0; pica_draw_log_drej=0; pica_draw_log_frw=0;
+    pica_draw_log_fcw=0; pica_draw_log_fccw=0;
+    pica_cull_kept_tris=0; pica_cull_dropped_tris=0;
     memset(pica_thist, 0, sizeof pica_thist);
     pica_cov_px = 0;
     pica_clst_reset();
@@ -4889,6 +7151,7 @@ static void pica_draw_arrays(uint32_t trigger,int indexed) {
 #if defined(PVS_SSE)
     pvs_sse_sync();           /* follow the guest's swizzle-table uploads */
     pvs_dec_sync();           /* t_469b3d92: re-decode the VS program once */
+    pvs_plan_sync();          /* t_fdc40e6f: prepared plan, cached per program */
     pvs_ghist_init();         /* t_6f9e3fed: DQ8_VSDEC_HIST=1 */
 #endif
     pica_vs_attr_ready = 0;   /* t_5a3c517a: rebuild the attribute table once per draw */
@@ -5025,27 +7288,40 @@ done:
             /* t_6f9e3fed: DQ8_VSDEC_HIST=1 -> which opcodes still take the
                generic interpreter, and their share of executed instructions. */
             if (pvs_ghist_on > 0) pvs_ghist_report();
+            if (pvs_stats_on > 0) pvs_plan_report();
             {   /* t_5a3c517a: did the parallel transform actually help, and how
                    much of the draw does the MAIN thread now spend waiting? */
-                static uint64_t last_jobs, last_mw, last_wt;
+                static uint64_t last_jobs, last_mw, last_wt, last_blk, last_wblk, last_inl;
                 uint64_t dj = pvs_par_jobs - last_jobs;
                 if (dj) {
-                    fprintf(stderr, "VSPARSTAT jobs=%llu main_ms=%.2f wait_ms=%.2f "
-                            "wait_share=%.2f\n", (unsigned long long)dj,
+                    fprintf(stderr, "VSPARSTAT jobs=%llu inline=%llu main_ms=%.2f wait_ms=%.2f "
+                            "wait_share=%.2f blk_per_job=%.2f wblk_per_job=%.2f\n",
+                            (unsigned long long)dj,
+                            (unsigned long long)(pvs_inline_jobs - last_inl),
                             (double)(pvs_par_mainwork_ns - last_mw) / 1e6 / (double)dj,
                             (double)(pvs_par_wait_ns - last_wt) / 1e6 / (double)dj,
                             (double)(pvs_par_wait_ns - last_wt) /
                                 (double)((pvs_par_wait_ns - last_wt) +
-                                         (pvs_par_mainwork_ns - last_mw) + 1));
+                                         (pvs_par_mainwork_ns - last_mw) + 1),
+                            (double)(pvs_block_count - last_blk) / (double)dj,
+                            (double)(pvs_wait_blocks - last_wblk) / (double)dj);
                 }
                 last_jobs = pvs_par_jobs;
                 last_mw = pvs_par_mainwork_ns;
                 last_wt = pvs_par_wait_ns;
+                last_blk = pvs_block_count;
+                last_wblk = pvs_wait_blocks;
+                last_inl = pvs_inline_jobs;
             }
         }
     }
     pica_log_draw(0);
     pvs_vc_report();   /* t_6f9e3fed: DQ8_VSCACHE_STATS=1 counters */
+    if (pvs_stress) {  /* t_e1773c51: DQ8_VS4_STRESS handshake counters, 2 s */
+        static double pvs_stress_last;
+        double now = (double)pica_pqt_now_ns() / 1e9;
+        if (now - pvs_stress_last >= 2.0) { pvs_stress_last = now; pvs_stress_report(); }
+    }
     if (pica_clst() && count >= 256u) {
         static unsigned clst_lines;
         if (clst_lines++ < 600u)

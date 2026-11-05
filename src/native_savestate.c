@@ -241,6 +241,28 @@ static void savestate_request(int kind) {
     atomic_store(&savestate_pending, kind);
 }
 
+/* HOST COMMANDS IN A WAIT (t_56936fec): the seeker the main-context wait
+   loops use.  A request is normally consumed by savestate_service() at the
+   next main-context dispatch boundary, but a main-context SVC wait that never
+   completes never reaches one -- so the wait loop polls this instead of the
+   variable, breaks the wait, and lets the dispatcher act.  Relaxed load: the
+   no-request case costs one plain load per wait-loop iteration. */
+static int savestate_pending_kind(void) {
+    return atomic_load_explicit(&savestate_pending, memory_order_relaxed);
+}
+
+/* One line per host command that had to leave a wait, so an operator's log
+   shows the command was taken from inside the wait rather than at a frame
+   boundary.  Bounded: a wedged guest cannot flood the log. */
+static unsigned savestate_wait_escapes;
+static void savestate_wait_escape(int kind, uint32_t handle, unsigned spin) {
+    if (savestate_wait_escapes++ >= 8u) return;
+    fprintf(stderr,
+            "HOSTCMD: %s escaped from a main-context wait (handle=%08X spin=%u)"
+            " -> guest keeps its timeout result, the state load replaces it\n",
+            kind == 2 ? "load (F9)" : "save (F5)", handle, spin);
+}
+
 static int savestate_take_resume(int *n, int *z, int *c, int *v, int *ge) {
     if (!savestate_resume_valid) return 0;
     savestate_resume_valid = 0;
